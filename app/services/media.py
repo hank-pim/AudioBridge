@@ -110,7 +110,7 @@ class MediaController:
                 "clock_recovery": False,
             },
             "limitations": [
-                "TX source graph supports configured tone and silence sources only; Dante capture is not wired yet",
+                "Dante TX capture depends on the selected host driver and device being available to GStreamer",
                 "WebRTC stream start/stop is control-plane state only",
                 "Managed TX SRT graphs poll srtsink.stats for transport telemetry",
                 "Monitor branches terminate at autoaudiosink/fakesink only; browser delivery not wired yet",

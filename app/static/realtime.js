@@ -53,16 +53,19 @@
     const outputs = (st && st.meters && st.meters.outputs) || [];
     const defaultProgramOpus = (cfg && cfg.program && cfg.program.opus) || {};
     const defaultTalkbackBitrate = (cfg && cfg.talkback && cfg.talkback.opus_bitrate_kbps) || 48;
+    const maxFinite = (values) => {
+      const nums = values.filter(Number.isFinite);
+      return nums.length ? Math.max(...nums) : null;
+    };
 
     const srtRows = srtTransports.map((transport, index) => {
       const dir = transport.direction === "tx" ? "out" : "in";
       const group = encodeGroups.find((item) => (transport.encode_group_ids || []).includes(item.id));
-      // Single-channel only: server emits meters at channel index 1 for both TX (per-encode-group)
-      // and RX (per-transport). When multi-channel lands, route the lookup via the tap's channel_index.
-      const dante = 1;
-      const meter = (dir === "in" ? inputs : outputs)[dante - 1] || { peak_dbfs: null, rms_dbfs: null };
-      const level = meter.rms_dbfs;
-      const peak  = meter.peak_dbfs;
+      const meterSet = dir === "in" ? inputs : outputs;
+      const channelCount = Math.max(1, (group && group.channel_count) || 1);
+      const meters = meterSet.slice(0, channelCount);
+      const level = maxFinite(meters.map(m => m && m.rms_dbfs));
+      const peak  = maxFinite(meters.map(m => m && m.peak_dbfs));
       const bitrate = (defaultProgramOpus && defaultProgramOpus.bitrate_kbps) || 96;
       const running = transport.state === "running";
       const enabled = true;
@@ -77,7 +80,7 @@
         type: "SRT",
         direction: dir,
         transport: "SRT",
-        dante_channel: dante,
+        dante_channel: 1,
         srt_slot: index + 1,
         rtc_track: null,
         route,

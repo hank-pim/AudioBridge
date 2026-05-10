@@ -36,7 +36,9 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
   const hasProgramRtt = Number.isFinite(PROGRAM.rtt_ms);
   const hasProgramJitter = Number.isFinite(PROGRAM.jitter_ms);
   const hasProgramLoss = Number.isFinite(PROGRAM.loss_pct);
-  const hasClockTelemetry = Number.isFinite(CLOCK.frequency_ratio_ppm) || Number.isFinite(CLOCK.buffer_occupancy_ms);
+  const hasClockTelemetry = ["running", "lock", "slew", "drift"].includes(CLOCK.lock_state)
+    || Number.isFinite(CLOCK.frequency_ratio_ppm)
+    || Number.isFinite(CLOCK.buffer_occupancy_ms);
   const activeMeterCount = CHANNELS.filter(c => Number.isFinite(c.level_dbfs) || Number.isFinite(c.peak_dbfs)).length;
 
   const filtered = useMemo(() => {
@@ -196,6 +198,7 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                   const cfgRoot = window.AB.config || {};
                   const stRoot = window.AB.status || {};
                   const inputMeters = (stRoot.meters && stRoot.meters.inputs) || [];
+                  const outputMeters = (stRoot.meters && stRoot.meters.outputs) || [];
                   const transportCfg = isSrtTx ? (cfgRoot.srt_transports || []).find(t => t.id === c.runtime_id) : null;
                   const groupId = transportCfg && (transportCfg.encode_group_ids || [])[0];
                   const groupCfg = groupId ? (cfgRoot.encode_groups || []).find(g => g.id === groupId) : null;
@@ -231,6 +234,8 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                       group={groupCfg}
                       sources={cfgRoot.sources || []}
                       inputMeters={inputMeters}
+                      outputMeters={outputMeters}
+                      meterDirection={c.direction}
                       colSpan={12}
                     />
                   )}
@@ -1109,6 +1114,7 @@ function RowActions({ ch, expanded, onToggle }) {
 
 function ClockChip({ sync, ppm }) {
   const meta = sync === "lock"  ? { fg: "var(--ab-ok)",   bg: "var(--ab-ok-soft)",     bd: "rgba(34,197,94,0.35)",  label: "LOCK"  }
+             : sync === "running" ? { fg: "var(--ab-ok)", bg: "var(--ab-ok-soft)",     bd: "rgba(34,197,94,0.35)",  label: "RUN"   }
              : sync === "slew"  ? { fg: "var(--ab-warn)", bg: "var(--ab-warn-soft)",   bd: "rgba(245,158,11,0.35)", label: "SLEW"  }
              : sync === "drift" ? { fg: "var(--ab-err)",  bg: "var(--ab-err-soft)",    bd: "rgba(239,68,68,0.35)",  label: "DRIFT" }
              :                    { fg: "var(--ab-fg-5)", bg: "var(--ab-surface-2)",   bd: "var(--ab-border-soft)", label: "—"     };
@@ -1131,7 +1137,7 @@ function ClockChip({ sync, ppm }) {
 // Codec / clock status. Most values stay blank until the media runtime
 // has real clock and resampler telemetry.
 function ClockKpiTile({ sync = "off", ppm = null, codec = "—", sampleRate = "48.000 kHz", note, liveNote }) {
-  const tone = sync === "lock" ? "ok" : sync === "slew" ? "warn" : sync === "drift" ? "err" : "muted";
+  const tone = sync === "lock" || sync === "running" ? "ok" : sync === "slew" ? "warn" : sync === "drift" ? "err" : "muted";
   const ppmLabel = Number.isFinite(ppm)
     ? `${ppm >= 0 ? "+" : "−"}${Math.abs(ppm) < 1 ? Math.abs(ppm).toFixed(2) : Math.abs(ppm).toFixed(1)}`
     : "—";
@@ -1187,7 +1193,7 @@ function defaultOpus(transport) {
 
 const SILENCE_DEFAULT_SOURCE_ID = "silence-default";
 
-function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeters, colSpan }) {
+function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeters, outputMeters, meterDirection, colSpan }) {
   const [pending, setPending] = useState({}); // index -> { source_id?, label?, gain_db? }
   const [savingIdx, setSavingIdx] = useState(null);
   const [error, setError] = useState("");
@@ -1291,7 +1297,9 @@ function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeter
     const effectiveSource = (pending[i] && pending[i].source_id) || ch.source_id;
     const isSilence = effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
     const meterCh = sourceMeterChannel(effectiveSource);
-    const meter = meterCh ? (inputMeters[meterCh - 1] || {}) : {};
+    const meter = meterDirection === "out"
+      ? ((outputMeters || [])[i - 1] || {})
+      : (meterCh ? (inputMeters[meterCh - 1] || {}) : {});
     const gainVal = pending[i] && pending[i].gain_db != null ? pending[i].gain_db : (ch.gain_db ?? 0);
     rows.push(
       <tr key={`${streamId}-ch-${i}`} style={{ background: "var(--ab-surface-2)", opacity: isSilence ? 0.55 : 1 }}>

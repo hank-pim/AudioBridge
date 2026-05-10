@@ -223,6 +223,7 @@ class CtypesManagedPipeline:
     _stopped: bool = False
     _last_bytes: int | None = None
     _last_stats_at: float | None = None
+    _last_stats_tail_at: float | None = None
     _thread: threading.Thread | None = None
     _branches: dict[str, AttachedBranch] = field(default_factory=dict)
     _branch_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -399,28 +400,35 @@ class CtypesManagedPipeline:
 
     def _poll(self) -> None:
         while not self._stopped:
-            self._poll_bus_once()
+            self._drain_bus()
             self._poll_srt_stats()
             time.sleep(0.1)
 
-    def _poll_bus_once(self) -> None:
+    def _drain_bus(self, *, max_messages: int = 100) -> None:
+        for _ in range(max_messages):
+            if not self._poll_bus_once():
+                return
+
+    def _poll_bus_once(self) -> bool:
         if not self.bus:
-            return
+            return False
         message = self.runtime.gst.gst_bus_timed_pop_filtered(self.bus, 0, GST_MESSAGE_ANY)
         if not message:
-            return
+            return False
         try:
             structure = self.runtime.gst.gst_message_get_structure(message)
             if not structure:
-                return
+                return True
             text = self.runtime.string_and_free(self.runtime.gst.gst_structure_to_string(structure))
             if not text:
-                return
+                return True
             source = GstMessage.from_address(message).src
             source_name = self.runtime.string_and_free(self.runtime.gst.gst_object_get_name(source)) if source else None
             line = f'{source_name or "unknown"}: {text}'
             self.output_tail.append(line)
+            self._observe_clock(source_name, text)
             self._observe_level(source_name, text)
+            return True
         finally:
             self.runtime.gst.gst_mini_object_unref(message)
 
@@ -434,9 +442,11 @@ class CtypesManagedPipeline:
         text = self.runtime.string_and_free(self.runtime.gst.gst_structure_to_string(stats))
         if not text:
             return
-        self.output_tail.append(f"srtstats: {text}")
-        fields = _parse_stats(text)
         now = time.time()
+        if self._last_stats_tail_at is None or now - self._last_stats_tail_at >= 1.0:
+            self.output_tail.append(f"srtstats: {text}")
+            self._last_stats_tail_at = now
+        fields = _parse_stats(text)
         bytes_total = _first_int(fields, "pkti-send-bytes", "bytes-sent-total", "bytes-received-total")
         bitrate_kbps = _mbps_to_kbps(_first_float(fields, "send-rate-mbps"))
         if bytes_total is not None and self._last_bytes is not None and self._last_stats_at is not None:
@@ -475,6 +485,13 @@ class CtypesManagedPipeline:
             peak_dbfs=_first_level_value(match.group("peak")),
             rms_dbfs=_first_level_value(match.group("rms")),
         )
+
+    def _observe_clock(self, source_name: str | None, text: str) -> None:
+        if text.startswith("GstMessageNewClock"):
+            self.telemetry.observe_clock(lock_state="running")
+            return
+        if source_name and source_name.startswith(("dbmeter_out_", "dbmeter_in_")):
+            self.telemetry.observe_clock(lock_state="running")
 
 
 def _parse_stats(text: str) -> dict[str, str]:

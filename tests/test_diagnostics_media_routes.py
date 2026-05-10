@@ -651,6 +651,8 @@ def test_media_graph_plan_exposes_tx_graph_from_configured_tone_sources() -> Non
         ]
         assert "level" in transport_plan["gstreamer"]["argv"]
         assert "name=dbmeter_out_enc_main_1" in transport_plan["gstreamer"]["argv"]
+        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1,channel-mask=(bitmask)0x4" in transport_plan["gstreamer"]["argv"]
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x4" in transport_plan["gstreamer"]["argv"]
         assert "name=monitor_tap_tx_srt_main_enc_main_1" in transport_plan["gstreamer"]["argv"]
         assert "wait-for-connection=true" in transport_plan["gstreamer"]["argv"]
         assert "freq=440.0" in transport_plan["gstreamer"]["argv"]
@@ -821,6 +823,10 @@ def test_tx_dante_capture_uses_shared_deinterleave_per_os() -> None:
         assert "dante_in_enc_mix.src_4 !" in graph
         # The silence channel still uses audiotestsrc.
         assert "audiotestsrc is-live=true wave=silence" in graph
+        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=3,channel-mask=(bitmask)0x7" in graph
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x1" in graph
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x2" in graph
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x4" in graph
         # Each channel terminates at the matching interleave sink pad.
         assert "il_enc_mix.sink_0" in graph
         assert "il_enc_mix.sink_1" in graph
@@ -875,6 +881,22 @@ def test_tx_dante_capture_switches_element_per_driver() -> None:
         assert plan["valid"] is True, f"{driver}: {plan['errors']}"
         graph = plan["gstreamer"]["graph"]
         assert expected_element in graph, f"{driver} should use {expected_element}"
+
+    cfg = EndpointConfig(
+        audio=AudioConfig(
+            interface_name="DVS",
+            interface_driver="asio",
+            interface_device_id="B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+            channel_count=16,
+        ),
+        **base_kwargs,
+    )
+    plan = MediaGraphBuilder().plan_srt_transport(cfg, "srt-1")
+    assert plan["valid"] is True, plan["errors"]
+    graph = plan["gstreamer"]["graph"]
+    assert "asiosrc device-clsid=\"{B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8}\" input-channels=0,1" in graph
+    assert "audio/x-raw,rate=48000,channels=2,format=S16LE" in graph
+    assert "dante_in_enc_1.src_0 !" in graph
 
 
 def test_tx_srt_transport_start_uses_graph_plan(monkeypatch) -> None:
@@ -949,6 +971,8 @@ def test_tx_srt_transport_start_uses_graph_plan(monkeypatch) -> None:
         assert "audiotestsrc" in graph
         assert "level" in graph
         assert "name=dbmeter_out_enc_main_1" in graph
+        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1,channel-mask=(bitmask)0x4" in graph
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x4" in graph
         assert "tee name=monitor_tap_tx_tx_main_enc_main_1 allow-not-linked=true" in graph
         assert "wait-for-connection=true" in graph
         assert "freq=440.0" in graph
@@ -989,6 +1013,31 @@ def test_srt_stats_parser_maps_sender_srt_trace_fields() -> None:
     assert _mbps_to_kbps(_first_float(fields, "send-rate-mbps")) == 94.0
     assert _first_int(fields, "bytes-sent-total") == 123456
     assert _loss_percent(2, 100) == 1.961
+
+
+def test_managed_gstreamer_meter_activity_marks_clock_running() -> None:
+    from app.services.gst_runtime import CtypesManagedPipeline
+
+    telemetry = media_module.TelemetryService()
+    pipeline = CtypesManagedPipeline(
+        name="test",
+        graph="",
+        transport_id="srt-1",
+        telemetry=telemetry,
+        runtime=None,  # type: ignore[arg-type]
+        pipeline=0,
+        srt_element=None,
+        bus=None,
+    )
+
+    pipeline._observe_clock(
+        "dbmeter_out_enc_main_1",
+        "level, rms=(GValueArray)< -21.25 >, peak=(GValueArray)< -4.5 >;",
+    )
+
+    status = telemetry.snapshot(media_module.EndpointConfig())
+    assert status["clock"]["lock_state"] == "running"
+    assert status["clock"]["frequency_ratio_ppm"] is None
 
 
 def test_monitor_branch_attach_detach_round_trip(monkeypatch) -> None:

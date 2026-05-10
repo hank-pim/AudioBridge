@@ -223,9 +223,7 @@ class MediaGraphBuilder:
             "interleave",
             f"name={interleave_name}",
             "!",
-            f"audio/x-raw,rate=48000,channels={n},channel-mask=(bitmask){self._channel_mask_hex(n)}",
-            "!",
-            "audioconvert",
+            f"audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask){self._channel_mask_hex(n)}",
             "!",
             "opusenc",
             f"bitrate={group.opus.bitrate_kbps * 1000}",
@@ -247,15 +245,25 @@ class MediaGraphBuilder:
             if (ch.source_id or "") in source_by_id
         )
         deinterleave_name = self._deinterleave_element_name(group.id)
+        dante_pad_by_channel: dict[int, int] = {}
         if any_dante:
+            dante_channels = [
+                source_by_id[channel.source_id or ""].dante_channel or 1
+                for channel in sorted_channels
+                if source_by_id[channel.source_id or ""].kind == SourceKind.dante_input
+            ]
+            capture_args, capture_channel_count, dante_pad_by_channel = self._dante_capture_plan(
+                config.audio,
+                dante_channels,
+            )
             argv.extend([
-                *self._dante_capture_args(config.audio),
+                *capture_args,
                 "!",
                 "audioconvert",
                 "!",
                 "audioresample",
                 "!",
-                f"audio/x-raw,rate=48000,channels={config.audio.channel_count},format=S16LE",
+                f"audio/x-raw,rate=48000,channels={capture_channel_count},format=S16LE",
                 "!",
                 "deinterleave",
                 f"name={deinterleave_name}",
@@ -270,13 +278,13 @@ class MediaGraphBuilder:
             if source.kind == SourceKind.dante_input:
                 # Pull a specific channel from the shared deinterleave.
                 argv.extend([
-                    f"{deinterleave_name}.src_{(source.dante_channel or 1) - 1}",
+                    f"{deinterleave_name}.src_{dante_pad_by_channel[source.dante_channel or 1]}",
                     "!",
                     "queue",
                     "!",
                     "audioconvert",
                     "!",
-                    "audio/x-raw,rate=48000,channels=1",
+                    f"audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){self._channel_mask_bit_hex(n, channel.index)}",
                     "!",
                     "level",
                     f"name={self._meter_element_name(group.id, channel.index)}",
@@ -302,7 +310,7 @@ class MediaGraphBuilder:
                     "!",
                     "audioresample",
                     "!",
-                    "audio/x-raw,rate=48000,channels=1",
+                    f"audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){self._channel_mask_bit_hex(n, channel.index)}",
                     "!",
                     "level",
                     f"name={self._meter_element_name(group.id, channel.index)}",
@@ -320,7 +328,23 @@ class MediaGraphBuilder:
                 ])
         return argv
 
-    def _dante_capture_args(self, audio: AudioConfig) -> list[str]:
+    def _dante_capture_plan(self, audio: AudioConfig, dante_channels: list[int]) -> tuple[list[str], int, dict[int, int]]:
+        requested_channels = sorted({max(1, channel) for channel in dante_channels})
+        if audio.interface_driver == "asio":
+            zero_based = sorted({channel - 1 for channel in requested_channels})
+            expanded: set[int] = set()
+            for channel in zero_based:
+                pair_base = channel - (channel % 2)
+                expanded.update({pair_base, pair_base + 1})
+            selected = sorted(expanded)
+            args = self._dante_capture_args(audio, selected)
+            pad_by_channel = {channel + 1: selected.index(channel) for channel in zero_based}
+            return args, len(selected), pad_by_channel
+
+        args = self._dante_capture_args(audio, None)
+        return args, audio.channel_count, {channel: channel - 1 for channel in requested_channels}
+
+    def _dante_capture_args(self, audio: AudioConfig, asio_channels: list[int] | None = None) -> list[str]:
         """Return the gst element + properties for the host audio capture device.
         Selected by interface_driver; device addressed by interface_device_id when set,
         otherwise the OS default capture device for the driver is used (DVS, in normal
@@ -352,7 +376,9 @@ class MediaGraphBuilder:
             # currently configured for.
             args = ["asiosrc"]
             if device:
-                args.append(f'device-clsid="{device}"')
+                args.append(f'device-clsid="{{{device.strip("{}")}}}"')
+            if asio_channels:
+                args.append(f"input-channels={','.join(str(channel) for channel in asio_channels)}")
             return args
         # unknown shouldn't reach here — the validator rejects it.
         raise ValueError(f"unsupported audio driver for dante capture: '{driver}'")
@@ -444,6 +470,26 @@ class MediaGraphBuilder:
             8: 0x63F,  # 7.1
         }
         return f"0x{masks.get(channels, 0):x}"
+
+    @staticmethod
+    def _channel_mask_bit_hex(channels: int, channel_index: int) -> str:
+        # Per-mono-leg channel positions must add up to the interleaved output
+        # mask, otherwise opusenc produces unknown-position caps that rtpopuspay
+        # cannot negotiate.
+        bits = {
+            1: [0x4],
+            2: [0x1, 0x2],
+            3: [0x1, 0x2, 0x4],
+            4: [0x1, 0x2, 0x10, 0x20],
+            5: [0x1, 0x2, 0x4, 0x10, 0x20],
+            6: [0x1, 0x2, 0x4, 0x8, 0x10, 0x20],
+            7: [0x1, 0x2, 0x4, 0x8, 0x100, 0x200, 0x400],
+            8: [0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x200, 0x400],
+        }
+        selected = bits.get(channels, [])
+        if channel_index < 1 or channel_index > len(selected):
+            return "0x0"
+        return f"0x{selected[channel_index - 1]:x}"
 
     def _rx_meter_element_name(self, transport_id: str) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
