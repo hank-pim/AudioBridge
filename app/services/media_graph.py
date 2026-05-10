@@ -93,16 +93,13 @@ class MediaGraphBuilder:
         if transport.direction == SrtTransportDirection.tx:
             if not transport.encode_group_ids:
                 errors.append(self._error(transport.id, None, "tx_transport_has_no_groups", "TX SRT transport has no encode groups"))
-            total_channels = sum(
-                len(group_by_id[g].channels)
-                for g in transport.encode_group_ids
-                if g in group_by_id
-            )
-            if total_channels > 1:
-                errors.append(self._error(
-                    transport.id, None, "multi_channel_unsupported",
-                    "TX SRT transport currently supports a single channel per transport (rtpopuspay)",
-                ))
+            for g in transport.encode_group_ids:
+                group = group_by_id.get(g)
+                if group and group.channel_count > 8:
+                    errors.append(self._error(
+                        transport.id, group.id, "opus_multichannel_max_8",
+                        f"encode group '{group.id}' has {group.channel_count} channels; native multichannel OPUS supports up to 8",
+                    ))
 
         if transport.direction == SrtTransportDirection.tx and transport.mode.value in {"caller", "rendezvous"} and not transport.host:
             errors.append(self._error(transport.id, None, "transport_host_required", "SRT caller and rendezvous transports require host"))
@@ -171,50 +168,72 @@ class MediaGraphBuilder:
         groups: list[EncodeGroupConfig],
         uri: str,
     ) -> list[str]:
+        # Multichannel-native OPUS: each source leg is mono (with its own level + tee
+        # for per-channel metering and monitoring), then all legs are interleaved
+        # into one N-channel buffer that feeds a single opusenc. This preserves
+        # phase alignment across channels because every channel shares encoder
+        # framing.
         source_by_id = {source.id: source for source in config.sources if source.enabled}
         argv = [self.gst_launch_executable, "-m"]
-        # Single-channel path: encoder feeds a tee, tee feeds rtpopuspay → srtsink.
-        # Multi-channel will need mpegtsmux + dynamic pad linking; not yet supported.
-        for group in groups:
-            for channel in sorted(group.channels, key=lambda item: item.index):
-                source = source_by_id[channel.source_id or ""]
-                tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
-                argv.extend(
-                    [
-                        self._source_element(source),
-                        "is-live=true",
-                        *self._source_properties(source),
-                        "!",
-                        "audioconvert",
-                        "!",
-                        "audioresample",
-                        "!",
-                        "audio/x-raw,rate=48000,channels=1",
-                        "!",
-                        "level",
-                        f"name={self._meter_element_name(group.id, channel.index)}",
-                        "message=true",
-                        "interval=100000000",
-                        "!",
-                        "opusenc",
-                        f"bitrate={group.opus.bitrate_kbps * 1000}",
-                        "!",
-                        "tee",
-                        f"name={tap_name}",
-                        "allow-not-linked=true",
-                        f"{tap_name}.",
-                        "!",
-                        "queue",
-                        "!",
-                        "rtpopuspay",
-                        "pt=96",
-                        "!",
-                        "srtsink",
-                        f"name={self._srt_element_name(transport.id, transport.direction.value)}",
-                        f"uri={uri}",
-                        "wait-for-connection=true",
-                    ]
-                )
+        if not groups:
+            return argv
+        # Only one encode group per TX is wired today; the validator catches multi-group attempts upstream when added.
+        group = groups[0]
+        n = group.channel_count
+        interleave_name = self._interleave_element_name(group.id)
+        srt_name = self._srt_element_name(transport.id, transport.direction.value)
+
+        # Sink chain: interleave -> caps -> opusenc -> rtpopuspay -> srtsink.
+        argv.extend([
+            "interleave",
+            f"name={interleave_name}",
+            "!",
+            f"audio/x-raw,rate=48000,channels={n},channel-mask=(bitmask){self._channel_mask_hex(n)}",
+            "!",
+            "audioconvert",
+            "!",
+            "opusenc",
+            f"bitrate={group.opus.bitrate_kbps * 1000}",
+            "!",
+            "rtpopuspay",
+            "pt=96",
+            "!",
+            "srtsink",
+            f"name={srt_name}",
+            f"uri={uri}",
+            "wait-for-connection=true",
+        ])
+
+        # Source legs: one branch per channel, terminating at interleave.sink_<k>.
+        for channel in sorted(group.channels, key=lambda item: item.index):
+            source = source_by_id[channel.source_id or ""]
+            tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
+            pad = f"{interleave_name}.sink_{channel.index - 1}"
+            argv.extend([
+                self._source_element(source),
+                "is-live=true",
+                *self._source_properties(source),
+                "!",
+                "audioconvert",
+                "!",
+                "audioresample",
+                "!",
+                "audio/x-raw,rate=48000,channels=1",
+                "!",
+                "level",
+                f"name={self._meter_element_name(group.id, channel.index)}",
+                "message=true",
+                "interval=100000000",
+                "!",
+                "tee",
+                f"name={tap_name}",
+                "allow-not-linked=true",
+                f"{tap_name}.",
+                "!",
+                "queue",
+                "!",
+                pad,
+            ])
         return argv
 
     def _build_rx_argv(
@@ -280,6 +299,26 @@ class MediaGraphBuilder:
     def _meter_element_name(self, group_id: str, channel_index: int) -> str:
         safe_group = "".join(char if char.isalnum() else "_" for char in group_id)
         return f"dbmeter_out_{safe_group}_{channel_index}"
+
+    def _interleave_element_name(self, group_id: str) -> str:
+        safe_group = "".join(char if char.isalnum() else "_" for char in group_id)
+        return f"il_{safe_group}"
+
+    @staticmethod
+    def _channel_mask_hex(channels: int) -> str:
+        # Standard speaker masks for 1..8 channels matching gstreamer/Vorbis-order
+        # surround layouts. opusenc uses these to set channel_mapping_family=1.
+        masks = {
+            1: 0x4,    # mono (front center)
+            2: 0x3,    # stereo (front L, R)
+            3: 0x7,    # 3.0 (front L, R, C)
+            4: 0x33,   # quad
+            5: 0x37,   # 5.0
+            6: 0x3F,   # 5.1
+            7: 0x70F,  # 6.1
+            8: 0x63F,  # 7.1
+        }
+        return f"0x{masks.get(channels, 0):x}"
 
     def _rx_meter_element_name(self, transport_id: str) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)

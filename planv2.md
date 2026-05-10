@@ -25,7 +25,7 @@ A point-to-point bridge that extends a Dante audio network across the open inter
 
 ## Program path (SRT + OPUS)
 
-- N parallel mono OPUS encoders, one per source channel, multiplexed into a single SRT stream. Not OPUS native multichannel — chosen for loss resilience and routing flexibility.
+- Single OPUS multichannel encoder (`channel_mapping_family=1`) feeds one RTP/OPUS stream over SRT. All channels share encoder framing, which preserves inter-channel phase alignment — critical for stereo imaging and multi-mic capture. Per-channel taps live pre-encode (after `level`, before `interleave`) so monitoring and metering remain per-channel.
 - Configurable per stream: OPUS bitrate, frame size, complexity, in-band FEC on/off, expected packet-loss percentage.
 - SRT mode selectable: caller, listener, or rendezvous. Defaults presented based on which side has a public IP/open port.
 - Configurable SRT latency window (the dominant tuning knob); UI surfaces it on the main screen with a recommended starting value derived from measured RTT.

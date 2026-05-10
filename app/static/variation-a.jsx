@@ -1404,7 +1404,7 @@ function AddStreamPanel({ onClose }) {
       if (kind === "srt_transport") {
         const encodeGroupIds = [];
         if (direction === "tx") {
-          const n = clampInt(channelCount, 1, 64);
+          const n = clampInt(channelCount, 1, 8);
           const channels = Array.from({ length: n }, (_, i) => ({
             index: i + 1,
             source_id: SILENCE_DEFAULT_SOURCE_ID,
@@ -1497,7 +1497,7 @@ function AddStreamPanel({ onClose }) {
             {direction === "tx" && (
               <>
                 <CfgField label="Channels">
-                  <NumberField value={channelCount} min={1} max={64} onChange={setChannelCount} suffix="ch" />
+                  <NumberField value={channelCount} min={1} max={8} onChange={setChannelCount} suffix="ch" />
                 </CfgField>
                 <CfgField label="Codec">
                   <Segmented value={opusOverride ? "override" : "default"} onChange={v => setOpusOverride(v === "override")} options={[["default", "Defaults"], ["override", "Override"]]} />
@@ -1518,7 +1518,7 @@ function AddStreamPanel({ onClose }) {
         )}
         <CfgSection label="Preview">
           <CfgField label="ID"><span className="ab-mono" style={cfgVal}>{previewId}</span></CfgField>
-          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? `${clampInt(channelCount, 1, 64)}ch silence-filled · group -> SRT` : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
+          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? `${clampInt(channelCount, 1, 8)}ch silence-filled · group -> SRT` : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
           {kind === "srt_transport" && direction === "tx" && (
             <CfgField label="Group ID"><span className="ab-mono" style={cfgVal}>{groupPreviewId}</span></CfgField>
           )}
