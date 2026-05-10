@@ -1,0 +1,68 @@
+schema_version = 1
+endpoint_name = "Dante Bridge Endpoint"
+
+[network]
+signaling_port = 8443
+srt_port = 9000
+stun_servers = [
+  "stun:stun.l.google.com:19302",
+  "stun:stun.cloudflare.com:3478",
+]
+
+[audio]
+interface_driver = "unknown"
+sample_rate = 48000
+channel_count = 8
+channel_labels = [
+  "Channel 1",
+  "Channel 2",
+  "Channel 3",
+  "Channel 4",
+  "Channel 5",
+  "Channel 6",
+  "Channel 7",
+  "Channel 8",
+]
+
+[program]
+enabled = false
+srt_mode = "listener"
+srt_latency_ms = 240
+encryption_enabled = true
+encryption_strength = "aes-256"
+clock_recovery_mode = "adaptive"
+
+[program.opus]
+bitrate_kbps = 96
+frame_ms = 20
+complexity = 7
+inband_fec = true
+expected_packet_loss_percent = 5
+
+[program.adaptive_clock]
+convergence_window_seconds = 10
+steady_window_seconds = 300
+lock_ppm_threshold = 1.0
+lock_hold_seconds = 30
+ratio_clamp_ppm = 50.0
+
+[program.free_running_clock]
+jitter_buffer_ms = 500
+underrun_policy = "silence"
+
+[talkback]
+enabled = false
+output_channel = 1
+opus_bitrate_kbps = 48
+frame_ms = 10
+restricted_lowdelay = false
+
+[routes]
+talkback_output_channel = 1
+
+[pairing]
+
+[ui]
+theme = "dark"
+meter_units = "dbfs"
+meter_ballistics = "fast"

@@ -1,0 +1,1 @@
+"""Dante Bridge endpoint application."""

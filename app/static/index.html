@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Audiobridge — Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/static/styles.css" />
+<style>
+  html, body { margin: 0; padding: 0; background: #0a0a0c; height: 100%; }
+  body { font-family: "IBM Plex Sans", system-ui, sans-serif; color: #e6e6ea; }
+  #root { width: 100vw; height: 100vh; display: flex; }
+  #root > * { flex: 1; min-width: 0; min-height: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+
+<script src="/static/realtime.js"></script>
+<script type="text/babel" src="/static/tweaks-panel.jsx"></script>
+<script type="text/babel" src="/static/shared.jsx"></script>
+<script type="text/babel" src="/static/variation-a.jsx"></script>
+
+<script type="text/babel" data-presets="env,react">
+function App() {
+  // Subscribe to the live store; bump tick on every notify to re-render.
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => window.AB.subscribe(() => setTick(t => t + 1)), []);
+  return (
+    <VariationA
+      density={8}
+      showEventsRail={true}
+      showSystemCard={true}
+      kpiCount={6}
+    />
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
