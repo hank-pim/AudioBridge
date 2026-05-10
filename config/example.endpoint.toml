@@ -24,6 +24,64 @@ channel_labels = [
   "Channel 8",
 ]
 
+[[sources]]
+id = "src-1"
+name = "Dante Input 1"
+kind = "dante_input"
+dante_channel = 1
+enabled = true
+
+[[sources]]
+id = "src-silence"
+name = "Silence"
+kind = "silence"
+enabled = true
+
+[[encode_groups]]
+id = "enc-main"
+name = "Main Opus Pair"
+channel_count = 2
+enabled = true
+
+[[encode_groups.channels]]
+index = 1
+source_id = "src-1"
+label = "L"
+gain_db = 0.0
+
+[[encode_groups.channels]]
+index = 2
+source_id = "src-silence"
+label = "R"
+gain_db = 0.0
+
+[encode_groups.opus]
+bitrate_kbps = 96
+frame_ms = 20
+complexity = 7
+inband_fec = true
+expected_packet_loss_percent = 5
+
+[[srt_transports]]
+id = "srt-main"
+name = "Main SRT Transport"
+direction = "tx"
+mode = "caller"
+host = "198.51.100.10"
+port = 9000
+latency_ms = 240
+encryption_enabled = true
+encryption_strength = "aes-256"
+encode_group_ids = ["enc-main"]
+enabled = true
+
+[[webrtc_streams]]
+id = "wb-tb-1"
+name = "Talkback 1"
+direction = "tx"
+source_id = "src-1"
+enabled = true
+
 [program]
 enabled = false
 srt_mode = "listener"

@@ -173,10 +173,18 @@
   overflow: hidden;
 }
 .ab-meter-fill {
-  position: absolute; left: 0; top: 0; bottom: 0;
+  /* Scale: 0% = -60 dBFS, 100% = 0 dBFS. Reference at -20 dBFS = 66.67%.
+     Span the full track — clipPath in JSX crops the visible portion so the
+     gradient stays anchored to the bar instead of being squashed into the fill. */
+  position: absolute; left: 0; top: 0; right: 0; bottom: 0;
   background: linear-gradient(
     to right,
-    #14532d 0%, #22c55e 35%, #84cc16 60%, #f59e0b 80%, #ef4444 100%
+    #14532d 0%,
+    #22c55e 66.67%,
+    #84cc16 70%,
+    #f59e0b 80%,
+    #ef4444 92%,
+    #b91c1c 100%
   );
   border-right: 1px solid #fff8;
 }

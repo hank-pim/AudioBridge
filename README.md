@@ -1,16 +1,17 @@
 # Dante Bridge
 
-Prototype endpoint app for a point-to-point Dante WAN bridge. The first build is a runnable control-plane and operator UI skeleton based on `planv2.md`; the GStreamer/Dante media plane is represented by explicit controller boundaries and simulated telemetry so the product surface can be exercised early.
+Prototype endpoint app for a point-to-point Dante WAN bridge. The current build is a runnable control-plane and operator UI skeleton based on `planv2.md`; the GStreamer/Dante media plane is represented by explicit controller boundaries, subprocess diagnostics, and truthful null telemetry for observations that are not wired yet.
 
 ## What Exists
 
 - FastAPI service with REST and WebSocket APIs.
 - Versioned TOML config model with atomic saves.
 - Static dark operator UI served by the control plane.
-- Program and talkback start/stop controls.
+- Transport-oriented API for sources, encode groups, SRT transports, and WebRTC streams.
+- Legacy program and talkback start/stop controls retained while the UI catches up.
 - Pairing bundle generation and application endpoints.
 - Diagnostics stubs for interfaces and tone generation.
-- Live status stream, event log, and mock clock-recovery telemetry.
+- Live status stream, event log, per-transport runtime state, and explicit media-runtime capability reporting.
 
 ## Run Locally
 
@@ -31,11 +32,33 @@ The app writes its endpoint config to `config/endpoint.toml` the first time sett
 - `GET /api/config`
 - `PUT /api/config`
 - `PATCH /api/config`
+- `GET /api/sources`
+- `POST /api/sources`
+- `PUT /api/sources/{source_id}`
+- `DELETE /api/sources/{source_id}`
+- `GET /api/encode-groups`
+- `POST /api/encode-groups`
+- `PUT /api/encode-groups/{group_id}`
+- `DELETE /api/encode-groups/{group_id}`
+- `GET /api/srt-transports`
+- `POST /api/srt-transports`
+- `PUT /api/srt-transports/{transport_id}`
+- `DELETE /api/srt-transports/{transport_id}`
+- `POST /api/srt-transports/{transport_id}/start`
+- `POST /api/srt-transports/{transport_id}/stop`
+- `GET /api/webrtc-streams`
+- `POST /api/webrtc-streams`
+- `PUT /api/webrtc-streams/{stream_id}`
+- `DELETE /api/webrtc-streams/{stream_id}`
+- `POST /api/webrtc-streams/{stream_id}/start`
+- `POST /api/webrtc-streams/{stream_id}/stop`
 - `POST /api/program/start`
 - `POST /api/program/stop`
 - `POST /api/talkback/start`
 - `POST /api/talkback/stop`
 - `GET /api/status`
+- `GET /api/media/runtime`
+- `GET /api/media/pipelines`
 - `GET /api/events`
 - `POST /api/pairing/bundle`
 - `POST /api/pairing/apply`
@@ -46,8 +69,8 @@ The app writes its endpoint config to `config/endpoint.toml` the first time sett
 
 ## Next Implementation Steps
 
-1. Replace simulated telemetry with platform probes for NICs, audio devices, CPU, memory, and network counters.
-2. Add the media pipeline builder for GStreamer program path capture, OPUS encode/decode, SRT transport, and shared-ratio resampling.
+1. Add platform probes for NICs, audio devices, CPU, memory, network counters, SRT socket stats, and audio meters.
+2. Add a first-class media runtime and graph builder for configured sources, encode groups, OPUS encode/decode, SRT transport, and shared-ratio resampling.
 3. Add WebRTC signaling message types, browser talkback capture, and endpoint-to-endpoint SDP/ICE forwarding.
 4. Add authentication, HTTPS certificate generation, token hashing, and log redaction.
 5. Add tests around config migrations, route validation, pairing bundle expiry, and API behavior.

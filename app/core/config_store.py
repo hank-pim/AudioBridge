@@ -23,8 +23,9 @@ def _plain(value: Any, redact_secrets: bool = False) -> Any:
 
 
 class ConfigStore:
-    def __init__(self, path: Path = DEFAULT_CONFIG_PATH) -> None:
-        self.path = path
+    def __init__(self, path: Path | None = None) -> None:
+        env_path = os.environ.get("DANTEBRIDGE_CONFIG_PATH")
+        self.path = Path(env_path) if env_path else (path or DEFAULT_CONFIG_PATH)
         self._config = self.load()
 
     @property

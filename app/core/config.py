@@ -4,7 +4,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 
 class SrtMode(str, Enum):
@@ -63,6 +63,24 @@ class StreamDirection(str, Enum):
     rx = "rx"  # arriving at this endpoint from the peer
 
 
+class SourceKind(str, Enum):
+    dante_input = "dante_input"
+    tone = "tone"
+    silence = "silence"
+    webrtc_stream = "webrtc_stream"
+
+
+class SourceConfig(BaseModel):
+    id: str
+    name: str
+    kind: SourceKind = SourceKind.dante_input
+    dante_channel: int | None = Field(default=None, ge=1, le=64)
+    webrtc_stream_id: str | None = None
+    tone_frequency_hz: float | None = Field(default=None, gt=0)
+    tone_level_dbfs: float = Field(default=-20.0, le=0.0, ge=-60.0)
+    enabled: bool = True
+
+
 class OpusStreamConfig(BaseModel):
     bitrate_kbps: int = Field(default=96, ge=16, le=512)
     bitrate_mode: Literal["cbr", "vbr", "cvbr"] = "cbr"
@@ -70,6 +88,62 @@ class OpusStreamConfig(BaseModel):
     complexity: int = Field(default=7, ge=0, le=10)
     inband_fec: bool = True
     expected_packet_loss_percent: int = Field(default=5, ge=0, le=30)
+
+
+class WebRtcStreamConfig(BaseModel):
+    id: str
+    name: str
+    direction: StreamDirection
+    source_id: str | None = None
+    enabled: bool = True
+    opus: OpusStreamConfig | None = None
+
+
+class EncodeGroupChannelConfig(BaseModel):
+    index: int = Field(ge=1, le=64)
+    source_id: str | None = None
+    label: str | None = None
+    gain_db: float = 0.0
+
+
+class EncodeGroupConfig(BaseModel):
+    id: str
+    name: str
+    channel_count: int = Field(default=2, ge=1, le=64)
+    channels: list[EncodeGroupChannelConfig] = Field(default_factory=list)
+    opus: OpusStreamConfig = Field(default_factory=OpusStreamConfig)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_channels(self) -> "EncodeGroupConfig":
+        seen: set[int] = set()
+        for channel in self.channels:
+            if channel.index > self.channel_count:
+                raise ValueError("encode group channel index cannot exceed channel_count")
+            if channel.index in seen:
+                raise ValueError("encode group channel indices must be unique")
+            seen.add(channel.index)
+        return self
+
+
+class SrtTransportDirection(str, Enum):
+    tx = "tx"
+    rx = "rx"
+
+
+class SrtTransportConfig(BaseModel):
+    id: str
+    name: str
+    direction: SrtTransportDirection
+    mode: SrtMode = SrtMode.listener
+    host: str | None = None
+    port: int | None = Field(default=None, ge=1, le=65535)
+    latency_ms: int | None = Field(default=None, ge=20, le=8000)
+    encryption_enabled: bool = True
+    encryption_strength: EncryptionStrength = EncryptionStrength.aes256
+    passphrase: SecretStr | None = None
+    encode_group_ids: list[str] = Field(default_factory=list)
+    enabled: bool = True
 
 
 class StreamConfig(BaseModel):
@@ -176,6 +250,10 @@ class EndpointConfig(BaseModel):
     endpoint_name: str = "Dante Bridge Endpoint"
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    sources: list[SourceConfig] = Field(default_factory=list)
+    encode_groups: list[EncodeGroupConfig] = Field(default_factory=list)
+    srt_transports: list[SrtTransportConfig] = Field(default_factory=list)
+    webrtc_streams: list[WebRtcStreamConfig] = Field(default_factory=list)
     routes: RouteMap = Field(default_factory=RouteMap)
     program: ProgramConfig = Field(default_factory=ProgramConfig)
     talkback: TalkbackConfig = Field(default_factory=TalkbackConfig)

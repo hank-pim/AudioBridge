@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Monitor</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; padding: 1rem; }
+  label { display: block; margin: .5rem 0 .25rem; }
+  input, select, button { font: inherit; padding: .35rem .5rem; }
+  input, select { width: 100%; max-width: 30rem; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; }
+  button { background: #2a4; color: #eee; border: 0; cursor: pointer; margin-right: .5rem; }
+  button.stop { background: #a33; }
+  pre { background: #000; padding: .5rem; max-height: 14rem; overflow: auto; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Monitor</h1>
+
+<label>Transport ID</label>
+<input id="transport" value="srt-rx-tone-test" />
+
+<label>Tap ID</label>
+<input id="tap" value="monitor_tap_rx_srt_rx_tone_test" />
+
+<p>
+  <button id="start">Start listening</button>
+  <button id="stop" class="stop" disabled>Stop</button>
+</p>
+
+<audio id="player" autoplay controls></audio>
+
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script>
+const log = (msg) => {
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+};
+
+let pc = null;
+let sessionId = null;
+
+document.getElementById("start").onclick = async () => {
+  const transport = document.getElementById("transport").value.trim();
+  const tap = document.getElementById("tap").value.trim();
+  if (!transport || !tap) return;
+
+  pc = new RTCPeerConnection();
+  pc.addTransceiver("audio", { direction: "recvonly" });
+  pc.ontrack = (event) => {
+    log("ontrack: " + event.track.kind);
+    document.getElementById("player").srcObject = event.streams[0];
+  };
+  pc.onconnectionstatechange = () => log("pc state: " + pc.connectionState);
+
+  log("creating session...");
+  const r = await fetch("/api/monitor-sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ transport_id: transport, tap_id: tap }),
+  });
+  if (!r.ok) {
+    log("create failed: " + r.status + " " + await r.text());
+    return;
+  }
+  const offer = await r.json();
+  sessionId = offer.session_id;
+  log("session " + sessionId + " — applying offer");
+
+  await pc.setRemoteDescription({ sdp: offer.sdp, type: offer.type });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  // Wait for ICE gathering to complete (non-trickle).
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") resolve();
+    });
+  });
+
+  const a = await fetch(`/api/monitor-sessions/${sessionId}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+  });
+  log("answer posted: " + a.status);
+
+  document.getElementById("start").disabled = true;
+  document.getElementById("stop").disabled = false;
+};
+
+document.getElementById("stop").onclick = async () => {
+  if (sessionId) {
+    await fetch(`/api/monitor-sessions/${sessionId}`, { method: "DELETE" });
+    log("closed " + sessionId);
+    sessionId = null;
+  }
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+  document.getElementById("start").disabled = false;
+  document.getElementById("stop").disabled = true;
+};
+</script>
+</body>
+</html>

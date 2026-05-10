@@ -4,8 +4,18 @@ console.log("[variation-a] build loaded", new Date().toISOString());
 
 var useState = React.useState, useMemo = React.useMemo, useEffect = React.useEffect, useRef = React.useRef;
 
+function fmtMetric(value, digits = 1) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "—";
+}
+
+function fmtPercent(value) {
+  return Number.isFinite(value) ? `${value.toFixed(0)}%` : "—";
+}
+
 function VariationA({ density = 8, showEventsRail = true, showSystemCard = true, kpiCount = 6 }) {
-  const { PROGRAM, TALKBACK, SYS, CHANNELS, SERIES } = window.AB;
+  const { PROGRAM, TALKBACK, SYS, CLOCK, CHANNELS, SERIES } = window.AB;
+  const runtime = window.AB.runtime || {};
+  const caps = runtime.capabilities || {};
   const [view, setView] = useState("streams");
   const [tab, setTab] = useState("all"); // all | rx | tx | issues
   const [query, setQuery] = useState("");
@@ -22,6 +32,12 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
     return next;
   });
   const [adding, setAdding] = useState(false);
+  const hasProgramBitrate = Number.isFinite(PROGRAM.bitrate_kbps);
+  const hasProgramRtt = Number.isFinite(PROGRAM.rtt_ms);
+  const hasProgramJitter = Number.isFinite(PROGRAM.jitter_ms);
+  const hasProgramLoss = Number.isFinite(PROGRAM.loss_pct);
+  const hasClockTelemetry = Number.isFinite(CLOCK.frequency_ratio_ppm) || Number.isFinite(CLOCK.buffer_occupancy_ms);
+  const activeMeterCount = CHANNELS.filter(c => Number.isFinite(c.level_dbfs) || Number.isFinite(c.peak_dbfs)).length;
 
   const filtered = useMemo(() => {
     let rows = CHANNELS;
@@ -37,7 +53,7 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
 
   return (
     <div className="ab-frame ab-root">
-      <TopBar active={view} alerts={2} onNavigate={(next) => setView(next === "settings" ? "settings" : "streams")} />
+      <TopBar active={view} alerts={0} onNavigate={(next) => setView(next === "settings" ? "settings" : "streams")} />
 
       {view === "settings" ? (
         <SettingsView onBack={() => setView("streams")} />
@@ -48,63 +64,73 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
       <div style={{ display: "grid", gridTemplateColumns: `repeat(${kpiCount}, 1fr)`, gap: 1, padding: 12, paddingBottom: 0 }}>
         <KpiTile
           label="Program · SRT"
-          value={fmtBitrate(PROGRAM.bitrate_kbps).split(" ")[0]}
-          unit=" Mb/s"
-          delta="+0.4%"
-          deltaTone="ok"
+          value={fmtBitrate(PROGRAM.bitrate_kbps)}
+          delta={PROGRAM.state}
+          deltaTone={PROGRAM.state === "running" ? "warn" : "muted"}
           spark={SERIES.bitrate}
-          sparkTone="ok"
-          footer="OPUS 256k · 64ch · encrypted"
+          sparkTone="muted"
+          liveFooter={`${PROGRAM.codec} | ${PROGRAM.channels || 0} configured ch | ${hasProgramBitrate ? "observed" : "waiting for SRT stats"}`}
+          footer={`${PROGRAM.codec} · ${PROGRAM.channels || 0} configured ch · observed bitrate pending`}
         />
         <KpiTile
           label="RTT · Program"
-          value={PROGRAM.rtt_ms.toFixed(1)}
+          value={fmtMetric(PROGRAM.rtt_ms, 1)}
           unit=" ms"
-          delta="−0.6 ms"
-          deltaTone="ok"
+          delta="unobserved"
+          liveDelta={hasProgramRtt ? "observed" : "unobserved"}
+          deltaTone="muted"
+          liveDeltaTone={hasProgramRtt ? "ok" : "muted"}
           spark={SERIES.rtt}
-          sparkTone="ok"
-          footer="p99 · 41.2ms · TX + RX"
+          sparkTone="muted"
+          liveFooter={hasProgramRtt ? "SRT RTT from media runtime" : "waiting for SRT socket stats"}
+          footer="SRT socket statistics not wired yet"
         />
         <KpiTile
           label="Jitter"
-          value={PROGRAM.jitter_ms.toFixed(2)}
+          value={fmtMetric(PROGRAM.jitter_ms, 2)}
           unit=" ms"
-          delta="+0.1 ms"
-          deltaTone="warn"
+          delta="unobserved"
+          liveDelta={hasProgramJitter ? "observed" : "unobserved"}
+          deltaTone="muted"
+          liveDeltaTone={hasProgramJitter ? "ok" : "muted"}
           spark={SERIES.jitter}
-          sparkTone="warn"
-          footer="buffer hold 220 / 250ms"
+          sparkTone="muted"
+          liveFooter={hasProgramJitter ? "SRT variance from media runtime" : "waiting for jitter probe"}
+          footer="No runtime jitter probe yet"
         />
         <KpiTile
           label="Packet loss"
-          value={(PROGRAM.loss_pct * 100).toFixed(2)}
+          value={fmtMetric(PROGRAM.loss_pct, 2)}
           unit=" %"
-          delta="−0.01"
-          deltaTone="ok"
+          delta="unobserved"
+          liveDelta={hasProgramLoss ? "observed" : "unobserved"}
+          deltaTone="muted"
+          liveDeltaTone={hasProgramLoss ? "ok" : "muted"}
           spark={SERIES.loss}
           sparkTone="muted"
-          footer="60s window"
+          liveFooter={hasProgramLoss ? "packet counters active" : "waiting for packet counters"}
+          footer="No packet counters wired yet"
         />
         {kpiCount >= 5 && (
           <KpiTile
             label="Talkback · WebRTC"
-            value={TALKBACK.rtt_ms.toFixed(1)}
+            value={fmtMetric(TALKBACK.rtt_ms, 1)}
             unit=" ms"
-            delta="lock"
-            deltaTone="ok"
+            delta={caps.webrtc_media ? TALKBACK.state : "control only"}
+            deltaTone={caps.webrtc_media ? "ok" : "muted"}
             spark={SERIES.tb_rtt}
-            sparkTone="ok"
-            footer="OPUS 64k · 2ch"
+            sparkTone="muted"
+            footer={`${TALKBACK.codec} · media runtime ${caps.webrtc_media ? "available" : "not wired"}`}
           />
         )}
         {kpiCount >= 6 && (
           <ClockKpiTile
-            sync="lock"
-            ppm={-0.18}
-            codec="OPUS 256k"
+            sync={CLOCK.lock_state || "off"}
+            ppm={CLOCK.frequency_ratio_ppm}
+            codec={PROGRAM.codec}
             sampleRate="48.000 kHz"
-            note="shared ratio · last slew 6m ago"
+            liveNote={hasClockTelemetry ? "clock telemetry observed" : "waiting for clock telemetry"}
+            note={caps.clock_recovery ? "runtime clock recovery active" : "clock recovery not wired yet"}
           />
         )}
       </div>
@@ -113,6 +139,7 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: (showEventsRail || showSystemCard) ? "1fr 320px" : "1fr", gap: 12, padding: 12, minHeight: 0 }}>
         <Card
           title="Streams"
+          liveHint={`${filtered.length} of ${CHANNELS.length} | ${activeMeterCount} metered | ${CHANNELS.filter(c => c.state === "warn" || c.state === "err").length} alerts`}
           hint={`${filtered.length} of ${CHANNELS.length} · ${CHANNELS.filter(c => c.state === "warn" || c.state === "err").length} alerts`}
           right={(
             <>
@@ -139,7 +166,7 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                                 background: "var(--ab-surface-2)", color: "var(--ab-fg)",
                                 border: "1px solid var(--ab-border-soft)", borderRadius: 4, outline: "none" }} />
               </div>
-              <button className="ab-btn" data-variant={adding ? "primary" : undefined} style={{ height: 22, fontSize: 11 }} onClick={() => setAdding(v => !v)}>+ add stream</button>
+              <button className="ab-btn" data-variant={adding ? "primary" : undefined} style={{ height: 22, fontSize: 11 }} onClick={() => setAdding(v => !v)}>+ add object</button>
               <button className="ab-btn" style={{ height: 22, fontSize: 11 }}><Icon.refresh /> 1s</button>
             </>
           )}
@@ -188,9 +215,9 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                         <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-2)", width: 38, textAlign: "right" }}>{fmtDb(c.level_dbfs)}</span>
                       </div>
                     </td>
-                    <td className="ab-num ab-mono" style={{ color: c.loss_pct > 1 ? "var(--ab-err)" : c.loss_pct > 0.3 ? "var(--ab-warn)" : "var(--ab-fg-3)" }}>{c.loss_pct.toFixed(2)}</td>
-                    <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{c.jitter_ms ? c.jitter_ms.toFixed(1) : "—"}</td>
-                    <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{c.latency_ms ? c.latency_ms.toFixed(0) : "—"}</td>
+                    <td className="ab-num ab-mono" style={{ color: c.loss_pct > 1 ? "var(--ab-err)" : c.loss_pct > 0.3 ? "var(--ab-warn)" : "var(--ab-fg-3)" }}>{fmtMetric(c.loss_pct, 2)}</td>
+                    <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{fmtMetric(c.jitter_ms, 1)}</td>
+                    <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{fmtMetric(c.latency_ms, 0)}</td>
                     <td className="ab-num ab-mono" style={{ color: c.buffer_ms == null ? "var(--ab-fg-5)" : c.buffer_ms > 200 ? "var(--ab-warn)" : "var(--ab-fg-3)" }}>{c.buffer_ms == null ? "—" : c.buffer_ms.toFixed(0)}</td>
                     <td className="ab-mono" style={{ fontSize: 11 }}><TransportLabel transport={c.transport} codec={c.codec} /></td>
                     <td className="ab-mono" style={{ color: "var(--ab-fg-3)", fontSize: 11 }}>{c.route}</td>
@@ -215,16 +242,16 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
           {showSystemCard && (
           <Card title="System" hint={SYS.audio_iface.name}>
             <div style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 10 }}>
-              <SysRow label="CPU" value={SYS.cpu_pct + "%"} bar={SYS.cpu_pct} tone="ok" sub={`load avg 0.74`} />
-              <SysRow label="MEM" value={SYS.mem_pct + "%"} bar={SYS.mem_pct} tone="ok" sub={`3.1 / 6.5 GiB`} />
-              <SysRow label="TEMP" value={SYS.temp_c + "°C"} bar={(SYS.temp_c / 90) * 100} tone={SYS.temp_c > 70 ? "warn" : "ok"} sub="threshold 78°C" />
+              <SysRow label="CPU" value={fmtPercent(SYS.cpu_pct)} bar={SYS.cpu_pct} tone="muted" sub="probe pending" />
+              <SysRow label="MEM" value={SYS.mem_mb == null ? "—" : `${SYS.mem_mb} MB`} bar={SYS.mem_pct} tone="muted" sub="probe pending" />
+              <SysRow label="TEMP" value={SYS.temp_c == null ? "—" : `${SYS.temp_c}°C`} bar={SYS.temp_c == null ? null : (SYS.temp_c / 90) * 100} tone="muted" sub="probe pending" />
               <div className="ab-divider" />
               <div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-                  <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }} title="Single shared resampler PLL — one clock domain for all interleaved channels on this bridge">Resampler PLL</span>
-                  <ClockChip sync="lock" ppm={-0.18} />
+                  <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }} title={hasClockTelemetry ? "Clock telemetry observed" : "Waiting for clock telemetry"}>Clock Runtime</span>
+                  <ClockChip sync={CLOCK.lock_state || "off"} ppm={CLOCK.frequency_ratio_ppm} />
                 </div>
-                <div className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)", marginTop: 3 }}>shared ratio · 48.000 kHz · last slew 6m ago</div>
+                <div className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)", marginTop: 3 }}>{CLOCK.mode || "adaptive"} · {hasClockTelemetry ? "telemetry observed" : "telemetry pending"}</div>
               </div>
               <div className="ab-divider" />
               <NicRow label="Dante NIC" nic={SYS.nic_dante} />
@@ -255,6 +282,7 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
 }
 
 function SysRow({ label, value, bar, tone, sub }) {
+  const width = Number.isFinite(bar) ? Math.max(0, Math.min(100, bar)) : 0;
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
@@ -262,13 +290,15 @@ function SysRow({ label, value, bar, tone, sub }) {
         <span className="ab-mono" style={{ fontSize: 12, color: "var(--ab-fg)" }}>{value}</span>
       </div>
       <div style={{ height: 4, background: "var(--ab-surface-3)", borderRadius: 1, overflow: "hidden" }}>
-        <div style={{ width: bar + "%", height: "100%", background: tone === "warn" ? "var(--ab-warn)" : "var(--ab-accent)" }} />
+        <div style={{ width: width + "%", height: "100%", background: tone === "warn" ? "var(--ab-warn)" : "var(--ab-accent)" }} />
       </div>
       {sub && <div className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)", marginTop: 3 }}>{sub}</div>}
     </div>
   );
 }
 function NicRow({ label, nic }) {
+  const rx = Number.isFinite(nic.rx_mbps) ? nic.rx_mbps : "—";
+  const tx = Number.isFinite(nic.tx_mbps) ? nic.tx_mbps : "—";
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
       <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -277,7 +307,7 @@ function NicRow({ label, nic }) {
       </div>
       <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-4)", display: "flex", justifyContent: "space-between" }}>
         <span>{nic.ip}</span>
-        <span>↓ {nic.rx_mbps} <span style={{ color: "var(--ab-fg-5)" }}>·</span> ↑ {nic.tx_mbps} <span style={{ color: "var(--ab-fg-5)" }}>Mb/s</span></span>
+        <span>↓ {rx} <span style={{ color: "var(--ab-fg-5)" }}>·</span> ↑ {tx} <span style={{ color: "var(--ab-fg-5)" }}>Mb/s</span></span>
       </div>
     </div>
   );
@@ -285,7 +315,8 @@ function NicRow({ label, nic }) {
 
 function SettingsView({ onBack }) {
   const cfg = window.AB.config || {};
-  const streams = (cfg.audio && cfg.audio.streams) || [];
+  const srtTransports = cfg.srt_transports || [];
+  const webrtcStreams = cfg.webrtc_streams || [];
   const programDefaults = (cfg.program && cfg.program.opus) || defaultOpus("srt");
 
   const makeState = () => ({
@@ -354,9 +385,9 @@ function SettingsView({ onBack }) {
 
   const current = JSON.stringify(makeState());
   const dirty = JSON.stringify(form) !== current;
-  const srtStreams = streams.filter(s => (s.transport || "srt") === "srt").length;
-  const rtcStreams = streams.filter(s => (s.transport || "srt") === "webrtc").length;
-  const overridden = streams.filter(s => !!s.opus).length;
+  const srtStreams = srtTransports.length;
+  const rtcStreams = webrtcStreams.length;
+  const overridden = 0;
 
   const update = (section, key, value) => {
     setForm(prev => ({ ...prev, [section]: { ...prev[section], [key]: value } }));
@@ -541,7 +572,7 @@ function SettingsView({ onBack }) {
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, padding: 12, gap: 12, overflow: "auto" }}>
       <Card
         title="Settings"
-        hint={`${streams.length} streams - ${srtStreams} SRT / ${rtcStreams} WebRTC - ${overridden} overrides`}
+        hint={`${srtStreams + rtcStreams} objects - ${srtStreams} SRT / ${rtcStreams} WebRTC - ${overridden} overrides`}
         right={(
           <>
             {error && <span className="ab-mono" style={{ color: "var(--ab-err)", fontSize: 10.5, maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{error}</span>}
@@ -862,6 +893,7 @@ function TypeChip({ type, transport }) {
 }
 function StateChip({ state }) {
   const meta = state === "active" ? { fg: "var(--ab-ok)",   bg: "var(--ab-ok-soft)",   bd: "rgba(34,197,94,0.35)",  label: "ACTIVE" }
+             : state === "running"? { fg: "var(--ab-warn)", bg: "var(--ab-warn-soft)", bd: "rgba(245,158,11,0.35)", label: "RUN"    }
              : state === "warn"   ? { fg: "var(--ab-warn)", bg: "var(--ab-warn-soft)", bd: "rgba(245,158,11,0.35)", label: "WARN"   }
              : state === "err"    ? { fg: "var(--ab-err)",  bg: "var(--ab-err-soft)",  bd: "rgba(239,68,68,0.35)",  label: "ERR"    }
              : state === "muted"  ? { fg: "var(--ab-fg-3)", bg: "var(--ab-surface-2)", bd: "var(--ab-border-soft)", label: "MUTE"   }
@@ -901,19 +933,164 @@ const ActIcon = {
 };
 
 function RowActions({ ch, expanded, onToggle }) {
-  const isVoice  = ch.type === "PL" || ch.type === "IFB" || ch.type === "TB";
-  const running  = ch.state !== "idle";
-  const canTalk  = isVoice && ch.direction === "out";
+  const running = ch.state !== "idle";
+  const runtime = window.AB.runtime || {};
+  const caps = runtime.capabilities || {};
+  const supportsLifecycle = ch.entity_kind === "srt_transport"
+    || (ch.entity_kind === "webrtc_stream" && !!caps.webrtc_media);
+  const diagnostics = (window.AB.status && window.AB.status.diagnostics) || {};
+  const endpointBase = ch.entity_kind === "srt_transport"
+    ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
+    : ch.entity_kind === "webrtc_stream"
+      ? `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`
+      : null;
+  const supportsListen = ch.entity_kind === "srt_transport" && ch.direction === "in";
+  const [monitorSession, setMonitorSession] = useState(null);
+  const monitorActiveForRow = !!monitorSession;
+  const [actionState, setActionState] = useState({ tone: "idle", message: "" });
+
+  useEffect(() => {
+    return () => {
+      if (!monitorSession) return;
+      try { fetch(`/api/monitor-sessions/${monitorSession.sessionId}`, { method: "DELETE" }).catch(() => {}); } catch {}
+      try { monitorSession.pc.close(); } catch {}
+      if (monitorSession.audio && monitorSession.audio.parentNode) {
+        monitorSession.audio.parentNode.removeChild(monitorSession.audio);
+      }
+    };
+  }, [monitorSession]);
+
+  // If the transport stops while we're listening, drop the dead session.
+  useEffect(() => {
+    if (monitorSession && ch.state === "idle") {
+      try { fetch(`/api/monitor-sessions/${monitorSession.sessionId}`, { method: "DELETE" }).catch(() => {}); } catch {}
+      try { monitorSession.pc.close(); } catch {}
+      if (monitorSession.audio && monitorSession.audio.parentNode) {
+        monitorSession.audio.parentNode.removeChild(monitorSession.audio);
+      }
+      setMonitorSession(null);
+    }
+  }, [ch.state]);
+
+  const refreshProgramView = async () => {
+    await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
+  };
+
+  const showActionState = (tone, message) => {
+    setActionState({ tone, message });
+    window.setTimeout(() => {
+      setActionState((current) => current.message === message ? { tone: "idle", message: "" } : current);
+    }, 2500);
+  };
+
+  const handleProgramStart = async () => {
+    if (!endpointBase) return;
+    try {
+      const response = await fetch(`${endpointBase}/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: ch.entity_kind === "srt_transport" && ch.direction === "out"
+          ? JSON.stringify({ frequency_hz: 1000, level_dbfs: -18, waveform: "sine" })
+          : undefined,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshProgramView();
+      showActionState("ok", "started");
+    } catch (error) {
+      console.error("[program] start failed", error);
+      showActionState("err", "start failed");
+    }
+  };
+
+  const handleProgramStop = async () => {
+    if (!endpointBase) return;
+    try {
+      const response = await fetch(`${endpointBase}/stop`, { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshProgramView();
+      showActionState("ok", "stopped");
+    } catch (error) {
+      console.error("[program] stop failed", error);
+      showActionState("err", "stop failed");
+    }
+  };
+
+  const handleListenToggle = async () => {
+    if (!supportsListen) return;
+
+    try {
+      if (monitorActiveForRow) {
+        const { sessionId, pc, audio } = monitorSession;
+        try { await fetch(`/api/monitor-sessions/${sessionId}`, { method: "DELETE" }); } catch {}
+        try { pc.close(); } catch {}
+        if (audio && audio.parentNode) audio.parentNode.removeChild(audio);
+        setMonitorSession(null);
+        showActionState("ok", "listen stopped");
+        return;
+      }
+
+      const pc = new RTCPeerConnection();
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      const audio = document.createElement("audio");
+      audio.autoplay = true;
+      audio.style.display = "none";
+      document.body.appendChild(audio);
+      pc.ontrack = (event) => { audio.srcObject = event.streams[0]; };
+
+      const create = await fetch("/api/monitor-sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transport_id: ch.runtime_id }),
+      });
+      if (!create.ok) {
+        pc.close();
+        if (audio.parentNode) audio.parentNode.removeChild(audio);
+        throw new Error(await create.text());
+      }
+      const offer = await create.json();
+      await pc.setRemoteDescription({ sdp: offer.sdp, type: offer.type });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (pc.iceGatheringState === "complete") resolve();
+        });
+      });
+      const ans = await fetch(`/api/monitor-sessions/${offer.session_id}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      });
+      if (!ans.ok) {
+        try { await fetch(`/api/monitor-sessions/${offer.session_id}`, { method: "DELETE" }); } catch {}
+        pc.close();
+        if (audio.parentNode) audio.parentNode.removeChild(audio);
+        throw new Error(await ans.text());
+      }
+      setMonitorSession({ sessionId: offer.session_id, pc, audio });
+      showActionState("ok", "listening");
+    } catch (error) {
+      console.error("[monitor] toggle failed", error);
+      showActionState("err", "listen failed");
+    }
+  };
+
   return (
-    <div style={{ display: "inline-flex", gap: 3 }}>
-      {running
-        ? <IconBtn tone="err" title="Stop stream"><ActIcon.stop /></IconBtn>
-        : <IconBtn tone="acc" title="Start stream"><ActIcon.play /></IconBtn>}
-      <IconBtn tone="info" title="Listen / monitor locally"><ActIcon.listen /></IconBtn>
-      {canTalk && (
-        <IconBtn tone="info" title="Push to talk"><ActIcon.mic /></IconBtn>
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
+      <div style={{ display: "inline-flex", gap: 3 }}>
+        {running
+          ? <IconBtn tone="err" title={supportsLifecycle ? "Stop stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStop}><ActIcon.stop /></IconBtn>
+          : <IconBtn tone="acc" title={supportsLifecycle ? "Start stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStart}><ActIcon.play /></IconBtn>}
+        <IconBtn tone={monitorActiveForRow ? "ok" : "info"} title={supportsListen ? (monitorActiveForRow ? "Stop monitor" : "Listen in browser") : "Listen is only available for RX SRT transports"} disabled={!supportsListen} onClick={handleListenToggle}><ActIcon.listen /></IconBtn>
+        <IconBtn tone="info" title="Push to talk is not wired yet" disabled={true}><ActIcon.mic /></IconBtn>
+        <IconBtn tone={expanded ? "acc" : "ghost"} title={expanded ? "Hide settings" : "Stream settings"} onClick={onToggle}><ActIcon.more /></IconBtn>
+      </div>
+      {actionState.message && (
+        <span className="ab-mono" style={{ fontSize: 9.5, color: actionState.tone === "err" ? "var(--ab-err)" : "var(--ab-ok)" }}>
+          {actionState.message}
+        </span>
       )}
-      <IconBtn tone={expanded ? "acc" : "ghost"} title={expanded ? "Hide settings" : "Stream settings"} onClick={onToggle}><ActIcon.more /></IconBtn>
     </div>
   );
 }
@@ -930,7 +1107,7 @@ function ClockChip({ sync, ppm }) {
         height: 14, padding: "0 5px", fontFamily: "var(--ab-mono)", fontSize: 9.5, letterSpacing: 0.05,
         borderRadius: 2, color: meta.fg, background: meta.bg, border: "1px solid " + meta.bd,
       }}>{meta.label}</span>
-      {ppm != null && sync !== "off" && (
+      {Number.isFinite(ppm) && sync !== "off" && (
         <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)" }}>
           {ppm >= 0 ? "+" : ""}{Math.abs(ppm) < 1 ? ppm.toFixed(2) : ppm.toFixed(1)}
         </span>
@@ -939,20 +1116,22 @@ function ClockChip({ sync, ppm }) {
   );
 }
 
-// Codec / resampling clock status — replaces the old CPU tile in the
-// hero KPI strip. One indicator for the bridge's single shared resampler
-// PLL: lock state, ppm offset, codec, sample rate, clock domain.
-function ClockKpiTile({ sync = "lock", ppm = 0, codec = "OPUS 256k", sampleRate = "48.000 kHz", note }) {
+// Codec / clock status. Most values stay blank until the media runtime
+// has real clock and resampler telemetry.
+function ClockKpiTile({ sync = "off", ppm = null, codec = "—", sampleRate = "48.000 kHz", note, liveNote }) {
   const tone = sync === "lock" ? "ok" : sync === "slew" ? "warn" : sync === "drift" ? "err" : "muted";
+  const ppmLabel = Number.isFinite(ppm)
+    ? `${ppm >= 0 ? "+" : "−"}${Math.abs(ppm) < 1 ? Math.abs(ppm).toFixed(2) : Math.abs(ppm).toFixed(1)}`
+    : "—";
   return (
     <div className="ab-card" style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
-        <span className="ab-kpi-label" title="Single shared resampler PLL — one clock domain for all interleaved channels on this bridge">Codec · Resampler PLL</span>
+        <span className="ab-kpi-label" title={Number.isFinite(ppm) ? "Clock telemetry observed" : "Waiting for clock telemetry"}>Codec · Clock</span>
         <ClockChip sync={sync} ppm={null} />
       </div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
         <span className="ab-kpi-value">
-          {ppm >= 0 ? "+" : "−"}{Math.abs(ppm) < 1 ? Math.abs(ppm).toFixed(2) : Math.abs(ppm).toFixed(1)}
+          {ppmLabel}
           <span className="ab-kpi-unit"> ppm</span>
         </span>
         <span className="ab-kpi-delta" style={{ color: `var(--ab-${tone === "muted" ? "fg-3" : tone})` }}>
@@ -968,7 +1147,7 @@ function ClockKpiTile({ sync = "lock", ppm = 0, codec = "OPUS 256k", sampleRate 
         }}>{codec}</span>
         <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-3)" }}>{sampleRate}</span>
       </div>
-      {note && <div style={{ fontSize: 10.5, color: "var(--ab-fg-4)", fontFamily: "var(--ab-mono)" }}>{note}</div>}
+      {(liveNote || note) && <div style={{ fontSize: 10.5, color: "var(--ab-fg-4)", fontFamily: "var(--ab-mono)" }}>{liveNote || note}</div>}
     </div>
   );
 }
@@ -996,59 +1175,98 @@ function defaultOpus(transport) {
 
 function AddStreamPanel({ onClose }) {
   const cfg = window.AB.config || {};
-  const streams = (cfg.audio && cfg.audio.streams) || [];
-  const channelCount = (cfg.audio && cfg.audio.channel_count) || 0;
-  const max = 128;
-  const atCap = streams.length >= max;
+  const [kind, setKind] = useState("srt_transport");
+  const [name, setName] = useState("");
+  const [direction, setDirection] = useState("tx");
+  const [mode, setMode] = useState("listener");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState(String((cfg.network && cfg.network.srt_port) || 9000));
+  const [latencyMs, setLatencyMs] = useState(String((cfg.program && cfg.program.srt_latency_ms) || 240));
+  const [sourceId, setSourceId] = useState("");
+  const [sourceKind, setSourceKind] = useState("tone");
+  const [toneFrequency, setToneFrequency] = useState("1000");
+  const [status, setStatus] = useState("idle");
+  const [error, setError] = useState("");
 
-  const [name, setName]           = useState("");
-  const [transport, setTransport] = useState("srt");
-  const [type, setType]           = useState("PGM");
-  const [dir,  setDir]            = useState("tx");
-  const [dante, setDante]         = useState("");
-  const [opus, setOpus]           = useState(defaultOpus("srt"));
-  const [opusOverride, setOpusOverride] = useState(false);
-  const [status, setStatus]       = useState("idle");
-  const [error, setError]         = useState(null);
+  const trimmedName = name.trim();
+  const previewId = `${kind === "srt_transport" ? "srt" : "wrtc"}-${(trimmedName || "item").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "item"}`;
+  const sourcePreviewId = `src-${previewId}`;
+  const groupPreviewId = `enc-${previewId}`;
+  const srtTxNeedsHost = kind === "srt_transport" && direction === "tx" && mode !== "listener";
+  const canSubmit = !!trimmedName && (!srtTxNeedsHost || !!host.trim()) && status !== "saving";
 
-  // When transport flips, reset OPUS suggestion if the operator hasn't
-  // explicitly diverged from the bridge default.
-  useEffect(() => {
-    if (!opusOverride) setOpus(defaultOpus(transport));
-  }, [transport, opusOverride]);
-
-  const trimmed = name.trim();
-  const danteN = dante === "" ? null : Math.max(1, Math.min(64, parseInt(dante, 10) || 0));
+  const postJson = async (path, body) => {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+  };
 
   const submit = async () => {
-    console.log("[add-stream] submit click", { trimmed, atCap, type, transport, dir, danteN, opusOverride });
-    if (!trimmed) { setError("name is required"); setStatus("error"); return; }
-    if (atCap)    { setError("at stream cap");    setStatus("error"); return; }
-    setStatus("saving"); setError(null);
+    if (!trimmedName) {
+      setError("name is required");
+      setStatus("error");
+      return;
+    }
+    if (srtTxNeedsHost && !host.trim()) {
+      setError("host is required for caller and rendezvous TX");
+      setStatus("error");
+      return;
+    }
+
+    setStatus("saving");
+    setError("");
+
     try {
-      const stream = {
-        name: trimmed, type, transport, direction: dir,
-        ...(danteN ? { dante_channel: danteN } : {}),
-        ...(opusOverride ? { opus } : {}),
-      };
-      const next = streams.concat([stream]);
-      const patch = { audio: { streams: next } };
-      if (danteN && danteN > channelCount) patch.audio.channel_count = danteN;
-      console.log("[add-stream] PATCH /api/config", patch);
-      const r = await fetch("/api/config", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(patch),
-      });
-      const text = await r.text();
-      console.log("[add-stream] response", r.status, text.slice(0, 400));
-      if (!r.ok) throw new Error(text);
-      await (window.AB.refreshConfig && window.AB.refreshConfig());
-      setName(""); setDante(""); setOpusOverride(false);
+      if (kind === "srt_transport") {
+        const encodeGroupIds = [];
+        if (direction === "tx") {
+          await postJson("/api/sources", {
+            id: sourcePreviewId,
+            name: `${trimmedName} ${sourceKind === "tone" ? "Tone" : "Silence"}`,
+            kind: sourceKind,
+            enabled: true,
+            ...(sourceKind === "tone" ? { tone_frequency_hz: clampInt(toneFrequency, 20, 20000) } : {}),
+          });
+          await postJson("/api/encode-groups", {
+            id: groupPreviewId,
+            name: `${trimmedName} Mono`,
+            channel_count: 1,
+            channels: [
+              { index: 1, source_id: sourcePreviewId, label: sourceKind === "tone" ? "Tone" : "Silence", gain_db: 0.0 },
+            ],
+            opus: defaultOpus("srt"),
+            enabled: true,
+          });
+          encodeGroupIds.push(groupPreviewId);
+        }
+        await postJson("/api/srt-transports", {
+          id: previewId,
+          name: trimmedName,
+          direction,
+          mode,
+          port: clampInt(port, 1, 65535),
+          latency_ms: clampInt(latencyMs, 20, 8000),
+          ...(host.trim() ? { host: host.trim() } : {}),
+          encode_group_ids: encodeGroupIds,
+        });
+      } else {
+        await postJson("/api/webrtc-streams", {
+          id: previewId,
+          name: trimmedName,
+          direction,
+          ...(sourceId.trim() ? { source_id: sourceId.trim() } : {}),
+        });
+      }
+
+      await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
       setStatus("idle");
       onClose();
     } catch (e) {
-      console.error("[add-stream] failed", e);
+      console.error("[add-object] failed", e);
       setError(String(e.message || e));
       setStatus("error");
     }
@@ -1058,101 +1276,73 @@ function AddStreamPanel({ onClose }) {
     <div style={{ padding: "12px 14px 14px", background: "var(--ab-surface-2)", borderBottom: "1px solid var(--ab-border)", display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }}>
-          New stream
-        </span>
-        <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-5)" }}>
-          {atCap ? `at stream cap (${max})` : `slot ${streams.length + 1} of ${max}`}
+          New object
         </span>
         <button className="ab-btn" data-variant="ghost" onClick={onClose} style={{ marginLeft: "auto", height: 22, fontSize: 11 }}>cancel</button>
-        <button className="ab-btn" data-variant="primary" disabled={!trimmed || atCap || status === "saving"} onClick={submit} style={{ height: 22, fontSize: 11 }}>
-          {status === "saving" ? "adding…" : "add stream"}
+        <button className="ab-btn" data-variant="primary" disabled={!canSubmit} onClick={submit} style={{ height: 22, fontSize: 11 }}>
+          {status === "saving" ? "creating..." : "create"}
         </button>
       </div>
-
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 14 }}>
         <CfgSection label="Identity">
-          <CfgField label="Name">
-            <input
-              autoFocus
-              value={name}
-              onChange={e => setName(e.target.value)}
-              onKeyDown={e => { if (e.key === "Enter") submit(); if (e.key === "Escape") onClose(); }}
-              placeholder="e.g. PGM L, Caller 1 mic, IFB Talent A"
-              className="ab-mono"
-              style={cfgInputStyle}
-            />
+          <CfgField label="Kind">
+            <Segmented value={kind} onChange={setKind} options={[["srt_transport", "SRT"], ["webrtc_stream", "WebRTC"]]} />
           </CfgField>
-          <CfgField label="Type">
-            <select value={type} onChange={e => setType(e.target.value)} className="ab-mono" style={cfgInputStyle}>
-              {STREAM_TYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
+          <CfgField label="Name">
+            <input autoFocus value={name} onChange={e => setName(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder="operator label" />
           </CfgField>
           <CfgField label="Direction">
-            <Segmented value={dir} onChange={setDir} options={[["tx", "TX"], ["rx", "RX"]]} />
-          </CfgField>
-          <CfgField label="Dante ch">
-            <input
-              value={dante}
-              onChange={e => setDante(e.target.value.replace(/[^0-9]/g, ""))}
-              placeholder="optional · 1–64"
-              className="ab-mono"
-              style={cfgInputStyle}
-              title={dir === "tx" ? "Local Dante input channel feeding this stream" : "Local Dante output channel this stream lands on"}
-            />
+            <Segmented value={direction} onChange={setDirection} options={[["tx", "TX"], ["rx", "RX"]]} />
           </CfgField>
         </CfgSection>
-
-        <CfgSection label="Transport" hint="how this stream rides the WAN">
-          <CfgField label="Path">
-            <Segmented
-              value={transport}
-              onChange={setTransport}
-              options={[["srt", "SRT"], ["webrtc", "WebRTC"]]}
-            />
-          </CfgField>
-          {transport === "srt" ? (
+        {kind === "srt_transport" ? (
+          <CfgSection label="Transport">
+            <CfgField label="Mode">
+              <Segmented value={mode} onChange={setMode} options={[["listener", "Listen"], ["caller", "Call"], ["rendezvous", "Rendezvous"]]} />
+            </CfgField>
+            <CfgField label="Host">
+              <input value={host} onChange={e => setHost(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder={mode === "listener" ? "optional" : "required for call/rendezvous"} />
+            </CfgField>
+            <CfgField label="Port">
+              <NumberField value={port} min={1} max={65535} onChange={setPort} suffix="port" />
+            </CfgField>
+            <CfgField label="Latency">
+              <NumberField value={latencyMs} min={20} max={8000} onChange={setLatencyMs} suffix="ms" />
+            </CfgField>
+            {direction === "tx" && (
+              <>
+                <CfgField label="Source">
+                  <Segmented value={sourceKind} onChange={setSourceKind} options={[["tone", "Tone"], ["silence", "Silence"]]} />
+                </CfgField>
+                {sourceKind === "tone" && (
+                  <CfgField label="Tone">
+                    <NumberField value={toneFrequency} min={20} max={20000} onChange={setToneFrequency} suffix="Hz" />
+                  </CfgField>
+                )}
+              </>
+            )}
+          </CfgSection>
+        ) : (
+          <CfgSection label="Stream">
+            <CfgField label="Source id">
+              <input value={sourceId} onChange={e => setSourceId(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder="optional source link" />
+            </CfgField>
+            <CfgField label="Codec"><span className="ab-mono" style={cfgVal}>inherits talkback defaults</span></CfgField>
+          </CfgSection>
+        )}
+        <CfgSection label="Preview">
+          <CfgField label="ID"><span className="ab-mono" style={cfgVal}>{previewId}</span></CfgField>
+          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? "source -> group -> SRT" : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
+          {kind === "srt_transport" && direction === "tx" && (
             <>
-              <CfgField label="SRT mode"><span className="ab-mono" style={cfgVal}>{(cfg.program && cfg.program.srt_mode) || "listener"}</span></CfgField>
-              <CfgField label="SRT port"><span className="ab-mono" style={cfgVal}>{(cfg.network && cfg.network.srt_port) || 9000}</span></CfgField>
-              <CfgField label="Latency"><span className="ab-mono" style={cfgVal}>{(cfg.program && cfg.program.srt_latency_ms) || 240} ms</span></CfgField>
-              <CfgField label="Encryption"><span className="ab-mono" style={cfgVal}>{(cfg.program && cfg.program.encryption_enabled) ? ((cfg.program && cfg.program.encryption_strength) || "on") : "off"}</span></CfgField>
-            </>
-          ) : (
-            <>
-              <CfgField label="STUN"><span className="ab-mono" style={cfgVal}>{((cfg.network && cfg.network.stun_servers) || []).length} server(s)</span></CfgField>
-              <CfgField label="TURN"><span className="ab-mono" style={cfgVal}>{(cfg.network && cfg.network.turn_server) || "—"}</span></CfgField>
-              <CfgField label="Encryption"><span className="ab-mono" style={cfgVal}>DTLS-SRTP (mandatory)</span></CfgField>
+              <CfgField label="Source ID"><span className="ab-mono" style={cfgVal}>{sourcePreviewId}</span></CfgField>
+              <CfgField label="Group ID"><span className="ab-mono" style={cfgVal}>{groupPreviewId}</span></CfgField>
             </>
           )}
-        </CfgSection>
-
-        <CfgSection
-          label="OPUS codec"
-          hint={opusOverride ? "per-stream override" : "inheriting bridge defaults"}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingBottom: 2 }}>
-            <button className="ab-btn" data-variant={opusOverride ? "primary" : "ghost"} onClick={() => setOpusOverride(v => !v)} style={{ height: 22, fontSize: 11 }}>
-              {opusOverride ? "using override" : "override defaults"}
-            </button>
-            {opusOverride && (
-              <button className="ab-btn" data-variant="ghost" onClick={() => setOpus(defaultOpus(transport))} style={{ height: 22, fontSize: 11 }}>
-                reset
-              </button>
-            )}
-          </div>
-          <OpusFields opus={opus} disabled={!opusOverride} onChange={setOpus} />
+          <CfgField label="State"><span className="ab-mono" style={cfgVal}>created stopped</span></CfgField>
         </CfgSection>
       </div>
-
-      <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-5)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <span>preview:</span>
-        <TypeChip type={type} transport={transport === "srt" ? "SRT" : "WebRTC"} />
-        <span style={{ color: dir === "tx" ? "var(--ab-accent)" : "var(--ab-info)" }}>{dir.toUpperCase()}</span>
-        <span>· {transport === "srt" ? "SRT" : "WebRTC"}</span>
-        <span>· OPUS {opus.bitrate_kbps}k / {opus.frame_ms}ms</span>
-        {danteN && <span>· Dante ch {danteN}</span>}
-      </div>
-      {error && <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-err)" }}>error: {error}</div>}
+      {error && <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-err)" }}>{error}</div>}
     </div>
   );
 }
@@ -1229,131 +1419,99 @@ function OpusFields({ opus, disabled, onChange }) {
 
 function StreamConfig({ ch, onClose }) {
   const cfg = window.AB.config || {};
-  const srtLatency = (cfg.program && cfg.program.srt_latency_ms) || 240;
-  const clockMode  = (cfg.program && cfg.program.clock_recovery_mode) || "adaptive";
+  const details = ch.details || {};
+  const [name, setName] = useState(ch.name || "");
+  const [direction, setDirection] = useState(details.direction || (ch.direction === "out" ? "tx" : "rx"));
+  const [mode, setMode] = useState(details.mode || "listener");
+  const [host, setHost] = useState(details.host || "");
+  const [port, setPort] = useState(String(details.port || ((cfg.network && cfg.network.srt_port) || 9000)));
+  const [latencyMs, setLatencyMs] = useState(String(details.latency_ms || ((cfg.program && cfg.program.srt_latency_ms) || 240)));
+  const [sourceId, setSourceId] = useState(details.source_id || "");
+  const [saveState, setSaveState] = useState("idle");
+  const [saveError, setSaveError] = useState("");
+  const fields = ch.entity_kind === "srt_transport"
+    ? [
+        ["ID", details.id || ch.runtime_id],
+        ["Direction", details.direction || (ch.direction === "out" ? "tx" : "rx")],
+        ["Mode", details.mode || "listener"],
+        ["Host", details.host || "—"],
+        ["Port", details.port || ((cfg.network && cfg.network.srt_port) || "—")],
+        ["Latency", details.latency_ms != null ? `${details.latency_ms} ms` : "—"],
+        ["Groups", (details.encode_group_ids || []).join(", ") || "—"],
+        ["State", details.state || ch.state],
+      ]
+    : [
+        ["ID", details.id || ch.runtime_id],
+        ["Direction", details.direction || (ch.direction === "out" ? "tx" : "rx")],
+        ["Source", details.source_id || "—"],
+        ["Bitrate", details.bitrate_kbps != null ? `${details.bitrate_kbps} kbps` : "—"],
+        ["RTT", details.rtt_ms != null ? `${details.rtt_ms} ms` : "—"],
+        ["State", details.state || ch.state],
+      ];
 
-  const streams = (cfg.audio && cfg.audio.streams) || [];
-  const idx = ch.id - 1;
-  const streamCfg = streams[idx] || {
-    name: ch.name, type: ch.type, transport: ch.transport === "WebRTC" ? "webrtc" : "srt",
-    direction: ch.direction === "in" ? "rx" : "tx", dante_channel: ch.dante_channel, opus: null,
-  };
-
-  const [label, setLabel]         = useState(streamCfg.name);
-  const [type,  setType]          = useState(streamCfg.type);
-  const [transport, setTransport] = useState(streamCfg.transport || "srt");
-  const [dir,   setDir]           = useState(streamCfg.direction);
-  const [dante, setDante]         = useState(streamCfg.dante_channel ? String(streamCfg.dante_channel) : "");
-  const [opusOverride, setOpusOverride] = useState(!!streamCfg.opus);
-  const [opus, setOpus]           = useState(streamCfg.opus || defaultOpus(streamCfg.transport || "srt"));
-  const [labelStatus, setLabelStatus] = useState("idle");
-
-  const danteN = dante === "" ? null : Math.max(1, Math.min(64, parseInt(dante, 10) || 0));
-
-  const dirty = label !== streamCfg.name
-             || type !== streamCfg.type
-             || transport !== (streamCfg.transport || "srt")
-             || dir !== streamCfg.direction
-             || danteN !== (streamCfg.dante_channel || null)
-             || (opusOverride !== !!streamCfg.opus)
-             || (opusOverride && JSON.stringify(opus) !== JSON.stringify(streamCfg.opus));
-
-  const saveLabel = async () => {
-    setLabelStatus("saving");
+  const saveObject = async () => {
+    setSaveState("saving");
+    setSaveError("");
     try {
-      const next = streams.slice();
-      next[idx] = {
-        name: label, type, transport, direction: dir,
-        ...(danteN ? { dante_channel: danteN } : {}),
-        ...(opusOverride ? { opus } : {}),
-        enabled: streamCfg.enabled !== false,
-      };
-      const body = { audio: { streams: next } };
-      const currentChannelCount = (cfg.audio && cfg.audio.channel_count) || 0;
-      if (danteN && danteN > currentChannelCount) body.audio.channel_count = danteN;
-      console.log("[stream-config] PATCH /api/config", body);
-      const r = await fetch("/api/config", {
-        method: "PATCH",
+      const endpoint = ch.entity_kind === "srt_transport"
+        ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
+        : `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`;
+      const body = ch.entity_kind === "srt_transport"
+        ? {
+            id: details.id || ch.runtime_id,
+            name: name.trim() || ch.name,
+            direction,
+            mode,
+            port: clampInt(port, 1, 65535),
+            latency_ms: clampInt(latencyMs, 20, 8000),
+            ...(host.trim() ? { host: host.trim() } : {}),
+            encode_group_ids: details.encode_group_ids || [],
+          }
+        : {
+            id: details.id || ch.runtime_id,
+            name: name.trim() || ch.name,
+            direction,
+            ...(sourceId.trim() ? { source_id: sourceId.trim() } : {}),
+          };
+      const response = await fetch(endpoint, {
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const text = await r.text();
-      console.log("[stream-config] response", r.status, text.slice(0, 400));
-      if (!r.ok) throw new Error(text);
-      setLabelStatus("saved");
-      window.AB.refreshConfig && window.AB.refreshConfig();
-      setTimeout(() => setLabelStatus("idle"), 1500);
+      if (!response.ok) throw new Error(await response.text());
+      await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
+      setSaveState("saved");
+      window.setTimeout(() => setSaveState("idle"), 1500);
     } catch (e) {
-      console.error("[stream-config] save failed", e);
-      setLabelStatus("error");
+      console.error("[object-config] save failed", e);
+      setSaveError(String(e.message || e));
+      setSaveState("error");
     }
   };
 
-  const duplicateStream = async () => {
-    setLabelStatus("saving");
+  const deleteObject = async () => {
+    setSaveState("saving");
+    setSaveError("");
     try {
-      // Use the in-flight (possibly dirty) form values so the duplicate
-      // matches what the operator sees, not the stale persisted version.
-      const clone = {
-        name: `${label} (copy)`, type, transport, direction: dir,
-        ...(danteN ? { dante_channel: danteN } : {}),
-        ...(opusOverride ? { opus } : {}),
-        enabled: streamCfg.enabled !== false,
-      };
-      const next = streams.slice();
-      next.splice(idx + 1, 0, clone);
-      const r = await fetch("/api/config", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: { streams: next } }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      window.AB.refreshConfig && window.AB.refreshConfig();
-      setLabelStatus("saved");
-      setTimeout(() => setLabelStatus("idle"), 1500);
-    } catch (e) {
-      console.error("[stream-config] duplicate failed", e);
-      setLabelStatus("error");
-    }
-  };
-
-  const removeStream = async () => {
-    setLabelStatus("saving");
-    try {
-      const next = streams.slice();
-      next.splice(idx, 1);
-      const r = await fetch("/api/config", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: { streams: next } }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      window.AB.refreshConfig && window.AB.refreshConfig();
+      const endpoint = ch.entity_kind === "srt_transport"
+        ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
+        : `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`;
+      const response = await fetch(endpoint, { method: "DELETE" });
+      if (!response.ok) throw new Error(await response.text());
+      await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
       onClose();
     } catch (e) {
-      console.error("[stream-config] remove failed", e);
-      setLabelStatus("error");
+      console.error("[object-config] delete failed", e);
+      setSaveError(String(e.message || e));
+      setSaveState("error");
     }
   };
-
-  const startTone = () => fetch("/api/diagnostics/tone", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ frequency_hz: 1000, level_dbfs: -18, channel: ch.id, waveform: "sine" }),
-  });
-  const startMonitor = () => fetch("/api/diagnostics/monitor", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ channel: ch.id, is_input: ch.direction === "in" }),
-  });
-  const startLoopback = () => fetch("/api/diagnostics/loopback", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input_channels: [ch.id], output_channels: [ch.id] }),
-  });
 
   return (
     <div style={{ padding: "14px 16px 16px", display: "flex", flexDirection: "column", gap: 14 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }}>
-          Stream {String(ch.id).padStart(2, "0")} settings
+          {ch.entity_kind === "srt_transport" ? "SRT transport" : "WebRTC stream"} details
         </span>
         <TypeChip type={ch.type} transport={ch.transport} />
         <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-4)" }}>
@@ -1362,84 +1520,48 @@ function StreamConfig({ ch, onClose }) {
         <button className="ab-btn" data-variant="ghost" style={{ marginLeft: "auto", height: 22, fontSize: 11 }} onClick={onClose}>close</button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 14 }}>
         <CfgSection label="Identity">
-          <CfgField label="Name">
-            <input value={label} onChange={e => setLabel(e.target.value)} className="ab-mono" style={cfgInputStyle} />
-          </CfgField>
-          <CfgField label="Type">
-            <select value={type} onChange={e => setType(e.target.value)} className="ab-mono" style={cfgInputStyle}>
-              {STREAM_TYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-          </CfgField>
-          <CfgField label="Direction">
-            <Segmented value={dir} onChange={setDir} options={[["tx","TX"], ["rx","RX"]]} />
-          </CfgField>
-          <CfgField label="Dante ch">
-            <input value={dante} onChange={e => setDante(e.target.value.replace(/[^0-9]/g, ""))}
-                   placeholder="1–64" className="ab-mono" style={cfgInputStyle} />
-          </CfgField>
+          <CfgField label="Name"><input value={name} onChange={e => setName(e.target.value)} className="ab-mono" style={cfgInputStyle} /></CfgField>
+          <CfgField label="Kind"><span className="ab-mono" style={cfgVal}>{ch.entity_kind}</span></CfgField>
           <CfgField label="Route"><span className="ab-mono" style={cfgVal}>{ch.route}</span></CfgField>
+          <CfgField label="State"><span className="ab-mono" style={cfgVal}>{ch.state}</span></CfgField>
         </CfgSection>
 
-        <CfgSection label="Transport" hint="how this stream rides the WAN">
-          <CfgField label="Path">
-            <Segmented value={transport} onChange={setTransport}
-                       options={[["srt", "SRT"], ["webrtc", "WebRTC"]]} />
+        <CfgSection label="Config" hint="persisted object editor">
+          <CfgField label="Direction">
+            <Segmented value={direction} onChange={setDirection} options={[["tx", "TX"], ["rx", "RX"]]} />
           </CfgField>
-          {transport === "srt" ? (
+          {ch.entity_kind === "srt_transport" ? (
             <>
-              <CfgField label="Slot">
-                <span className="ab-mono" style={cfgVal} title="Encoder/decoder slot in the per-direction multichannel SRT multiplex. TX and RX slot indices are independent. Assigned in list order.">
-                  {ch.srt_slot != null ? `SRT/${String(ch.srt_slot).padStart(2, "0")}  (${dir.toUpperCase()})` : "—"}
-                </span>
+              <CfgField label="Mode">
+                <Segmented value={mode} onChange={setMode} options={[["listener", "Listen"], ["caller", "Call"], ["rendezvous", "Rendezvous"]]} />
               </CfgField>
-              <CfgField label="SRT mode"><span className="ab-mono" style={cfgVal}>{(cfg.program && cfg.program.srt_mode) || "—"}</span></CfgField>
-              <CfgField label="SRT port"><span className="ab-mono" style={cfgVal}>{(cfg.network && cfg.network.srt_port) || "—"}</span></CfgField>
-              <CfgField label="Latency"><span className="ab-mono" style={cfgVal}>{srtLatency} ms</span></CfgField>
-              <CfgField label="Encryption"><span className="ab-mono" style={cfgVal}>{(cfg.program && cfg.program.encryption_enabled) ? ((cfg.program && cfg.program.encryption_strength) || "on") : "off"}</span></CfgField>
-              <CfgField label="Clock recovery"><span className="ab-mono" style={cfgVal}>{clockMode}</span></CfgField>
+              <CfgField label="Host"><input value={host} onChange={e => setHost(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder="optional for listener" /></CfgField>
+              <CfgField label="Port"><NumberField value={port} min={1} max={65535} onChange={setPort} suffix="port" /></CfgField>
+              <CfgField label="Latency"><NumberField value={latencyMs} min={20} max={8000} onChange={setLatencyMs} suffix="ms" /></CfgField>
             </>
           ) : (
             <>
-              <CfgField label="Track">
-                <span className="ab-mono" style={cfgVal} title="OPUS track index within the WebRTC peer connection. TX and RX track indices are independent. Assigned in list order.">
-                  {ch.rtc_track != null ? `WRTC/${String(ch.rtc_track).padStart(2, "0")}  (${dir.toUpperCase()})` : "—"}
-                </span>
-              </CfgField>
-              <CfgField label="STUN"><span className="ab-mono" style={cfgVal}>{((cfg.network && cfg.network.stun_servers) || []).length} server(s)</span></CfgField>
-              <CfgField label="TURN"><span className="ab-mono" style={cfgVal}>{(cfg.network && cfg.network.turn_server) || "—"}</span></CfgField>
-              <CfgField label="Encryption"><span className="ab-mono" style={cfgVal}>DTLS-SRTP (mandatory)</span></CfgField>
+              <CfgField label="Source id"><input value={sourceId} onChange={e => setSourceId(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder="optional source link" /></CfgField>
+              <CfgField label="Codec"><span className="ab-mono" style={cfgVal}>inherits talkback defaults</span></CfgField>
             </>
           )}
         </CfgSection>
 
-        <CfgSection label="OPUS codec" hint={opusOverride ? "per-stream override" : "inheriting bridge defaults"}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingBottom: 2 }}>
-            <button className="ab-btn" data-variant={opusOverride ? "primary" : "ghost"} onClick={() => setOpusOverride(v => !v)} style={{ height: 22, fontSize: 11 }}>
-              {opusOverride ? "using override" : "override defaults"}
-            </button>
-            {opusOverride && (
-              <button className="ab-btn" data-variant="ghost" onClick={() => setOpus(defaultOpus(transport))} style={{ height: 22, fontSize: 11 }}>reset</button>
-            )}
-          </div>
-          <OpusFields opus={opus} disabled={!opusOverride} onChange={setOpus} />
+        <CfgSection label="Runtime" hint="read-only summary from /api/status">
+          {fields.map(([label, value]) => (
+            <CfgField key={label} label={label}><span className="ab-mono" style={cfgVal}>{String(value)}</span></CfgField>
+          ))}
         </CfgSection>
       </div>
 
-      {/* Unified action bar — diagnostics on the left, save/delete on the right. */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, paddingTop: 10, borderTop: "1px solid var(--ab-border-soft)", flexWrap: "wrap" }}>
-        <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)", marginRight: 4 }}>Diagnostics</span>
-        <button className="ab-btn" style={{ height: 24, fontSize: 11 }} onClick={startTone}>tone → ch {ch.id}</button>
-        <button className="ab-btn" style={{ height: 24, fontSize: 11 }} onClick={startMonitor}>monitor</button>
-        <button className="ab-btn" style={{ height: 24, fontSize: 11 }} onClick={startLoopback}>loopback {ch.id}↔{ch.id}</button>
-
+        {saveError && <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-err)" }}>{saveError}</span>}
         <div style={{ flex: 1 }} />
-
-        <button className="ab-btn" onClick={duplicateStream} style={{ height: 24, fontSize: 11 }} title="Duplicate this stream below">duplicate</button>
-        <button className="ab-btn" data-variant="danger" onClick={removeStream} style={{ height: 24, fontSize: 11 }}>delete</button>
-        <button className="ab-btn" data-variant={dirty ? "primary" : "ghost"} disabled={labelStatus === "saving"} onClick={saveLabel} style={{ height: 24, fontSize: 11 }}>
-          {labelStatus === "saving" ? "saving…" : labelStatus === "saved" ? "saved ✓" : labelStatus === "error" ? "error" : (dirty ? "save changes" : "no changes")}
+        <button className="ab-btn" data-variant="danger" disabled={saveState === "saving"} onClick={deleteObject} style={{ height: 24, fontSize: 11 }}>delete</button>
+        <button className="ab-btn" data-variant="primary" disabled={saveState === "saving"} onClick={saveObject} style={{ height: 24, fontSize: 11 }}>
+          {saveState === "saving" ? "saving..." : saveState === "saved" ? "saved" : saveState === "error" ? "retry save" : "save changes"}
         </button>
       </div>
     </div>

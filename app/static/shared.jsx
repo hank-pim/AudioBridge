@@ -53,19 +53,31 @@ function Sparkline({ data, w=84, h=22, tone, area=true }) {
 // Level in dBFS [-60, 0]; we treat -60 → 0%, 0dBFS → 100%.
 function Meter({ level, peak, w, h=6 }) {
   const norm = (db) => Math.max(0, Math.min(1, (db + 60) / 60));
-  const lv = norm(level);
-  const pk = peak != null ? norm(peak) : null;
+  // Fill tracks RMS so the bar edge matches the calibrated dBFS readout.
+  const fill = Number.isFinite(level) ? norm(level) : 0;
+  // Peak-hold with slow decay (~20 dB/sec); only render when held value is
+  // meaningfully above the current peak — i.e. a recent transient that's decaying.
+  const hold = useRef({ db: -60, t: performance.now() });
+  const now = performance.now();
+  const dt = Math.max(0, (now - hold.current.t) / 1000);
+  hold.current.t = now;
+  const decayed = hold.current.db - dt * 20;
+  const incoming = Number.isFinite(peak) ? peak : -60;
+  hold.current.db = Math.max(decayed, incoming);
+  const showHold = Number.isFinite(peak) && hold.current.db > peak + 1.0;
+  const pk = showHold ? norm(hold.current.db) : null;
   return (
     <div className="ab-meter" style={{ width: w, height: h }}>
-      <div className="ab-meter-fill" style={{ width: (lv * 100) + "%" }} />
+      <div className="ab-meter-fill" style={{ clipPath: `inset(0 ${(1 - fill) * 100}% 0 0)` }} />
       {pk !== null && <div className="ab-meter-peak" style={{ left: "calc(" + (pk * 100) + "% - 0.5px)" }} />}
-      <div className="ab-meter-ticks" />
     </div>
   );
 }
 
 // ── KPI tile (label + big number + sparkline + delta) ─────────────────────
-function KpiTile({ label, value, unit, delta, deltaTone="muted", spark, sparkTone, footer, hint }) {
+function KpiTile({ label, value, unit, delta, liveDelta, deltaTone="muted", liveDeltaTone, spark, sparkTone, footer, liveFooter, hint }) {
+  const shownDelta = liveDelta || delta;
+  const shownDeltaTone = liveDeltaTone || deltaTone;
   return (
     <div className="ab-card" style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -74,9 +86,9 @@ function KpiTile({ label, value, unit, delta, deltaTone="muted", spark, sparkTon
       </div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
         <span className="ab-kpi-value">{value}{unit && <span className="ab-kpi-unit">{unit}</span>}</span>
-        {delta && (
-          <span className="ab-kpi-delta" style={{ color: `var(--ab-${deltaTone === "muted" ? "fg-3" : deltaTone})` }}>
-            {delta}
+        {shownDelta && (
+          <span className="ab-kpi-delta" style={{ color: `var(--ab-${shownDeltaTone === "muted" ? "fg-3" : shownDeltaTone})` }}>
+            {shownDelta}
           </span>
         )}
       </div>
@@ -85,19 +97,19 @@ function KpiTile({ label, value, unit, delta, deltaTone="muted", spark, sparkTon
           <Sparkline data={spark} tone={sparkTone} w={220} h={28} />
         </div>
       )}
-      {footer && <div style={{ fontSize: 10.5, color: "var(--ab-fg-4)", fontFamily: "var(--ab-mono)" }}>{footer}</div>}
+      {(liveFooter || footer) && <div style={{ fontSize: 10.5, color: "var(--ab-fg-4)", fontFamily: "var(--ab-mono)" }}>{liveFooter || footer}</div>}
     </div>
   );
 }
 
 // ── Card shell ─────────────────────────────────────────────────────────────
-function Card({ title, right, children, padding=0, style, hint }) {
+function Card({ title, right, children, padding=0, style, hint, liveHint }) {
   return (
     <div className="ab-card" style={style}>
       {title && (
         <div className="ab-card-h">
           <span>{title}</span>
-          {hint && <span className="ab-mono" style={{ textTransform: "none", letterSpacing: 0, color: "var(--ab-fg-4)", fontSize: 10.5 }}>{hint}</span>}
+          {(liveHint || hint) && <span className="ab-mono" style={{ textTransform: "none", letterSpacing: 0, color: "var(--ab-fg-4)", fontSize: 10.5 }}>{liveHint || hint}</span>}
           {right && <span className="ab-card-h-r">{right}</span>}
         </div>
       )}
@@ -109,6 +121,7 @@ function Card({ title, right, children, padding=0, style, hint }) {
 // ── Topbar (endpoint ↔ peer link, nav) ─────────────────────────────────────
 function TopBar({ active="streams", alerts=2, onNavigate }) {
   const { PEER, PROGRAM, TALKBACK } = window.AB;
+  const paired = PEER.peer && PEER.peer.addr && PEER.peer.addr !== "—";
   const tone = PROGRAM.state === "running" && TALKBACK.state === "running" ? "ok"
               : PROGRAM.state === "stopped" ? "muted" : "warn";
   return (
@@ -120,7 +133,7 @@ function TopBar({ active="streams", alerts=2, onNavigate }) {
         <span style={{ color: "var(--ab-fg)" }}>{PEER.self.name}</span>
         <Icon.bidir style={{ color: "var(--ab-fg-3)" }} />
         <span style={{ color: "var(--ab-fg)" }}>{PEER.peer.name}</span>
-        <span style={{ color: "var(--ab-fg-4)" }}>· SRT/WebRTC · paired 18d</span>
+        <span style={{ color: "var(--ab-fg-4)" }}>· SRT/WebRTC · {paired ? "paired" : "unpaired"}</span>
       </div>
       <nav>
         {["streams", "diagnostics", "events", "settings"].map(k => (
@@ -182,9 +195,10 @@ function fmtUptime(s) {
   return `${h}h ${m}m`;
 }
 function fmtBitrate(kbps) {
+  if (!Number.isFinite(kbps)) return "—";
   return kbps >= 1000 ? (kbps / 1000).toFixed(2) + " Mb/s" : kbps.toFixed(0) + " kb/s";
 }
-function fmtDb(v) { return v <= -100 ? "—" : v.toFixed(1); }
+function fmtDb(v) { return !Number.isFinite(v) || v <= -100 ? "—" : v.toFixed(1); }
 
 Object.assign(window, {
   Icon, Chip, Dot, Sparkline, Meter, KpiTile, Card, TopBar, EventsLog, StatePill,

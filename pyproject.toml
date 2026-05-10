@@ -9,6 +9,8 @@ dependencies = [
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
   "tomli-w>=1.0",
+  "aiortc>=1.9",
+  "av>=12.0",
 ]
 
 [project.optional-dependencies]
