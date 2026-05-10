@@ -1321,14 +1321,17 @@ function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeter
             >
               {sourceOptions.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
             </select>
-            <input
-              type="number" step={0.5} min={-60} max={20}
-              className="ab-mono"
-              value={gainVal}
-              onChange={e => setGain(i, e.target.value)}
-              onBlur={() => commitGain(i)}
-              style={{ ...cfgInputStyle, height: 20, fontSize: 11, textAlign: "right" }}
-            />
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }} title="Per-channel gain (dB)">
+              <input
+                type="number" step={0.5} min={-60} max={20}
+                className="ab-mono"
+                value={gainVal}
+                onChange={e => setGain(i, e.target.value)}
+                onBlur={() => commitGain(i)}
+                style={{ ...cfgInputStyle, height: 20, fontSize: 11, textAlign: "right", flex: 1, minWidth: 0 }}
+              />
+              <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)" }}>dB</span>
+            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <Meter level={meter.rms_dbfs} peak={meter.peak_dbfs} w={140} />
               <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-3)", width: 38, textAlign: "right" }}>{fmtDb(meter.rms_dbfs)}</span>
