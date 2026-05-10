@@ -2,7 +2,7 @@
 // table, system + live events rail.
 console.log("[variation-a] build loaded", new Date().toISOString());
 
-var useState = React.useState, useMemo = React.useMemo, useEffect = React.useEffect, useRef = React.useRef;
+var useState = React.useState, useMemo = React.useMemo, useEffect = React.useEffect, useRef = React.useRef, useCallback = React.useCallback;
 
 function fmtMetric(value, digits = 1) {
   return Number.isFinite(value) ? value.toFixed(digits) : "—";
@@ -192,7 +192,15 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(c => (
+                {filtered.map(c => {
+                  const isSrtTx = c.entity_kind === "srt_transport" && c.direction === "out";
+                  const cfgRoot = window.AB.config || {};
+                  const stRoot = window.AB.status || {};
+                  const inputMeters = (stRoot.meters && stRoot.meters.inputs) || [];
+                  const transportCfg = isSrtTx ? (cfgRoot.srt_transports || []).find(t => t.id === c.runtime_id) : null;
+                  const groupId = transportCfg && (transportCfg.encode_group_ids || [])[0];
+                  const groupCfg = groupId ? (cfgRoot.encode_groups || []).find(g => g.id === groupId) : null;
+                  return (
                   <React.Fragment key={c.id}>
                   <tr data-state={c.state === "idle" ? "muted" : null} style={{ height: rowH }}>
                     <td className="ab-mono" style={{ color: "var(--ab-fg-4)" }}>{String(c.id).padStart(2, "0")}</td>
@@ -223,6 +231,16 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                     <td className="ab-mono" style={{ color: "var(--ab-fg-3)", fontSize: 11 }}>{c.route}</td>
                     <td><RowActions ch={c} expanded={expandedIds.has(c.id)} onToggle={() => toggleExpanded(c.id)} /></td>
                   </tr>
+                  {groupCfg && (
+                    <ChannelSubRows
+                      streamId={c.runtime_id}
+                      transportRunning={c.state !== "idle"}
+                      group={groupCfg}
+                      sources={cfgRoot.sources || []}
+                      inputMeters={inputMeters}
+                      colSpan={13}
+                    />
+                  )}
                   {expandedIds.has(c.id) && (
                     <tr key={c.id + "-cfg"}>
                       <td colSpan={13} style={{ padding: 0, height: "auto", background: "var(--ab-surface-2)", borderBottom: "1px solid var(--ab-border)" }}>
@@ -231,7 +249,8 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                     </tr>
                   )}
                   </React.Fragment>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1173,8 +1192,173 @@ function defaultOpus(transport) {
   return   { bitrate_kbps: 96, bitrate_mode: "cbr", frame_ms: 20, complexity: 7, inband_fec: true, expected_packet_loss_percent: 5 };
 }
 
+const SILENCE_DEFAULT_SOURCE_ID = "silence-default";
+
+function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeters, colSpan }) {
+  const [pending, setPending] = useState({}); // index -> { source_id?, label?, gain_db? }
+  const [savingIdx, setSavingIdx] = useState(null);
+  const [error, setError] = useState("");
+
+  const channelByIndex = useMemo(() => {
+    const map = new Map();
+    (group.channels || []).forEach(c => map.set(c.index, c));
+    return map;
+  }, [group]);
+
+  const sourceOptions = useMemo(() => {
+    const opts = [[SILENCE_DEFAULT_SOURCE_ID, "Silence"]];
+    sources
+      .filter(s => s.id !== SILENCE_DEFAULT_SOURCE_ID)
+      .forEach(s => {
+        const label = s.kind === "dante_input" && s.dante_channel
+          ? `Dante In ${String(s.dante_channel).padStart(2, "0")}`
+          : (s.name || s.id);
+        opts.push([s.id, label]);
+      });
+    return opts;
+  }, [sources]);
+
+  const sourceMeterChannel = useCallback((sourceId) => {
+    const src = sources.find(s => s.id === sourceId);
+    if (!src || src.kind !== "dante_input") return null;
+    return src.dante_channel || null;
+  }, [sources]);
+
+  const persistChannel = async (idx, patch) => {
+    setSavingIdx(idx);
+    setError("");
+    try {
+      const merged = (group.channels || []).map(ch => ch.index === idx ? { ...ch, ...patch } : ch);
+      // Backfill silence-default for any unassigned slot up to channel_count.
+      const present = new Set(merged.map(c => c.index));
+      for (let i = 1; i <= (group.channel_count || merged.length); i++) {
+        if (!present.has(i)) merged.push({ index: i, source_id: SILENCE_DEFAULT_SOURCE_ID, label: `Ch ${String(i).padStart(2, "0")}`, gain_db: 0 });
+      }
+      const body = {
+        id: group.id,
+        name: group.name,
+        channel_count: group.channel_count,
+        channels: merged.sort((a, b) => a.index - b.index),
+        opus: group.opus,
+        enabled: group.enabled !== false,
+      };
+      const res = await fetch(`/api/encode-groups/${encodeURIComponent(group.id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setPending(p => { const n = { ...p }; delete n[idx]; return n; });
+      if (transportRunning) {
+        // Hot-restart so encode-group changes take effect on the running pipeline.
+        await fetch(`/api/srt-transports/${encodeURIComponent(streamId)}/stop`, { method: "POST" });
+        await fetch(`/api/srt-transports/${encodeURIComponent(streamId)}/start`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      }
+      if (window.AB.refreshAll) await window.AB.refreshAll();
+    } catch (e) {
+      console.error("[channel-edit] failed", e);
+      setError(String(e.message || e));
+    } finally {
+      setSavingIdx(null);
+    }
+  };
+
+  const setSource = (idx, source_id) => {
+    setPending(p => ({ ...p, [idx]: { ...(p[idx] || {}), source_id } }));
+    persistChannel(idx, { source_id });
+  };
+  const setGain = (idx, gain_db) => {
+    setPending(p => ({ ...p, [idx]: { ...(p[idx] || {}), gain_db } }));
+  };
+  const commitGain = (idx) => {
+    const v = pending[idx] && pending[idx].gain_db;
+    if (v == null) return;
+    persistChannel(idx, { gain_db: Number(v) });
+  };
+
+  const startMonitor = async (idx, sourceId) => {
+    // Per-channel monitor uses the existing monitor-branch API. The transport must be running.
+    if (!transportRunning) return;
+    const tapId = `${group.id}-ch-${idx}`;
+    try {
+      const res = await fetch(`/api/srt-transports/${encodeURIComponent(streamId)}/monitor-branches`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tap_id: tapId, audible: true }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+    } catch (e) {
+      console.error("[monitor] failed", e);
+    }
+  };
+
+  const rows = [];
+  for (let i = 1; i <= (group.channel_count || 0); i++) {
+    const ch = channelByIndex.get(i) || { index: i, source_id: SILENCE_DEFAULT_SOURCE_ID, label: `Ch ${String(i).padStart(2, "0")}`, gain_db: 0 };
+    const effectiveSource = (pending[i] && pending[i].source_id) || ch.source_id;
+    const isSilence = effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
+    const meterCh = sourceMeterChannel(effectiveSource);
+    const meter = meterCh ? (inputMeters[meterCh - 1] || {}) : {};
+    const gainVal = pending[i] && pending[i].gain_db != null ? pending[i].gain_db : (ch.gain_db ?? 0);
+    rows.push(
+      <tr key={`${streamId}-ch-${i}`} style={{ background: "var(--ab-surface-2)", opacity: isSilence ? 0.55 : 1 }}>
+        <td colSpan={colSpan} style={{ padding: "3px 12px 3px 28px", borderBottom: "1px solid var(--ab-border-soft)" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 200px 80px 200px 80px", gap: 10, alignItems: "center", fontSize: 11 }}>
+            <span className="ab-mono" style={{ color: "var(--ab-fg-4)" }}>ch-{String(i).padStart(2, "0")}</span>
+            <input
+              className="ab-mono"
+              value={(pending[i] && pending[i].label) ?? (ch.label || "")}
+              onChange={e => setPending(p => ({ ...p, [i]: { ...(p[i] || {}), label: e.target.value } }))}
+              onBlur={() => { const v = pending[i] && pending[i].label; if (v != null && v !== ch.label) persistChannel(i, { label: v }); }}
+              placeholder={`Ch ${String(i).padStart(2, "0")}`}
+              style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
+            />
+            <select
+              className="ab-mono"
+              value={effectiveSource}
+              onChange={e => setSource(i, e.target.value)}
+              style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
+            >
+              {sourceOptions.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
+            </select>
+            <input
+              type="number" step={0.5} min={-60} max={20}
+              className="ab-mono"
+              value={gainVal}
+              onChange={e => setGain(i, e.target.value)}
+              onBlur={() => commitGain(i)}
+              style={{ ...cfgInputStyle, height: 20, fontSize: 11, textAlign: "right" }}
+            />
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <Meter level={meter.rms_dbfs} peak={meter.peak_dbfs} w={140} />
+              <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-3)", width: 38, textAlign: "right" }}>{fmtDb(meter.rms_dbfs)}</span>
+            </div>
+            <button
+              className="ab-btn"
+              data-variant="ghost"
+              disabled={!transportRunning || isSilence}
+              onClick={() => startMonitor(i, effectiveSource)}
+              title={transportRunning ? (isSilence ? "Assign a source first" : "Listen to this channel") : "Stream must be running"}
+              style={{ height: 20, fontSize: 11 }}
+            >
+              {savingIdx === i ? "…" : "🎧 monitor"}
+            </button>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+  if (error) {
+    rows.push(
+      <tr key={`${streamId}-err`}><td colSpan={colSpan} style={{ padding: "3px 12px 3px 28px", background: "var(--ab-surface-2)", color: "var(--ab-err)", fontSize: 10.5 }} className="ab-mono">{error}</td></tr>
+    );
+  }
+  return <>{rows}</>;
+}
+
 function AddStreamPanel({ onClose }) {
   const cfg = window.AB.config || {};
+  const programDefaults = (cfg.program && cfg.program.opus) || defaultOpus("srt");
   const [kind, setKind] = useState("srt_transport");
   const [name, setName] = useState("");
   const [direction, setDirection] = useState("tx");
@@ -1182,15 +1366,15 @@ function AddStreamPanel({ onClose }) {
   const [host, setHost] = useState("");
   const [port, setPort] = useState(String((cfg.network && cfg.network.srt_port) || 9000));
   const [latencyMs, setLatencyMs] = useState(String((cfg.program && cfg.program.srt_latency_ms) || 240));
+  const [channelCount, setChannelCount] = useState("2");
+  const [opusOverride, setOpusOverride] = useState(false);
+  const [opus, setOpus] = useState({ ...programDefaults });
   const [sourceId, setSourceId] = useState("");
-  const [sourceKind, setSourceKind] = useState("tone");
-  const [toneFrequency, setToneFrequency] = useState("1000");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
 
   const trimmedName = name.trim();
   const previewId = `${kind === "srt_transport" ? "srt" : "wrtc"}-${(trimmedName || "item").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "item"}`;
-  const sourcePreviewId = `src-${previewId}`;
   const groupPreviewId = `enc-${previewId}`;
   const srtTxNeedsHost = kind === "srt_transport" && direction === "tx" && mode !== "listener";
   const canSubmit = !!trimmedName && (!srtTxNeedsHost || !!host.trim()) && status !== "saving";
@@ -1224,21 +1408,26 @@ function AddStreamPanel({ onClose }) {
       if (kind === "srt_transport") {
         const encodeGroupIds = [];
         if (direction === "tx") {
-          await postJson("/api/sources", {
-            id: sourcePreviewId,
-            name: `${trimmedName} ${sourceKind === "tone" ? "Tone" : "Silence"}`,
-            kind: sourceKind,
-            enabled: true,
-            ...(sourceKind === "tone" ? { tone_frequency_hz: clampInt(toneFrequency, 20, 20000) } : {}),
-          });
+          const n = clampInt(channelCount, 1, 64);
+          const channels = Array.from({ length: n }, (_, i) => ({
+            index: i + 1,
+            source_id: SILENCE_DEFAULT_SOURCE_ID,
+            label: `Ch ${String(i + 1).padStart(2, "0")}`,
+            gain_db: 0.0,
+          }));
           await postJson("/api/encode-groups", {
             id: groupPreviewId,
-            name: `${trimmedName} Mono`,
-            channel_count: 1,
-            channels: [
-              { index: 1, source_id: sourcePreviewId, label: sourceKind === "tone" ? "Tone" : "Silence", gain_db: 0.0 },
-            ],
-            opus: defaultOpus("srt"),
+            name: `${trimmedName} (${n}ch)`,
+            channel_count: n,
+            channels,
+            opus: opusOverride ? {
+              bitrate_kbps: clampInt(opus.bitrate_kbps, 16, 512),
+              bitrate_mode: opus.bitrate_mode || "cbr",
+              frame_ms: clampInt(opus.frame_ms, 2, 60),
+              complexity: clampInt(opus.complexity, 0, 10),
+              inband_fec: !!opus.inband_fec,
+              expected_packet_loss_percent: clampInt(opus.expected_packet_loss_percent, 0, 30),
+            } : { ...programDefaults },
             enabled: true,
           });
           encodeGroupIds.push(groupPreviewId);
@@ -1311,13 +1500,14 @@ function AddStreamPanel({ onClose }) {
             </CfgField>
             {direction === "tx" && (
               <>
-                <CfgField label="Source">
-                  <Segmented value={sourceKind} onChange={setSourceKind} options={[["tone", "Tone"], ["silence", "Silence"]]} />
+                <CfgField label="Channels">
+                  <NumberField value={channelCount} min={1} max={64} onChange={setChannelCount} suffix="ch" />
                 </CfgField>
-                {sourceKind === "tone" && (
-                  <CfgField label="Tone">
-                    <NumberField value={toneFrequency} min={20} max={20000} onChange={setToneFrequency} suffix="Hz" />
-                  </CfgField>
+                <CfgField label="Codec">
+                  <Segmented value={opusOverride ? "override" : "default"} onChange={v => setOpusOverride(v === "override")} options={[["default", "Defaults"], ["override", "Override"]]} />
+                </CfgField>
+                {opusOverride && (
+                  <OpusFields opus={opus} disabled={false} onChange={setOpus} />
                 )}
               </>
             )}
@@ -1332,14 +1522,11 @@ function AddStreamPanel({ onClose }) {
         )}
         <CfgSection label="Preview">
           <CfgField label="ID"><span className="ab-mono" style={cfgVal}>{previewId}</span></CfgField>
-          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? "source -> group -> SRT" : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
+          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? `${clampInt(channelCount, 1, 64)}ch silence-filled · group -> SRT` : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
           {kind === "srt_transport" && direction === "tx" && (
-            <>
-              <CfgField label="Source ID"><span className="ab-mono" style={cfgVal}>{sourcePreviewId}</span></CfgField>
-              <CfgField label="Group ID"><span className="ab-mono" style={cfgVal}>{groupPreviewId}</span></CfgField>
-            </>
+            <CfgField label="Group ID"><span className="ab-mono" style={cfgVal}>{groupPreviewId}</span></CfgField>
           )}
-          <CfgField label="State"><span className="ab-mono" style={cfgVal}>created stopped</span></CfgField>
+          <CfgField label="State"><span className="ab-mono" style={cfgVal}>created stopped · assign sources after</span></CfgField>
         </CfgSection>
       </div>
       {error && <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-err)" }}>{error}</div>}

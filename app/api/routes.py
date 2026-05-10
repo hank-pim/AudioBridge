@@ -507,6 +507,7 @@ def create_api_router(
                 "channel_count": channel_count,
             }
         })
+        store.sync_dante_input_sources(channel_count)
         events.append("info", "system", f"audio interface set to '{name}' ({channel_count} ch)")
         return saved.audio.model_dump(mode="json", exclude_none=True)
 

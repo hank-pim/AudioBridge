@@ -543,7 +543,7 @@ def test_encode_group_crud_persists_channel_map() -> None:
         config_response = client.get("/api/config")
         assert config_response.status_code == 200
         body = config_response.json()
-        assert body["sources"][0]["id"] == "src-1"
+        assert any(s["id"] == "src-1" for s in body["sources"])
         assert body["encode_groups"][0]["channels"][0]["source_id"] == "src-1"
 
 
