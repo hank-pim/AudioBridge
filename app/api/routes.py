@@ -504,6 +504,7 @@ def create_api_router(
             "audio": {
                 "interface_name": match["name"],
                 "interface_driver": normalize_config_driver(match.get("driver")),
+                "interface_device_id": match.get("device_id"),
                 "channel_count": channel_count,
             }
         })

@@ -759,8 +759,122 @@ def test_media_graph_plan_reports_validation_errors() -> None:
             "empty_encode_group",
             "wrong_channel_count",
             "missing_source_id",
-            "unsupported_source_kind",
+            "audio_interface_not_selected",
         }.issubset(codes)
+
+
+def test_tx_dante_capture_uses_shared_deinterleave_per_os() -> None:
+    """A TX group with dante_input channels must emit one shared capture node
+    (per the configured driver) followed by deinterleave; per-channel branches
+    pull from the deinterleave src pad keyed on the source's dante_channel."""
+    with TestClient(create_app()) as client:
+        response = client.put(
+            "/api/config",
+            json={
+                "audio": {
+                    "interface_name": "Dante Virtual Soundcard",
+                    "interface_driver": "wasapi",
+                    "interface_device_id": "{0.0.1.dvs}",
+                    "channel_count": 8,
+                },
+                "sources": [
+                    {"id": "dante-in-01", "name": "Dante 1", "kind": "dante_input", "dante_channel": 1},
+                    {"id": "dante-in-05", "name": "Dante 5", "kind": "dante_input", "dante_channel": 5},
+                    {"id": "silence-default", "name": "Silence", "kind": "silence"},
+                ],
+                "encode_groups": [
+                    {
+                        "id": "enc-mix",
+                        "name": "Mix",
+                        "channel_count": 3,
+                        "channels": [
+                            {"index": 1, "source_id": "dante-in-01"},
+                            {"index": 2, "source_id": "dante-in-05"},
+                            {"index": 3, "source_id": "silence-default"},
+                        ],
+                    },
+                ],
+                "srt_transports": [
+                    {
+                        "id": "srt-mix",
+                        "name": "Mix TX",
+                        "direction": "tx",
+                        "mode": "listener",
+                        "port": 9100,
+                        "encode_group_ids": ["enc-mix"],
+                    },
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+        plan = client.get("/api/media/graph-plan").json()
+        assert plan["valid"] is True
+        graph = plan["srt_transports"][0]["gstreamer"]["graph"]
+
+        # Single shared capture node, addressed by device id, deinterleaved.
+        assert "wasapisrc" in graph
+        assert 'device="{0.0.1.dvs}"' in graph
+        assert "deinterleave name=dante_in_enc_mix" in graph
+        # Dante channels 1 and 5 map to deinterleave src pads 0 and 4.
+        assert "dante_in_enc_mix.src_0 !" in graph
+        assert "dante_in_enc_mix.src_4 !" in graph
+        # The silence channel still uses audiotestsrc.
+        assert "audiotestsrc is-live=true wave=silence" in graph
+        # Each channel terminates at the matching interleave sink pad.
+        assert "il_enc_mix.sink_0" in graph
+        assert "il_enc_mix.sink_1" in graph
+        assert "il_enc_mix.sink_2" in graph
+
+
+def test_tx_dante_capture_switches_element_per_driver() -> None:
+    from app.core.config import (
+        AudioConfig,
+        EncodeGroupChannelConfig,
+        EncodeGroupConfig,
+        EndpointConfig,
+        OpusStreamConfig,
+        SourceConfig,
+        SourceKind,
+        SrtMode,
+        SrtTransportConfig,
+        SrtTransportDirection,
+    )
+    from app.services.media_graph import MediaGraphBuilder
+
+    base_kwargs = dict(
+        sources=[
+            SourceConfig(id="silence-default", name="Silence", kind=SourceKind.silence),
+            SourceConfig(id="dante-in-01", name="D1", kind=SourceKind.dante_input, dante_channel=1),
+        ],
+        encode_groups=[
+            EncodeGroupConfig(
+                id="enc-1", name="g", channel_count=1,
+                channels=[EncodeGroupChannelConfig(index=1, source_id="dante-in-01")],
+                opus=OpusStreamConfig(bitrate_kbps=96),
+            ),
+        ],
+        srt_transports=[
+            SrtTransportConfig(
+                id="srt-1", name="t", direction=SrtTransportDirection.tx,
+                mode=SrtMode.listener, port=9100, latency_ms=240, encode_group_ids=["enc-1"],
+            ),
+        ],
+    )
+    cases = [
+        ("wasapi", "wasapisrc"),
+        ("coreaudio", "osxaudiosrc"),
+        ("alsa", "alsasrc"),
+    ]
+    for driver, expected_element in cases:
+        cfg = EndpointConfig(
+            audio=AudioConfig(interface_name="DVS", interface_driver=driver, channel_count=8),
+            **base_kwargs,
+        )
+        plan = MediaGraphBuilder().plan_srt_transport(cfg, "srt-1")
+        assert plan["valid"] is True, f"{driver}: {plan['errors']}"
+        graph = plan["gstreamer"]["graph"]
+        assert expected_element in graph, f"{driver} should use {expected_element}"
 
 
 def test_tx_srt_transport_start_uses_graph_plan(monkeypatch) -> None:

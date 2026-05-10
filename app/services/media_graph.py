@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import (
+    AudioConfig,
     EncodeGroupConfig,
     EndpointConfig,
     SourceConfig,
@@ -148,17 +149,43 @@ class MediaGraphBuilder:
                         )
                     )
                     continue
-                if transport.direction == SrtTransportDirection.tx and source.kind not in {SourceKind.tone, SourceKind.silence}:
-                    errors.append(
-                        self._error(
-                            transport.id,
-                            group.id,
-                            "unsupported_source_kind",
-                            f"source '{source.id}' kind '{source.kind.value}' is not supported by the first media runtime slice",
-                            channel.index,
-                            source_id=source.id,
+                if transport.direction == SrtTransportDirection.tx:
+                    if source.kind == SourceKind.dante_input:
+                        if not source.dante_channel:
+                            errors.append(self._error(
+                                transport.id, group.id, "dante_source_missing_channel",
+                                f"dante_input source '{source.id}' has no dante_channel set",
+                                channel.index, source_id=source.id,
+                            ))
+                        elif config.audio.interface_driver == "unknown" or not config.audio.interface_name:
+                            errors.append(self._error(
+                                transport.id, group.id, "audio_interface_not_selected",
+                                "audio interface must be selected before using dante_input sources",
+                                channel.index, source_id=source.id,
+                            ))
+                        elif config.audio.interface_driver not in {"wasapi", "coreaudio", "alsa"}:
+                            errors.append(self._error(
+                                transport.id, group.id, "unsupported_audio_driver",
+                                f"audio driver '{config.audio.interface_driver}' is not supported for dante capture",
+                                channel.index, source_id=source.id,
+                            ))
+                        elif source.dante_channel > config.audio.channel_count:
+                            errors.append(self._error(
+                                transport.id, group.id, "dante_channel_out_of_range",
+                                f"dante_channel {source.dante_channel} exceeds interface channel_count {config.audio.channel_count}",
+                                channel.index, source_id=source.id,
+                            ))
+                    elif source.kind not in {SourceKind.tone, SourceKind.silence}:
+                        errors.append(
+                            self._error(
+                                transport.id,
+                                group.id,
+                                "unsupported_source_kind",
+                                f"source '{source.id}' kind '{source.kind.value}' is not supported by the first media runtime slice",
+                                channel.index,
+                                source_id=source.id,
+                            )
                         )
-                    )
         return errors
 
     def _build_tx_argv(
@@ -173,11 +200,19 @@ class MediaGraphBuilder:
         # into one N-channel buffer that feeds a single opusenc. This preserves
         # phase alignment across channels because every channel shares encoder
         # framing.
+        #
+        # Source legs are heterogeneous:
+        #   - tone/silence channels start with their own audiotestsrc.
+        #   - dante_input channels pull from a single shared capture node
+        #     (wasapisrc/osxaudiosrc/alsasrc) that is deinterleaved into per-
+        #     channel src pads. Multiple dante channels in the same TX (or
+        #     across encode groups within the same pipeline) share that
+        #     capture so the audio device is opened exactly once.
         source_by_id = {source.id: source for source in config.sources if source.enabled}
         argv = [self.gst_launch_executable, "-m"]
         if not groups:
             return argv
-        # Only one encode group per TX is wired today; the validator catches multi-group attempts upstream when added.
+        # Only one encode group per TX is wired today.
         group = groups[0]
         n = group.channel_count
         interleave_name = self._interleave_element_name(group.id)
@@ -204,37 +239,112 @@ class MediaGraphBuilder:
             "wait-for-connection=true",
         ])
 
-        # Source legs: one branch per channel, terminating at interleave.sink_<k>.
-        for channel in sorted(group.channels, key=lambda item: item.index):
-            source = source_by_id[channel.source_id or ""]
-            tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
-            pad = f"{interleave_name}.sink_{channel.index - 1}"
+        # Shared dante capture node, only emitted if any channel needs it.
+        sorted_channels = sorted(group.channels, key=lambda item: item.index)
+        any_dante = any(
+            source_by_id[ch.source_id or ""].kind == SourceKind.dante_input
+            for ch in sorted_channels
+            if (ch.source_id or "") in source_by_id
+        )
+        deinterleave_name = self._deinterleave_element_name(group.id)
+        if any_dante:
             argv.extend([
-                self._source_element(source),
-                "is-live=true",
-                *self._source_properties(source),
+                *self._dante_capture_args(config.audio),
                 "!",
                 "audioconvert",
                 "!",
                 "audioresample",
                 "!",
-                "audio/x-raw,rate=48000,channels=1",
+                f"audio/x-raw,rate=48000,channels={config.audio.channel_count},format=S16LE",
                 "!",
-                "level",
-                f"name={self._meter_element_name(group.id, channel.index)}",
-                "message=true",
-                "interval=100000000",
-                "!",
-                "tee",
-                f"name={tap_name}",
-                "allow-not-linked=true",
-                f"{tap_name}.",
-                "!",
-                "queue",
-                "!",
-                pad,
+                "deinterleave",
+                f"name={deinterleave_name}",
             ])
+
+        # Per-channel branches into interleave.sink_K.
+        for channel in sorted_channels:
+            source = source_by_id[channel.source_id or ""]
+            tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
+            sink_pad = f"{interleave_name}.sink_{channel.index - 1}"
+
+            if source.kind == SourceKind.dante_input:
+                # Pull a specific channel from the shared deinterleave.
+                argv.extend([
+                    f"{deinterleave_name}.src_{(source.dante_channel or 1) - 1}",
+                    "!",
+                    "queue",
+                    "!",
+                    "audioconvert",
+                    "!",
+                    "audio/x-raw,rate=48000,channels=1",
+                    "!",
+                    "level",
+                    f"name={self._meter_element_name(group.id, channel.index)}",
+                    "message=true",
+                    "interval=100000000",
+                    "!",
+                    "tee",
+                    f"name={tap_name}",
+                    "allow-not-linked=true",
+                    f"{tap_name}.",
+                    "!",
+                    "queue",
+                    "!",
+                    sink_pad,
+                ])
+            else:
+                argv.extend([
+                    self._source_element(source),
+                    "is-live=true",
+                    *self._source_properties(source),
+                    "!",
+                    "audioconvert",
+                    "!",
+                    "audioresample",
+                    "!",
+                    "audio/x-raw,rate=48000,channels=1",
+                    "!",
+                    "level",
+                    f"name={self._meter_element_name(group.id, channel.index)}",
+                    "message=true",
+                    "interval=100000000",
+                    "!",
+                    "tee",
+                    f"name={tap_name}",
+                    "allow-not-linked=true",
+                    f"{tap_name}.",
+                    "!",
+                    "queue",
+                    "!",
+                    sink_pad,
+                ])
         return argv
+
+    def _dante_capture_args(self, audio: AudioConfig) -> list[str]:
+        """Return the gst element + properties for the host audio capture device.
+        Selected by interface_driver; device addressed by interface_device_id when set,
+        otherwise the OS default capture device for the driver is used (DVS, in normal
+        deployments, is configured as default)."""
+        driver = audio.interface_driver
+        device = audio.interface_device_id
+        if driver == "wasapi":
+            args = ["wasapisrc"]
+            if device:
+                args.append(f'device="{device}"')
+            return args
+        if driver == "coreaudio":
+            args = ["osxaudiosrc"]
+            if device:
+                # CoreAudio device id is an integer; pass through as-is.
+                args.append(f"device={device}")
+            return args
+        if driver == "alsa":
+            args = ["alsasrc"]
+            if device:
+                args.append(f'device="{device}"')
+            return args
+        # asio/unknown shouldn't reach here — the validator rejects them.
+        raise ValueError(f"unsupported audio driver for dante capture: '{driver}'")
 
     def _build_rx_argv(
         self,
@@ -303,6 +413,10 @@ class MediaGraphBuilder:
     def _interleave_element_name(self, group_id: str) -> str:
         safe_group = "".join(char if char.isalnum() else "_" for char in group_id)
         return f"il_{safe_group}"
+
+    def _deinterleave_element_name(self, group_id: str) -> str:
+        safe_group = "".join(char if char.isalnum() else "_" for char in group_id)
+        return f"dante_in_{safe_group}"
 
     @staticmethod
     def _channel_mask_hex(channels: int) -> str:
