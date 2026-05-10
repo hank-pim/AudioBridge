@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import EndpointConfig, SrtTransportConfig, SrtTransportDirection, WebRtcStreamConfig
+from app.services.audio_devices import discover_audio_interfaces
 from app.services.gst_runtime import CtypesGst, CtypesManagedPipeline
 from app.services.media_graph import MediaGraphBuilder
 from app.services.telemetry import DiagnosticsState, TelemetryService
@@ -341,6 +342,9 @@ class MediaController:
             pipelines.append(self._monitor_pipeline)
         pipelines.extend(self._srt_transport_pipelines.values())
         return [pipeline.describe(include_output_tail=include_output_tail) for pipeline in pipelines]
+
+    def discover_audio_interfaces(self) -> list[dict[str, Any]]:
+        return discover_audio_interfaces(self.gst_launch_executable)
 
     # --- tone generator ---
 

@@ -161,7 +161,7 @@ class StreamConfig(BaseModel):
 
 class AudioConfig(BaseModel):
     interface_name: str | None = None
-    interface_driver: Literal["wasapi", "coreaudio", "alsa", "unknown"] = "unknown"
+    interface_driver: Literal["wasapi", "coreaudio", "alsa", "asio", "unknown"] = "unknown"
     sample_rate: int = 48000
     channel_count: int = Field(default=8, ge=1, le=64)
     channel_labels: list[str] = Field(default_factory=lambda: [f"Channel {i}" for i in range(1, 9)])

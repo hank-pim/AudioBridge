@@ -11,19 +11,15 @@ from fastapi.responses import StreamingResponse
 
 from app.core.config import EndpointConfig, RouteMap
 from app.core.config_store import ConfigStore
+from app.services.audio_devices import normalize_config_driver
 from app.services.events import EventLog
 from app.services.media import MediaController
 from app.services.telemetry import TelemetryService
 from app.services.webrtc_monitor import WebRtcMonitorService
 
 # ---------------------------------------------------------------------------
-# Stub audio / network interface catalogue
-# Replace with real enumeration once GStreamer / WASAPI / ALSA layers exist.
+# Stub network interface catalogue.
 # ---------------------------------------------------------------------------
-_STUB_AUDIO_INTERFACES = [
-    {"name": "Dante Virtual Soundcard", "driver": "wasapi", "max_channels": 64},
-    {"name": "System Default Output", "driver": "wasapi", "max_channels": 2},
-]
 _STUB_NETWORK_INTERFACES = [
     {"name": "Ethernet", "description": "Intel I219-V", "ip_address": None},
     {"name": "Ethernet 2", "description": "Realtek PCIe GbE", "ip_address": None},
@@ -478,26 +474,36 @@ def create_api_router(
     # -----------------------------------------------------------------------
 
     @router.get("/interfaces/audio")
-    def list_audio_interfaces() -> list[dict[str, Any]]:
+    def list_audio_interfaces() -> dict[str, Any]:
         selected = store.config.audio.interface_name
-        return [
+        interfaces = [
             {**iface, "selected": iface["name"] == selected}
-            for iface in _STUB_AUDIO_INTERFACES
+            for iface in media.discover_audio_interfaces()
         ]
+        return {
+            "interfaces": interfaces,
+            "selected": {
+                "name": selected,
+                "driver": store.config.audio.interface_driver,
+                "channel_count": store.config.audio.channel_count,
+                "sample_rate": store.config.audio.sample_rate,
+            },
+        }
 
     @router.post("/interfaces/audio")
     def select_audio_interface(body: dict[str, Any]) -> dict[str, Any]:
         name = body.get("name")
         if not name:
             raise HTTPException(status_code=422, detail="name is required")
-        match = next((i for i in _STUB_AUDIO_INTERFACES if i["name"] == name), None)
+        interfaces = media.discover_audio_interfaces()
+        match = next((i for i in interfaces if i["name"] == name or i.get("id") == name), None)
         if match is None:
             raise HTTPException(status_code=404, detail=f"audio interface '{name}' not found")
-        channel_count = min(int(body.get("channel_count", match["max_channels"])), match["max_channels"])
+        channel_count = max(1, min(int(body.get("channel_count", store.config.audio.channel_count)), 64))
         saved = store.update({
             "audio": {
                 "interface_name": match["name"],
-                "interface_driver": match["driver"],
+                "interface_driver": normalize_config_driver(match.get("driver")),
                 "channel_count": channel_count,
             }
         })

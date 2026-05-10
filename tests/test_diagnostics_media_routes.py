@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.services import audio_devices
 from app.services import media as media_module
 
 
@@ -96,6 +97,142 @@ def test_rejects_second_tone_start(monkeypatch) -> None:
         assert first.status_code == 200
         assert second.status_code == 409
         assert second.json()["detail"] == "tone pipeline is already running"
+
+
+def test_audio_interfaces_endpoint_reports_discovered_devices(monkeypatch) -> None:
+    discovered = [
+        {
+            "id": "gst:wasapi:input-dvs",
+            "name": "Dante Virtual Soundcard",
+            "driver": "wasapi",
+            "direction": "duplex",
+            "sample_rate": 48000,
+            "source": "gstreamer",
+        },
+        {
+            "id": "gst:wasapi:headphones",
+            "name": "Headphones",
+            "driver": "wasapi",
+            "direction": "output",
+            "sample_rate": 48000,
+            "source": "gstreamer",
+        },
+    ]
+    monkeypatch.setattr(media_module.MediaController, "discover_audio_interfaces", lambda self: discovered)
+
+    with TestClient(create_app()) as client:
+        select = client.post("/api/interfaces/audio", json={"name": "Dante Virtual Soundcard", "channel_count": 128})
+        assert select.status_code == 200
+        assert select.json()["interface_name"] == "Dante Virtual Soundcard"
+        assert select.json()["interface_driver"] == "wasapi"
+        assert select.json()["channel_count"] == 64
+
+        response = client.get("/api/interfaces/audio")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["selected"]["name"] == "Dante Virtual Soundcard"
+        assert body["interfaces"][0]["selected"] is True
+        assert body["interfaces"][1]["selected"] is False
+
+
+def test_audio_interface_selection_accepts_device_id_and_normalizes_unknown_driver(monkeypatch) -> None:
+    monkeypatch.setattr(media_module.MediaController, "discover_audio_interfaces", lambda self: [
+        {
+            "id": "gst:pulse:studio-capture",
+            "name": "Studio Capture",
+            "driver": "pulseaudio",
+            "direction": "input",
+            "sample_rate": 48000,
+            "source": "gstreamer",
+        },
+    ])
+
+    with TestClient(create_app()) as client:
+        response = client.post("/api/interfaces/audio", json={"name": "gst:pulse:studio-capture", "channel_count": 4})
+
+        assert response.status_code == 200
+        assert response.json()["interface_name"] == "Studio Capture"
+        assert response.json()["interface_driver"] == "unknown"
+        assert response.json()["channel_count"] == 4
+
+
+def test_gstreamer_audio_device_monitor_output_is_parsed() -> None:
+    output = """
+Device found:
+
+    name  : Dante Virtual Soundcard
+    class : Audio/Source
+    caps  : audio/x-raw, rate=(int)48000, channels=(int)[ 1, 64 ]
+    properties:
+        device.api = wasapi
+        device.id = DVS
+        device.description = Dante Virtual Soundcard
+    gst-launch-1.0 wasapisrc device=DVS
+
+Device found:
+
+    name  : Dante Virtual Soundcard
+    class : Audio/Sink
+    caps  : audio/x-raw, rate=(int)48000, channels=(int)64
+    properties:
+        device.api = wasapi
+        device.id = DVS
+    gst-launch-1.0 wasapisink device=DVS
+"""
+
+    devices = audio_devices._parse_gst_device_monitor(output)
+
+    assert devices == [
+        {
+            "id": "gst:wasapi:input-dvs",
+            "name": "Dante Virtual Soundcard",
+            "driver": "wasapi",
+            "direction": "input",
+            "sample_rate": 48000,
+            "device_id": "DVS",
+            "gst_class": "Audio/Source",
+            "gst_launch": "gst-launch-1.0 wasapisrc device=DVS",
+            "source": "gstreamer",
+        },
+        {
+            "id": "gst:wasapi:output-dvs",
+            "name": "Dante Virtual Soundcard",
+            "driver": "wasapi",
+            "direction": "output",
+            "sample_rate": 48000,
+            "device_id": "DVS",
+            "gst_class": "Audio/Sink",
+            "gst_launch": "gst-launch-1.0 wasapisink device=DVS",
+            "source": "gstreamer",
+        },
+    ]
+
+
+def test_gstreamer_audio_device_monitor_keeps_asio_source_and_sink_separate() -> None:
+    output = """
+Device found:
+
+    name  : Dante Virtual Soundcard (x64)
+    class : Audio/Source
+    caps  : audio/x-raw
+    gst-launch-1.0 asiosrc device-clsid='{B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8}' ! ...
+
+Device found:
+
+    name  : Dante Virtual Soundcard (x64)
+    class : Audio/Sink
+    caps  : audio/x-raw
+    gst-launch-1.0 ... ! asiosink device-clsid='{B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8}'
+"""
+
+    devices = audio_devices._parse_gst_device_monitor(output)
+
+    assert [device["driver"] for device in devices] == ["asio", "asio"]
+    assert [device["direction"] for device in devices] == ["input", "output"]
+    assert [device["device_id"] for device in devices] == [
+        "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+        "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+    ]
 
 
 def test_media_controller_falls_back_to_standard_windows_gstreamer_path(monkeypatch) -> None:
