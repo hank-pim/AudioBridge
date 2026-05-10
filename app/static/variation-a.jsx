@@ -181,7 +181,6 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                   <th style={{ width: 60 }}>Type</th>
                   <th>Name</th>
                   <th style={{ width: 64 }}>State</th>
-                  <th style={{ width: 156 }}>Level (dBFS)</th>
                   <th className="ab-num" style={{ width: 56 }} title="Packet loss % over 5s window">Loss</th>
                   <th className="ab-num" style={{ width: 50 }} title="Inter-arrival jitter (ms)">Jit</th>
                   <th className="ab-num" style={{ width: 48 }} title="One-way audio latency (ms) — RTT/2 + jitter buffer hold + codec">Lat</th>
@@ -217,12 +216,6 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                     <td><TypeChip type={c.type} transport={c.transport} /></td>
                     <td style={{ color: "var(--ab-fg)" }}>{c.name}</td>
                     <td><StateChip state={c.state} /></td>
-                    <td>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <Meter level={c.level_dbfs} peak={c.peak_dbfs} w={88} />
-                        <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-2)", width: 38, textAlign: "right" }}>{fmtDb(c.level_dbfs)}</span>
-                      </div>
-                    </td>
                     <td className="ab-num ab-mono" style={{ color: c.loss_pct > 1 ? "var(--ab-err)" : c.loss_pct > 0.3 ? "var(--ab-warn)" : "var(--ab-fg-3)" }}>{fmtMetric(c.loss_pct, 2)}</td>
                     <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{fmtMetric(c.jitter_ms, 1)}</td>
                     <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{fmtMetric(c.latency_ms, 0)}</td>
@@ -238,12 +231,12 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
                       group={groupCfg}
                       sources={cfgRoot.sources || []}
                       inputMeters={inputMeters}
-                      colSpan={13}
+                      colSpan={12}
                     />
                   )}
                   {expandedIds.has(c.id) && (
                     <tr key={c.id + "-cfg"}>
-                      <td colSpan={13} style={{ padding: 0, height: "auto", background: "var(--ab-surface-2)", borderBottom: "1px solid var(--ab-border)" }}>
+                      <td colSpan={12} style={{ padding: 0, height: "auto", background: "var(--ab-surface-2)", borderBottom: "1px solid var(--ab-border)" }}>
                         <StreamConfig ch={c} onClose={() => closeExpanded(c.id)} />
                       </td>
                     </tr>
