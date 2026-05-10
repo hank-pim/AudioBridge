@@ -163,7 +163,7 @@ class MediaGraphBuilder:
                                 "audio interface must be selected before using dante_input sources",
                                 channel.index, source_id=source.id,
                             ))
-                        elif config.audio.interface_driver not in {"wasapi", "coreaudio", "alsa"}:
+                        elif config.audio.interface_driver not in {"wasapi", "coreaudio", "alsa", "asio"}:
                             errors.append(self._error(
                                 transport.id, group.id, "unsupported_audio_driver",
                                 f"audio driver '{config.audio.interface_driver}' is not supported for dante capture",
@@ -343,7 +343,18 @@ class MediaGraphBuilder:
             if device:
                 args.append(f'device="{device}"')
             return args
-        # asio/unknown shouldn't reach here — the validator rejects them.
+        if driver == "asio":
+            # asiosrc (gst-plugins-bad) addresses devices via device-clsid (GUID).
+            # Without a clsid, asiosrc picks the system's registered ASIO driver
+            # — fine for single-driver hosts (e.g. Dante Virtual Soundcard in
+            # ASIO mode). DVS exposes itself in either ASIO or WASAPI mode but
+            # not both simultaneously, so the driver follows whatever DVS is
+            # currently configured for.
+            args = ["asiosrc"]
+            if device:
+                args.append(f'device-clsid="{device}"')
+            return args
+        # unknown shouldn't reach here — the validator rejects it.
         raise ValueError(f"unsupported audio driver for dante capture: '{driver}'")
 
     def _build_rx_argv(
