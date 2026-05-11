@@ -12,46 +12,41 @@ function fmtPercent(value) {
   return Number.isFinite(value) ? `${value.toFixed(0)}%` : "—";
 }
 
-function VariationA({ density = 8, showEventsRail = true, showSystemCard = true, kpiCount = 6 }) {
-  const { PROGRAM, TALKBACK, SYS, CLOCK, CHANNELS, SERIES } = window.AB;
-  const runtime = window.AB.runtime || {};
-  const caps = runtime.capabilities || {};
+function VariationA() {
+  const { CHANNELS, SYS, CLOCK } = window.AB;
+  const cfg = window.AB.config || {};
+  const status = window.AB.status || {};
   const [view, setView] = useState("streams");
   const [tab, setTab] = useState("all"); // all | rx | tx | issues
   const [query, setQuery] = useState("");
-  const [expandedIds, setExpandedIds] = useState(() => new Set());
-  const toggleExpanded = (id) => setExpandedIds(prev => {
+  const [adding, setAdding] = useState(false);
+  // Per-card drawer state — supports multiple drawers open at once.
+  const [openDrawers, setOpenDrawers] = useState(() => new Set());
+  const toggleDrawer = (id) => setOpenDrawers(prev => {
     const next = new Set(prev);
     if (next.has(id)) next.delete(id); else next.add(id);
     return next;
   });
-  const closeExpanded = (id) => setExpandedIds(prev => {
+  const closeDrawer = (id) => setOpenDrawers(prev => {
     if (!prev.has(id)) return prev;
-    const next = new Set(prev);
-    next.delete(id);
-    return next;
+    const next = new Set(prev); next.delete(id); return next;
   });
-  const [adding, setAdding] = useState(false);
-  const hasProgramBitrate = Number.isFinite(PROGRAM.bitrate_kbps);
-  const hasProgramRtt = Number.isFinite(PROGRAM.rtt_ms);
-  const hasProgramJitter = Number.isFinite(PROGRAM.jitter_ms);
-  const hasProgramLoss = Number.isFinite(PROGRAM.loss_pct);
-  const hasClockTelemetry = ["running", "lock", "slew", "drift"].includes(CLOCK.lock_state)
-    || Number.isFinite(CLOCK.frequency_ratio_ppm)
-    || Number.isFinite(CLOCK.buffer_occupancy_ms);
-  const activeMeterCount = CHANNELS.filter(c => Number.isFinite(c.level_dbfs) || Number.isFinite(c.peak_dbfs)).length;
+  const [eventsOpen, setEventsOpen] = useState(false);
+  const timeWindow = window.AB.timeWindow || "5m";
+  const setTimeWindow = (id) => window.AB.setTimeWindow && window.AB.setTimeWindow(id);
 
   const filtered = useMemo(() => {
     let rows = CHANNELS;
     if (tab === "rx") rows = rows.filter(c => c.direction === "in");
     if (tab === "tx") rows = rows.filter(c => c.direction === "out");
-    if (tab === "issues")  rows = rows.filter(c => c.state === "warn" || c.state === "err");
+    if (tab === "issues") rows = rows.filter(c => c.state === "warn" || c.state === "err");
     if (query) rows = rows.filter(c => c.name.toLowerCase().includes(query.toLowerCase()) || String(c.id).includes(query));
     return rows;
   }, [tab, query, CHANNELS]);
 
-  // Density 1..10 → row height 36..22
-  const rowH = Math.round(38 - (density - 1) * (16 / 9));
+  const inputMeters = (status.meters && status.meters.inputs) || [];
+  const outputMeters = (status.meters && status.meters.outputs) || [];
+  const sources = cfg.sources || [];
 
   return (
     <div className="ab-frame ab-root">
@@ -61,239 +56,232 @@ function VariationA({ density = 8, showEventsRail = true, showSystemCard = true,
         <SettingsView onBack={() => setView("streams")} />
       ) : (
       <>
-
-      {/* KPI strip */}
-      <div style={{ display: "grid", gridTemplateColumns: `repeat(${kpiCount}, 1fr)`, gap: 1, padding: 12, paddingBottom: 0 }}>
-        <KpiTile
-          label="Program · SRT"
-          value={fmtBitrate(PROGRAM.bitrate_kbps)}
-          delta={PROGRAM.state}
-          deltaTone={PROGRAM.state === "running" ? "warn" : "muted"}
-          spark={SERIES.bitrate}
-          sparkTone="muted"
-          liveFooter={`${PROGRAM.codec} | ${PROGRAM.channels || 0} configured ch | ${hasProgramBitrate ? "observed" : "waiting for SRT stats"}`}
-          footer={`${PROGRAM.codec} · ${PROGRAM.channels || 0} configured ch · observed bitrate pending`}
-        />
-        <KpiTile
-          label="RTT · Program"
-          value={fmtMetric(PROGRAM.rtt_ms, 1)}
-          unit=" ms"
-          delta="unobserved"
-          liveDelta={hasProgramRtt ? "observed" : "unobserved"}
-          deltaTone="muted"
-          liveDeltaTone={hasProgramRtt ? "ok" : "muted"}
-          spark={SERIES.rtt}
-          sparkTone="muted"
-          liveFooter={hasProgramRtt ? "SRT RTT from media runtime" : "waiting for SRT socket stats"}
-          footer="SRT socket statistics not wired yet"
-        />
-        <KpiTile
-          label="Jitter"
-          value={fmtMetric(PROGRAM.jitter_ms, 2)}
-          unit=" ms"
-          delta="unobserved"
-          liveDelta={hasProgramJitter ? "observed" : "unobserved"}
-          deltaTone="muted"
-          liveDeltaTone={hasProgramJitter ? "ok" : "muted"}
-          spark={SERIES.jitter}
-          sparkTone="muted"
-          liveFooter={hasProgramJitter ? "SRT variance from media runtime" : "waiting for jitter probe"}
-          footer="No runtime jitter probe yet"
-        />
-        <KpiTile
-          label="Packet loss"
-          value={fmtMetric(PROGRAM.loss_pct, 2)}
-          unit=" %"
-          delta="unobserved"
-          liveDelta={hasProgramLoss ? "observed" : "unobserved"}
-          deltaTone="muted"
-          liveDeltaTone={hasProgramLoss ? "ok" : "muted"}
-          spark={SERIES.loss}
-          sparkTone="muted"
-          liveFooter={hasProgramLoss ? "packet counters active" : "waiting for packet counters"}
-          footer="No packet counters wired yet"
-        />
-        {kpiCount >= 5 && (
-          <KpiTile
-            label="Talkback · WebRTC"
-            value={fmtMetric(TALKBACK.rtt_ms, 1)}
-            unit=" ms"
-            delta={caps.webrtc_media ? TALKBACK.state : "control only"}
-            deltaTone={caps.webrtc_media ? "ok" : "muted"}
-            spark={SERIES.tb_rtt}
-            sparkTone="muted"
-            footer={`${TALKBACK.codec} · media runtime ${caps.webrtc_media ? "available" : "not wired"}`}
-          />
-        )}
-        {kpiCount >= 6 && (
-          <ClockKpiTile
-            sync={CLOCK.lock_state || "off"}
-            ppm={CLOCK.frequency_ratio_ppm}
-            codec={PROGRAM.codec}
-            sampleRate="48.000 kHz"
-            liveNote={hasClockTelemetry ? "clock telemetry observed" : "waiting for clock telemetry"}
-            note={caps.clock_recovery ? "runtime clock recovery active" : "clock recovery not wired yet"}
-          />
-        )}
-      </div>
-
-      {/* Body grid: streams table | events rail */}
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: (showEventsRail || showSystemCard) ? "1fr 320px" : "1fr", gap: 12, padding: 12, minHeight: 0 }}>
-        <Card
-          title="Streams"
-          liveHint={`${filtered.length} of ${CHANNELS.length} | ${activeMeterCount} metered | ${CHANNELS.filter(c => c.state === "warn" || c.state === "err").length} alerts`}
-          hint={`${filtered.length} of ${CHANNELS.length} · ${CHANNELS.filter(c => c.state === "warn" || c.state === "err").length} alerts`}
-          right={(
-            <>
-              <div style={{ display: "flex", gap: 0, padding: 2, background: "var(--ab-surface-2)", borderRadius: 4 }}>
-                {(() => {
-                  const rxN = CHANNELS.filter(c => c.direction === "in").length;
-                  const txN = CHANNELS.filter(c => c.direction === "out").length;
-                  const isN = CHANNELS.filter(c => c.state === "warn" || c.state === "err").length;
-                  return [["all","All"],["rx",`RX · ${rxN}`],["tx",`TX · ${txN}`],["issues",`Issues · ${isN}`]];
-                })().map(([k, lbl]) => (
-                  <button key={k} onClick={() => setTab(k)}
-                          className="ab-btn"
-                          data-variant={tab === k ? "primary" : "ghost"}
-                          style={{ height: 22, padding: "0 8px", fontSize: 11, ...(tab !== k ? { background: "transparent", border: "1px solid transparent", color: "var(--ab-fg-3)" } : {}) }}>
-                    {lbl}
-                  </button>
-                ))}
-              </div>
-              <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
-                <Icon.search style={{ position: "absolute", left: 8, color: "var(--ab-fg-4)" }} />
-                <input value={query} onChange={e => setQuery(e.target.value)} placeholder="filter…"
-                       className="ab-mono"
-                       style={{ height: 22, padding: "0 8px 0 24px", width: 140, fontSize: 11,
-                                background: "var(--ab-surface-2)", color: "var(--ab-fg)",
-                                border: "1px solid var(--ab-border-soft)", borderRadius: 4, outline: "none" }} />
-              </div>
-              <button className="ab-btn" data-variant={adding ? "primary" : undefined} style={{ height: 22, fontSize: 11 }} onClick={() => setAdding(v => !v)}>+ add object</button>
-              <button className="ab-btn" style={{ height: 22, fontSize: 11 }}><Icon.refresh /> 1s</button>
-            </>
-          )}
-        >
-          {adding && <AddStreamPanel onClose={() => setAdding(false)} />}
-          <div style={{ maxHeight: 600, overflow: "auto" }}>
-            <table className="ab-tbl">
-              <thead>
-                <tr>
-                  <th style={{ width: 36 }}>#</th>
-                  <th style={{ width: 36 }}>TX/RX</th>
-                  <th style={{ width: 60 }}>Type</th>
-                  <th>Name</th>
-                  <th style={{ width: 64 }}>State</th>
-                  <th className="ab-num" style={{ width: 56 }} title="Packet loss % over 5s window">Loss</th>
-                  <th className="ab-num" style={{ width: 50 }} title="Inter-arrival jitter (ms)">Jit</th>
-                  <th className="ab-num" style={{ width: 48 }} title="One-way audio latency (ms) — RTT/2 + jitter buffer hold + codec">Lat</th>
-                  <th className="ab-num" style={{ width: 52 }} title="Adaptive jitter-buffer hold (ms) — grows under jitter, target 90–250ms">Buf</th>
-                  <th style={{ width: 100 }}>Transport</th>
-                  <th style={{ width: 100 }}>Route</th>
-                  <th style={{ width: 110 }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map(c => {
-                  const isSrtTx = c.entity_kind === "srt_transport" && c.direction === "out";
-                  const cfgRoot = window.AB.config || {};
-                  const stRoot = window.AB.status || {};
-                  const inputMeters = (stRoot.meters && stRoot.meters.inputs) || [];
-                  const outputMeters = (stRoot.meters && stRoot.meters.outputs) || [];
-                  const transportCfg = isSrtTx ? (cfgRoot.srt_transports || []).find(t => t.id === c.runtime_id) : null;
-                  const groupId = transportCfg && (transportCfg.encode_group_ids || [])[0];
-                  const groupCfg = groupId ? (cfgRoot.encode_groups || []).find(g => g.id === groupId) : null;
-                  return (
-                  <React.Fragment key={c.id}>
-                  <tr data-state={c.state === "idle" ? "muted" : null} style={{ height: rowH }}>
-                    <td className="ab-mono" style={{ color: "var(--ab-fg-4)" }}>{String(c.id).padStart(2, "0")}</td>
-                    <td>
-                      {c.direction === "in" ? (
-                        <span style={{ color: "var(--ab-info)", display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "var(--ab-mono)", fontSize: 11, letterSpacing: 0.04 }}><Icon.arrow2 /> RX</span>
-                      ) : (
-                        <span style={{ color: "var(--ab-accent)", display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "var(--ab-mono)", fontSize: 11, letterSpacing: 0.04 }}>
-                          <span style={{ display: "inline-flex", transform: "scaleX(-1)" }}><Icon.arrow2 /></span>
-                          TX
-                        </span>
-                      )}
-                    </td>
-                    <td><TypeChip type={c.type} transport={c.transport} /></td>
-                    <td style={{ color: "var(--ab-fg)" }}>{c.name}</td>
-                    <td><StateChip state={c.state} /></td>
-                    <td className="ab-num ab-mono" style={{ color: c.loss_pct > 1 ? "var(--ab-err)" : c.loss_pct > 0.3 ? "var(--ab-warn)" : "var(--ab-fg-3)" }}>{fmtMetric(c.loss_pct, 2)}</td>
-                    <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{fmtMetric(c.jitter_ms, 1)}</td>
-                    <td className="ab-num ab-mono" style={{ color: "var(--ab-fg-3)" }}>{fmtMetric(c.latency_ms, 0)}</td>
-                    <td className="ab-num ab-mono" style={{ color: c.buffer_ms == null ? "var(--ab-fg-5)" : c.buffer_ms > 200 ? "var(--ab-warn)" : "var(--ab-fg-3)" }}>{c.buffer_ms == null ? "—" : c.buffer_ms.toFixed(0)}</td>
-                    <td className="ab-mono" style={{ fontSize: 11 }}><TransportLabel transport={c.transport} codec={c.codec} /></td>
-                    <td className="ab-mono" style={{ color: "var(--ab-fg-3)", fontSize: 11 }}>{c.route}</td>
-                    <td><RowActions ch={c} expanded={expandedIds.has(c.id)} onToggle={() => toggleExpanded(c.id)} /></td>
-                  </tr>
-                  {groupCfg && (
-                    <ChannelSubRows
-                      streamId={c.runtime_id}
-                      transportRunning={c.state !== "idle"}
-                      group={groupCfg}
-                      sources={cfgRoot.sources || []}
-                      inputMeters={inputMeters}
-                      outputMeters={outputMeters}
-                      meterDirection={c.direction}
-                      colSpan={12}
-                    />
-                  )}
-                  {expandedIds.has(c.id) && (
-                    <tr key={c.id + "-cfg"}>
-                      <td colSpan={12} style={{ padding: 0, height: "auto", background: "var(--ab-surface-2)", borderBottom: "1px solid var(--ab-border)" }}>
-                        <StreamConfig ch={c} onClose={() => closeExpanded(c.id)} />
-                      </td>
-                    </tr>
-                  )}
-                  </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
+      <EndpointHeader
+        tab={tab} setTab={setTab}
+        query={query} setQuery={setQuery}
+        adding={adding} onAdd={() => setAdding(v => !v)}
+        timeWindow={timeWindow} onTimeWindow={setTimeWindow}
+      />
+      {adding && <div style={{ margin: "0 12px" }}><div className="ab-card"><AddStreamPanel onClose={() => setAdding(false)} /></div></div>}
+      <div style={{ flex: 1, overflow: "auto", padding: "12px", minHeight: 0 }}>
+        {filtered.length === 0 ? (
+          <div className="ab-card" style={{ padding: 40, textAlign: "center", color: "var(--ab-fg-4)", fontSize: 12 }}>
+            {CHANNELS.length === 0 ? "no streams configured — use + add object to create one" : "no streams match the current filter"}
           </div>
-        </Card>
-
-        {(showEventsRail || showSystemCard) && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
-          {showSystemCard && (
-          <Card title="System" hint={SYS.audio_iface.name}>
-            <div style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 10 }}>
-              <SysRow label="CPU" value={fmtPercent(SYS.cpu_pct)} bar={SYS.cpu_pct} tone="muted" sub="probe pending" />
-              <SysRow label="MEM" value={SYS.mem_mb == null ? "—" : `${SYS.mem_mb} MB`} bar={SYS.mem_pct} tone="muted" sub="probe pending" />
-              <SysRow label="TEMP" value={SYS.temp_c == null ? "—" : `${SYS.temp_c}°C`} bar={SYS.temp_c == null ? null : (SYS.temp_c / 90) * 100} tone="muted" sub="probe pending" />
-              <div className="ab-divider" />
-              <div>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-                  <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }} title={hasClockTelemetry ? "Clock telemetry observed" : "Waiting for clock telemetry"}>Clock Runtime</span>
-                  <ClockChip sync={CLOCK.lock_state || "off"} ppm={CLOCK.frequency_ratio_ppm} />
-                </div>
-                <div className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)", marginTop: 3 }}>{CLOCK.mode || "adaptive"} · {hasClockTelemetry ? "telemetry observed" : "telemetry pending"}</div>
-              </div>
-              <div className="ab-divider" />
-              <NicRow label="Dante NIC" nic={SYS.nic_dante} />
-              <NicRow label="WAN NIC"   nic={SYS.nic_wan} />
-            </div>
-          </Card>
-          )}
-
-          {showEventsRail && (
-          <Card
-            title="Live events"
-            hint="SSE · /api/logs/stream"
-            right={<><Chip tone="ok">connected</Chip><button className="ab-btn" data-variant="ghost" style={{ height: 22, fontSize: 11 }}>pause</button></>}
-            style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
-          >
-            <div style={{ borderTop: "1px solid var(--ab-border-soft)", flex: 1, overflow: "auto" }}>
-              <EventsLog />
-            </div>
-          </Card>
-          )}
-        </div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: 12, alignItems: "start" }}>
+            {filtered.map(c => (
+              <StreamCard
+                key={c.id}
+                ch={c}
+                drawerOpen={openDrawers.has(c.id)}
+                onToggleDrawer={() => toggleDrawer(c.id)}
+                onCloseDrawer={() => closeDrawer(c.id)}
+                sources={sources}
+                inputMeters={inputMeters}
+                outputMeters={outputMeters}
+              />
+            ))}
+          </div>
         )}
       </div>
+      <EventsRail open={eventsOpen} onToggle={() => setEventsOpen(v => !v)} />
       </>
       )}
+    </div>
+  );
+}
+
+// ── Endpoint header (replaces the old KPI strip) ───────────────────────────
+function EndpointHeader({ tab, setTab, query, setQuery, adding, onAdd, timeWindow, onTimeWindow }) {
+  const { SYS, CLOCK, CHANNELS } = window.AB;
+  const windows = window.AB.TIME_WINDOWS || [{ id: "5m", label: "5m" }];
+  const counts = useMemo(() => ({
+    rx: CHANNELS.filter(c => c.direction === "in").length,
+    tx: CHANNELS.filter(c => c.direction === "out").length,
+    issues: CHANNELS.filter(c => c.state === "warn" || c.state === "err").length,
+    total: CHANNELS.length,
+  }), [CHANNELS]);
+  const hasClockTelemetry = ["running", "lock", "slew", "drift"].includes(CLOCK.lock_state)
+    || Number.isFinite(CLOCK.frequency_ratio_ppm);
+  const stat = (label, value, hint) => (
+    <div title={hint} style={{ display: "flex", flexDirection: "column", lineHeight: 1.1, minWidth: 0 }}>
+      <span className="ab-mono" style={{ fontSize: 9.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-4)" }}>{label}</span>
+      <span className="ab-mono" style={{ fontSize: 12, color: "var(--ab-fg)", whiteSpace: "nowrap" }}>{value}</span>
+    </div>
+  );
+  const div = () => <span style={{ width: 1, height: 26, background: "var(--ab-border-soft)" }} />;
+  return (
+    <div className="ab-card" style={{ margin: "12px 12px 0", padding: "8px 12px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+      {stat("CPU", fmtPercent(SYS.cpu_pct), "Endpoint CPU usage")}
+      {stat("MEM", SYS.mem_mb == null ? "—" : `${SYS.mem_mb} MB`, "Endpoint memory in use")}
+      {stat("TEMP", SYS.temp_c == null ? "—" : `${SYS.temp_c}°C`, "Endpoint temperature (probe pending)")}
+      {div()}
+      {stat("Dante", `↓ ${SYS.nic_dante.rx_mbps ?? "—"} · ↑ ${SYS.nic_dante.tx_mbps ?? "—"} Mb/s`, SYS.nic_dante.name)}
+      {stat("WAN", `↓ ${SYS.nic_wan.rx_mbps ?? "—"} · ↑ ${SYS.nic_wan.tx_mbps ?? "—"} Mb/s`, SYS.nic_wan.name)}
+      {div()}
+      <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }} title={hasClockTelemetry ? "Clock telemetry observed" : "Waiting for clock telemetry"}>
+        <span className="ab-mono" style={{ fontSize: 9.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-4)" }}>Clock</span>
+        <ClockChip sync={CLOCK.lock_state || "off"} ppm={CLOCK.frequency_ratio_ppm} />
+      </div>
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", padding: 2, background: "var(--ab-surface-2)", borderRadius: 4 }}>
+          {[["all", `All · ${counts.total}`], ["rx", `RX · ${counts.rx}`], ["tx", `TX · ${counts.tx}`], ["issues", `Issues · ${counts.issues}`]].map(([k, lbl]) => (
+            <button key={k} onClick={() => setTab(k)} className="ab-btn"
+                    data-variant={tab === k ? "primary" : "ghost"}
+                    style={{ height: 22, padding: "0 8px", fontSize: 11, ...(tab !== k ? { background: "transparent", border: "1px solid transparent", color: "var(--ab-fg-3)" } : {}) }}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+        <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+          <Icon.search style={{ position: "absolute", left: 8, color: "var(--ab-fg-4)" }} />
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="filter…"
+                 className="ab-mono"
+                 style={{ height: 22, padding: "0 8px 0 24px", width: 140, fontSize: 11,
+                          background: "var(--ab-surface-2)", color: "var(--ab-fg)",
+                          border: "1px solid var(--ab-border-soft)", borderRadius: 4, outline: "none" }} />
+        </div>
+        <div style={{ display: "flex", padding: 2, background: "var(--ab-surface-2)", borderRadius: 4 }} title="Sparkline time window">
+          {windows.map(w => (
+            <button key={w.id} onClick={() => onTimeWindow(w.id)} className="ab-btn"
+                    data-variant={timeWindow === w.id ? "primary" : "ghost"}
+                    style={{ height: 22, padding: "0 8px", fontSize: 11, ...(timeWindow !== w.id ? { background: "transparent", border: "1px solid transparent", color: "var(--ab-fg-3)" } : {}) }}>
+              {w.label}
+            </button>
+          ))}
+        </div>
+        <button className="ab-btn" data-variant={adding ? "primary" : undefined} style={{ height: 22, fontSize: 11 }} onClick={onAdd}>+ add object</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Bottom events rail (collapsible) ───────────────────────────────────────
+function EventsRail({ open, onToggle }) {
+  const connected = window.AB.CONNECTED && window.AB.CONNECTED.sse;
+  return (
+    <div className="ab-card" style={{ margin: "0 12px 12px", display: "flex", flexDirection: "column", maxHeight: open ? 200 : 32, transition: "max-height 0.15s ease" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", cursor: "pointer", borderBottom: open ? "1px solid var(--ab-border-soft)" : "none" }} onClick={onToggle}>
+        <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }}>Live events</span>
+        <Chip tone={connected ? "ok" : "muted"}>{connected ? "connected" : "—"}</Chip>
+        <span className="ab-mono" style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--ab-fg-4)" }}>{open ? "collapse" : "expand"}</span>
+      </div>
+      {open && (
+        <div style={{ flex: 1, overflow: "auto" }}>
+          <EventsLog />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Stream card (the grid tile) ────────────────────────────────────────────
+function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, inputMeters, outputMeters }) {
+  const cfgRoot = window.AB.config || {};
+  const isSrt = ch.entity_kind === "srt_transport";
+  const transportCfg = isSrt ? (cfgRoot.srt_transports || []).find(t => t.id === ch.runtime_id) : null;
+  const groupId = transportCfg && (transportCfg.encode_group_ids || [])[0];
+  const groupCfg = groupId ? (cfgRoot.encode_groups || []).find(g => g.id === groupId) : null;
+  const channelCount = groupCfg ? (groupCfg.channel_count || 1) : (ch.direction === "in" ? 2 : 1);
+  const perPage = 4;
+  const pageCount = Math.max(1, Math.ceil(channelCount / perPage));
+  const [page, setPage] = useState(0);
+  useEffect(() => { if (page >= pageCount) setPage(0); }, [pageCount]);
+
+  return (
+    <div className="ab-card" style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+      <StreamCardHeader ch={ch} drawerOpen={drawerOpen} onToggleDrawer={onToggleDrawer} />
+      <SparklineStrip ch={ch} />
+      {groupCfg ? (
+        <ChannelStrip
+          streamId={ch.runtime_id}
+          transportRunning={ch.state !== "idle"}
+          group={groupCfg}
+          sources={sources}
+          inputMeters={inputMeters}
+          outputMeters={outputMeters}
+          meterDirection={ch.direction}
+          page={page}
+          perPage={perPage}
+        />
+      ) : (
+        <div style={{ padding: 12, fontSize: 11, color: "var(--ab-fg-4)" }}>no channel group — assign one in settings</div>
+      )}
+      {pageCount > 1 && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                      padding: "4px 10px", borderTop: "1px solid var(--ab-border-soft)" }}>
+          <button className="ab-btn" data-variant="ghost" style={{ height: 18, fontSize: 10.5, padding: "0 6px" }}
+                  disabled={page === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>‹</button>
+          <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-4)" }}>
+            page {page + 1} / {pageCount} · {channelCount} ch
+          </span>
+          <button className="ab-btn" data-variant="ghost" style={{ height: 18, fontSize: 10.5, padding: "0 6px" }}
+                  disabled={page >= pageCount - 1} onClick={() => setPage(p => Math.min(pageCount - 1, p + 1))}>›</button>
+        </div>
+      )}
+      {drawerOpen && (
+        <div style={{ borderTop: "2px solid var(--ab-border)", background: "var(--ab-surface-2)" }}>
+          <StreamDrawer ch={ch} onClose={onCloseDrawer} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StreamCardHeader({ ch, drawerOpen, onToggleDrawer }) {
+  const dirChip = ch.direction === "in"
+    ? <span style={{ color: "var(--ab-info)", display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "var(--ab-mono)", fontSize: 11, letterSpacing: 0.04 }}><Icon.arrow2 /> RX</span>
+    : <span style={{ color: "var(--ab-accent)", display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "var(--ab-mono)", fontSize: 11, letterSpacing: 0.04 }}>
+        <span style={{ display: "inline-flex", transform: "scaleX(-1)" }}><Icon.arrow2 /></span>TX
+      </span>;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+                  borderBottom: "1px solid var(--ab-border-soft)", minWidth: 0 }}>
+      {dirChip}
+      <TypeChip type={ch.type} transport={ch.transport} />
+      <span style={{ color: "var(--ab-fg)", fontSize: 12, fontWeight: 500, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={ch.name}>
+        {ch.name}
+      </span>
+      <StateChip state={ch.state} />
+      <RowActions ch={ch} expanded={drawerOpen} onToggle={onToggleDrawer} />
+    </div>
+  );
+}
+
+// ── Per-card sparkline strip ───────────────────────────────────────────────
+function SparklineStrip({ ch }) {
+  const get = (m) => window.AB.getStreamSeries ? window.AB.getStreamSeries(ch.runtime_id, m) : [];
+  const finite = (arr) => arr.filter(v => Number.isFinite(v));
+  const last = (arr) => {
+    const f = finite(arr);
+    return f.length ? f[f.length - 1] : null;
+  };
+  const bitrate = get("bitrate");
+  const rtt = get("rtt");
+  const loss = get("loss");
+  const buffer = get("buffer");
+  const tile = (label, value, unit, data, tone, hint) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2, padding: "6px 8px",
+                  borderRight: "1px solid var(--ab-border-soft)", minWidth: 0, flex: 1, overflow: "hidden" }} title={hint}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 }}>
+        <span className="ab-mono" style={{ fontSize: 9.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-4)" }}>{label}</span>
+        <span className="ab-mono" style={{ fontSize: 11, color: value == null ? "var(--ab-fg-5)" : "var(--ab-fg)", marginLeft: "auto", whiteSpace: "nowrap" }}>
+          {value == null ? "—" : value}{value != null && unit ? <span style={{ color: "var(--ab-fg-4)" }}> {unit}</span> : null}
+        </span>
+      </div>
+      <Sparkline data={finite(data)} tone={tone} w={200} h={20} fluid />
+    </div>
+  );
+  return (
+    <div style={{ display: "flex", borderBottom: "1px solid var(--ab-border-soft)" }}>
+      {tile("Bitrate", last(bitrate) != null ? (last(bitrate) >= 1000 ? (last(bitrate)/1000).toFixed(2) : last(bitrate).toFixed(0)) : null,
+            last(bitrate) != null ? (last(bitrate) >= 1000 ? "Mb/s" : "kb/s") : "",
+            bitrate, "muted", "SRT send/receive bitrate")}
+      {tile("RTT", last(rtt) != null ? last(rtt).toFixed(1) : null, "ms", rtt, "muted", "SRT round-trip time")}
+      {tile("Loss", last(loss) != null ? last(loss).toFixed(2) : null, "%", loss, "muted", "Packet loss / retransmit rate")}
+      {tile("Buffer", last(buffer) != null ? last(buffer).toFixed(0) : null, "ms", buffer, "muted", "Jitter buffer occupancy")}
     </div>
   );
 }
@@ -374,6 +362,10 @@ function SettingsView({ onBack }) {
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [networkInterfaces, setNetworkInterfaces] = useState([]);
+  const [audioInterfaces, setAudioInterfaces] = useState([]);
+  const [registeredDevices, setRegisteredDevices] = useState([]);
+  const [audioStatus, setAudioStatus] = useState("idle");
+  const [audioError, setAudioError] = useState("");
   const [keyStatus, setKeyStatus] = useState("idle");
   const [copyStatus, setCopyStatus] = useState("idle");
   const [pairingStatus, setPairingStatus] = useState("idle");
@@ -399,6 +391,59 @@ function SettingsView({ onBack }) {
       });
     return () => { cancelled = true; };
   }, []);
+
+  const refreshAudioInterfaces = useCallback(() => {
+    return Promise.all([
+      fetch("/api/interfaces/audio")
+        .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+        .then(data => setAudioInterfaces((data && data.interfaces) || []))
+        .catch(e => { console.error("[settings] audio interfaces fetch failed", e); setAudioInterfaces([]); }),
+      fetch("/api/devices/audio")
+        .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+        .then(data => setRegisteredDevices((data && data.devices) || []))
+        .catch(e => { console.error("[settings] registered devices fetch failed", e); setRegisteredDevices([]); }),
+    ]);
+  }, []);
+  useEffect(() => { refreshAudioInterfaces(); }, [refreshAudioInterfaces, JSON.stringify(cfg.sources || [])]);
+
+  const addAudioDevice = async (name, channelCount) => {
+    if (!name) return;
+    setAudioStatus("saving"); setAudioError("");
+    try {
+      const r = await fetch("/api/devices/audio", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(channelCount ? { name, channel_count: channelCount } : { name }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      await (window.AB.refreshConfig && window.AB.refreshConfig());
+      await refreshAudioInterfaces();
+      setAudioStatus("saved");
+      setTimeout(() => setAudioStatus("idle"), 1400);
+    } catch (e) {
+      console.error("[settings] add audio device failed", e);
+      setAudioError(String(e.message || e));
+      setAudioStatus("error");
+    }
+  };
+
+  const removeAudioDevice = async (name) => {
+    if (!name) return;
+    if (!window.confirm(`Remove device "${name}" and all its dante_input sources?`)) return;
+    setAudioStatus("saving"); setAudioError("");
+    try {
+      const r = await fetch(`/api/devices/audio/${encodeURIComponent(name)}`, { method: "DELETE" });
+      if (!r.ok) throw new Error(await r.text());
+      await (window.AB.refreshConfig && window.AB.refreshConfig());
+      await refreshAudioInterfaces();
+      setAudioStatus("saved");
+      setTimeout(() => setAudioStatus("idle"), 1400);
+    } catch (e) {
+      console.error("[settings] remove audio device failed", e);
+      setAudioError(String(e.message || e));
+      setAudioStatus("error");
+    }
+  };
 
   const current = JSON.stringify(makeState());
   const dirty = JSON.stringify(form) !== current;
@@ -619,6 +664,17 @@ function SettingsView({ onBack }) {
             </CfgField>
           </CfgSection>
 
+          <CfgSection label="Capture devices" hint="dante_input sources route through these. Each registered device opens one OS audio capture in the TX pipeline.">
+            <CaptureDevicesPanel
+              available={audioInterfaces}
+              status={audioStatus}
+              error={audioError}
+              onAdd={addAudioDevice}
+              onRemove={removeAudioDevice}
+              onRefresh={refreshAudioInterfaces}
+            />
+          </CfgSection>
+
           <CfgSection label="Program defaults" hint="SRT streams inherit these encode settings">
             <CfgField label="Program path">
               <ToggleButton value={form.program.enabled} onChange={v => updateProgram("enabled", v)} />
@@ -793,6 +849,81 @@ function ToggleButton({ value, onChange }) {
     <button className="ab-btn" data-variant={value ? "primary" : "ghost"} onClick={() => onChange(!value)} style={{ height: 22, fontSize: 11, minWidth: 72 }}>
       {value ? "on" : "off"}
     </button>
+  );
+}
+
+function CaptureDevicesPanel({ available, status, error, onAdd, onRemove, onRefresh }) {
+  const cfg = window.AB.config || {};
+  const registered = useMemo(() => {
+    const map = new Map();
+    (cfg.sources || []).forEach(s => {
+      if (s.kind !== "dante_input" || !s.interface_name) return;
+      const key = s.interface_name;
+      const entry = map.get(key) || { name: key, driver: s.interface_driver || "unknown", device_id: s.interface_device_id || null, source_count: 0, max_channel: 0 };
+      entry.source_count++;
+      entry.max_channel = Math.max(entry.max_channel, s.dante_channel || 0);
+      map.set(key, entry);
+    });
+    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [JSON.stringify(cfg.sources || [])]);
+
+  const [pickName, setPickName] = useState("");
+  const [pickCount, setPickCount] = useState("");
+  const availableUnregistered = (available || []).filter(iface => !registered.some(r => r.name === iface.name));
+
+  const submit = () => {
+    if (!pickName) return;
+    const n = pickCount ? Math.max(1, Math.min(255, parseInt(pickCount, 10) || 0)) : null;
+    onAdd(pickName, n);
+    setPickName("");
+    setPickCount("");
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {registered.length === 0 && (
+        <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-warn)", padding: "4px 0" }}>
+          no capture devices registered — dante_input sources will fail validation
+        </div>
+      )}
+      {registered.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {registered.map(d => (
+            <div key={d.name} style={{
+              display: "grid", gridTemplateColumns: "1fr auto auto auto", gap: 8, alignItems: "center",
+              padding: "4px 8px", background: "var(--ab-surface-2)", borderRadius: 3,
+              border: "1px solid var(--ab-border-soft)"
+            }}>
+              <span className="ab-mono" style={{ fontSize: 11.5, color: "var(--ab-fg)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={d.name}>{d.name}</span>
+              <Chip tone="muted">{d.driver}</Chip>
+              <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-3)" }}>{d.source_count} src · max ch {d.max_channel}</span>
+              <button className="ab-btn" data-variant="ghost" disabled={status === "saving"} onClick={() => onRemove(d.name)} style={{ height: 20, fontSize: 11, color: "var(--ab-err)" }}>remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 80px auto auto", gap: 6, alignItems: "center", paddingTop: 4, borderTop: "1px solid var(--ab-border-soft)" }}>
+        <select value={pickName} onChange={e => setPickName(e.target.value)} className="ab-mono" style={cfgInputStyle}>
+          <option value="">add a device…</option>
+          {availableUnregistered.length === 0 && <option value="" disabled>no unregistered devices detected</option>}
+          {availableUnregistered.map(iface => (
+            <option key={iface.name} value={iface.name}>
+              {iface.name}{iface.driver ? ` · ${iface.driver}` : ""}{iface.channel_count ? ` · ${iface.channel_count}ch` : ""}
+            </option>
+          ))}
+        </select>
+        <input type="number" min={1} max={255} value={pickCount} onChange={e => setPickCount(e.target.value)} placeholder="ch" title="Channels to seed (defaults to detected device channel count)" className="ab-mono" style={{ ...cfgInputStyle }} />
+        <button className="ab-btn" data-variant="primary" disabled={!pickName || status === "saving"} onClick={submit} style={{ height: 24, fontSize: 11 }}>add</button>
+        <button className="ab-btn" data-variant="ghost" disabled={status === "saving"} onClick={onRefresh} style={{ height: 24, fontSize: 11 }} title="Re-scan host audio devices">refresh</button>
+      </div>
+
+      <div className="ab-mono" style={{ fontSize: 10, color: status === "error" ? "var(--ab-err)" : "var(--ab-fg-4)" }}>
+        {status === "saving" ? "saving…"
+          : status === "saved" ? "saved"
+          : error || `${registered.length} device${registered.length === 1 ? "" : "s"} registered · ${availableUnregistered.length} unregistered detected`}
+      </div>
+    </div>
   );
 }
 
@@ -993,15 +1124,36 @@ function RowActions({ ch, expanded, onToggle }) {
     await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
   };
 
-  const showActionState = (tone, message) => {
-    setActionState({ tone, message });
-    window.setTimeout(() => {
-      setActionState((current) => current.message === message ? { tone: "idle", message: "" } : current);
-    }, 2500);
+  const actionTimeout = useRef(null);
+  const showActionState = (tone, message, opts = {}) => {
+    if (actionTimeout.current) {
+      window.clearTimeout(actionTimeout.current);
+      actionTimeout.current = null;
+    }
+    setActionState({ tone, message, detail: opts.detail || "", sticky: !!opts.sticky });
+    if (!opts.sticky) {
+      actionTimeout.current = window.setTimeout(() => {
+        setActionState((current) => current.message === message ? { tone: "idle", message: "", detail: "", sticky: false } : current);
+        actionTimeout.current = null;
+      }, tone === "err" ? 6000 : 2200);
+    }
+  };
+
+  const summariseStream = () => {
+    if (ch.entity_kind === "srt_transport") {
+      const cfgRoot = window.AB.config || {};
+      const t = (cfgRoot.srt_transports || []).find(x => x.id === ch.runtime_id);
+      if (t) {
+        const host = t.host || (t.mode === "listener" ? "*" : "—");
+        return `${t.mode || "listener"} ${host}:${t.port || ""}`;
+      }
+    }
+    return ch.runtime_id;
   };
 
   const handleProgramStart = async () => {
     if (!endpointBase) return;
+    showActionState("info", "starting…", { sticky: true });
     try {
       const response = await fetch(`${endpointBase}/start`, {
         method: "POST",
@@ -1012,15 +1164,17 @@ function RowActions({ ch, expanded, onToggle }) {
       });
       if (!response.ok) throw new Error(await response.text());
       await refreshProgramView();
-      showActionState("ok", "started");
+      showActionState("ok", `started · ${summariseStream()}`);
     } catch (error) {
       console.error("[program] start failed", error);
-      showActionState("err", "start failed");
+      const msg = String(error && error.message || error);
+      showActionState("err", "start failed", { detail: msg });
     }
   };
 
   const handleProgramStop = async () => {
     if (!endpointBase) return;
+    showActionState("info", "stopping…", { sticky: true });
     try {
       const response = await fetch(`${endpointBase}/stop`, { method: "POST" });
       if (!response.ok) throw new Error(await response.text());
@@ -1028,7 +1182,8 @@ function RowActions({ ch, expanded, onToggle }) {
       showActionState("ok", "stopped");
     } catch (error) {
       console.error("[program] stop failed", error);
-      showActionState("err", "stop failed");
+      const msg = String(error && error.message || error);
+      showActionState("err", "stop failed", { detail: msg });
     }
   };
 
@@ -1042,9 +1197,10 @@ function RowActions({ ch, expanded, onToggle }) {
         try { pc.close(); } catch {}
         if (audio && audio.parentNode) audio.parentNode.removeChild(audio);
         setMonitorSession(null);
-        showActionState("ok", "listen stopped");
+        showActionState("ok", "monitor stopped");
         return;
       }
+      showActionState("info", "connecting monitor…", { sticky: true });
 
       const pc = new RTCPeerConnection();
       pc.addTransceiver("audio", { direction: "recvonly" });
@@ -1086,28 +1242,52 @@ function RowActions({ ch, expanded, onToggle }) {
         throw new Error(await ans.text());
       }
       setMonitorSession({ sessionId: offer.session_id, pc, audio });
-      showActionState("ok", "listening");
+      showActionState("ok", "monitor connected");
     } catch (error) {
       console.error("[monitor] toggle failed", error);
-      showActionState("err", "listen failed");
+      const msg = String(error && error.message || error);
+      showActionState("err", "monitor failed", { detail: msg });
     }
   };
 
+  const toneColor = actionState.tone === "err"  ? "var(--ab-err)"
+                  : actionState.tone === "info" ? "var(--ab-fg-3)"
+                  : "var(--ab-ok)";
+  const visible = !!actionState.message;
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
-      <div style={{ display: "inline-flex", gap: 3 }}>
-        {running
-          ? <IconBtn tone="err" title={supportsLifecycle ? "Stop stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStop}><ActIcon.stop /></IconBtn>
-          : <IconBtn tone="acc" title={supportsLifecycle ? "Start stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStart}><ActIcon.play /></IconBtn>}
-        <IconBtn tone={monitorActiveForRow ? "ok" : "info"} title={supportsListen ? (monitorActiveForRow ? "Stop monitor" : "Listen in browser") : "Listen is only available for RX SRT transports"} disabled={!supportsListen} onClick={handleListenToggle}><ActIcon.listen /></IconBtn>
-        <IconBtn tone="info" title="Push to talk is not wired yet" disabled={true}><ActIcon.mic /></IconBtn>
-        <IconBtn tone={expanded ? "acc" : "ghost"} title={expanded ? "Hide settings" : "Stream settings"} onClick={onToggle}><ActIcon.more /></IconBtn>
-      </div>
-      {actionState.message && (
-        <span className="ab-mono" style={{ fontSize: 9.5, color: actionState.tone === "err" ? "var(--ab-err)" : "var(--ab-ok)" }}>
-          {actionState.message}
-        </span>
-      )}
+    <div style={{ position: "relative", display: "inline-flex", gap: 3 }}>
+      {running
+        ? <IconBtn tone="err" title={supportsLifecycle ? "Stop stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStop}><ActIcon.stop /></IconBtn>
+        : <IconBtn tone="acc" title={supportsLifecycle ? "Start stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStart}><ActIcon.play /></IconBtn>}
+      <IconBtn tone={monitorActiveForRow ? "ok" : "info"} title={supportsListen ? (monitorActiveForRow ? "Stop monitor" : "Listen in browser") : "Listen is only available for RX SRT transports"} disabled={!supportsListen} onClick={handleListenToggle}><ActIcon.listen /></IconBtn>
+      <IconBtn tone="info" title="Push to talk is not wired yet" disabled={true}><ActIcon.mic /></IconBtn>
+      <IconBtn tone={expanded ? "acc" : "ghost"} title={expanded ? "Hide settings" : "Stream settings"} onClick={onToggle}><ActIcon.more /></IconBtn>
+      <span
+        className="ab-mono"
+        title={actionState.detail || ""}
+        style={{
+          position: "absolute",
+          top: "calc(100% + 4px)",
+          right: 0,
+          maxWidth: 280,
+          padding: "3px 6px",
+          borderRadius: 4,
+          background: "var(--ab-surface-2)",
+          border: `1px solid ${actionState.tone === "err" ? "rgba(239,68,68,0.4)" : "var(--ab-border-soft)"}`,
+          color: toneColor,
+          fontSize: 10,
+          lineHeight: 1.2,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          pointerEvents: actionState.detail ? "auto" : "none",
+          opacity: visible ? 1 : 0,
+          transform: visible ? "translateY(0)" : "translateY(-2px)",
+          transition: "opacity 0.15s ease, transform 0.15s ease",
+          zIndex: 5,
+        }}>
+        {actionState.message || " "}
+      </span>
     </div>
   );
 }
@@ -1193,10 +1373,14 @@ function defaultOpus(transport) {
 
 const SILENCE_DEFAULT_SOURCE_ID = "silence-default";
 
-function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeters, outputMeters, meterDirection, colSpan }) {
-  const [pending, setPending] = useState({}); // index -> { source_id?, label?, gain_db? }
+function ChannelStrip({ streamId, transportRunning, group, sources, inputMeters, outputMeters, meterDirection, page = 0, perPage = 4 }) {
+  const [pending, setPending] = useState({}); // index -> { source_id?, label? }
   const [savingIdx, setSavingIdx] = useState(null);
   const [error, setError] = useState("");
+  // Per-channel mute is UI-only — backend has no `muted` flag yet.
+  // We swap source_id to silence and remember the prior value so the source
+  // can be restored when the user un-mutes within this session.
+  const [muteMemo, setMuteMemo] = useState({}); // index -> { prevSource }
 
   const channelByIndex = useMemo(() => {
     const map = new Map();
@@ -1204,17 +1388,28 @@ function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeter
     return map;
   }, [group]);
 
-  const sourceOptions = useMemo(() => {
-    const opts = [[SILENCE_DEFAULT_SOURCE_ID, "Silence"]];
-    sources
-      .filter(s => s.id !== SILENCE_DEFAULT_SOURCE_ID)
-      .forEach(s => {
-        const label = s.kind === "dante_input" && s.dante_channel
-          ? `Dante In ${String(s.dante_channel).padStart(2, "0")}`
-          : (s.name || s.id);
-        opts.push([s.id, label]);
-      });
-    return opts;
+  // Group sources by capture device so the dropdown reads "Device → Ch N",
+  // grouped under <optgroup> labels. Non-dante sources (silence/tone) fall
+  // into a "Generators" group.
+  const sourceGroups = useMemo(() => {
+    const groups = new Map();
+    const generators = [];
+    sources.forEach(s => {
+      if (s.id === SILENCE_DEFAULT_SOURCE_ID) { generators.unshift([s.id, "Silence"]); return; }
+      if (s.kind === "dante_input") {
+        const deviceLabel = s.interface_name || "(no device)";
+        const label = s.dante_channel ? `Ch ${String(s.dante_channel).padStart(2, "0")}${s.name && !s.name.startsWith(s.interface_name || "") ? " · " + s.name : ""}` : (s.name || s.id);
+        if (!groups.has(deviceLabel)) groups.set(deviceLabel, []);
+        groups.get(deviceLabel).push([s.id, label]);
+      } else {
+        generators.push([s.id, s.name || s.id]);
+      }
+    });
+    // Stable: silence/tone group first, then devices alphabetically.
+    const out = [];
+    if (generators.length) out.push(["Generators", generators]);
+    for (const name of Array.from(groups.keys()).sort()) out.push([name, groups.get(name)]);
+    return out;
   }, [sources]);
 
   const sourceMeterChannel = useCallback((sourceId) => {
@@ -1266,13 +1461,16 @@ function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeter
     setPending(p => ({ ...p, [idx]: { ...(p[idx] || {}), source_id } }));
     persistChannel(idx, { source_id });
   };
-  const setGain = (idx, gain_db) => {
-    setPending(p => ({ ...p, [idx]: { ...(p[idx] || {}), gain_db } }));
-  };
-  const commitGain = (idx) => {
-    const v = pending[idx] && pending[idx].gain_db;
-    if (v == null) return;
-    persistChannel(idx, { gain_db: Number(v) });
+  const toggleMute = (idx, currentSource) => {
+    const muted = currentSource === SILENCE_DEFAULT_SOURCE_ID;
+    if (muted) {
+      const restore = (muteMemo[idx] && muteMemo[idx].prevSource) || SILENCE_DEFAULT_SOURCE_ID;
+      setMuteMemo(m => { const n = { ...m }; delete n[idx]; return n; });
+      setSource(idx, restore);
+    } else {
+      setMuteMemo(m => ({ ...m, [idx]: { prevSource: currentSource } }));
+      setSource(idx, SILENCE_DEFAULT_SOURCE_ID);
+    }
   };
 
   const startMonitor = async (idx, sourceId) => {
@@ -1291,73 +1489,88 @@ function ChannelSubRows({ streamId, transportRunning, group, sources, inputMeter
     }
   };
 
+  const isRx = meterDirection === "in";
+  const channelCount = group.channel_count || 0;
+  const start = page * perPage;
+  const end = Math.min(channelCount, start + perPage);
   const rows = [];
-  for (let i = 1; i <= (group.channel_count || 0); i++) {
-    const ch = channelByIndex.get(i) || { index: i, source_id: SILENCE_DEFAULT_SOURCE_ID, label: `Ch ${String(i).padStart(2, "0")}`, gain_db: 0 };
+  for (let i = start + 1; i <= end; i++) {
+    const ch = channelByIndex.get(i) || { index: i, source_id: SILENCE_DEFAULT_SOURCE_ID, label: `Ch ${String(i).padStart(2, "0")}` };
     const effectiveSource = (pending[i] && pending[i].source_id) || ch.source_id;
-    const isSilence = effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
+    const isMuted = !isRx && effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
     const meterCh = sourceMeterChannel(effectiveSource);
-    const meter = meterDirection === "out"
-      ? ((outputMeters || [])[i - 1] || {})
-      : (meterCh ? (inputMeters[meterCh - 1] || {}) : {});
-    const gainVal = pending[i] && pending[i].gain_db != null ? pending[i].gain_db : (ch.gain_db ?? 0);
+    const meter = isRx
+      ? ((inputMeters || [])[i - 1] || {})
+      : ((outputMeters || [])[i - 1] || {});
     rows.push(
-      <tr key={`${streamId}-ch-${i}`} style={{ background: "var(--ab-surface-2)", opacity: isSilence ? 0.55 : 1 }}>
-        <td colSpan={colSpan} style={{ padding: "3px 12px 3px 28px", borderBottom: "1px solid var(--ab-border-soft)" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 200px 80px 200px 80px", gap: 10, alignItems: "center", fontSize: 11 }}>
-            <span className="ab-mono" style={{ color: "var(--ab-fg-4)" }}>ch-{String(i).padStart(2, "0")}</span>
-            <input
-              className="ab-mono"
-              value={(pending[i] && pending[i].label) ?? (ch.label || "")}
-              onChange={e => setPending(p => ({ ...p, [i]: { ...(p[i] || {}), label: e.target.value } }))}
-              onBlur={() => { const v = pending[i] && pending[i].label; if (v != null && v !== ch.label) persistChannel(i, { label: v }); }}
-              placeholder={`Ch ${String(i).padStart(2, "0")}`}
-              style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
-            />
-            <select
-              className="ab-mono"
-              value={effectiveSource}
-              onChange={e => setSource(i, e.target.value)}
-              style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
-            >
-              {sourceOptions.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
-            </select>
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }} title="Per-channel gain (dB)">
-              <input
-                type="number" step={0.5} min={-60} max={20}
-                className="ab-mono"
-                value={gainVal}
-                onChange={e => setGain(i, e.target.value)}
-                onBlur={() => commitGain(i)}
-                style={{ ...cfgInputStyle, height: 20, fontSize: 11, textAlign: "right", flex: 1, minWidth: 0 }}
-              />
-              <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)" }}>dB</span>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <Meter level={meter.rms_dbfs} peak={meter.peak_dbfs} w={140} />
-              <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-3)", width: 38, textAlign: "right" }}>{fmtDb(meter.rms_dbfs)}</span>
-            </div>
-            <button
-              className="ab-btn"
-              data-variant="ghost"
-              disabled={!transportRunning || isSilence}
-              onClick={() => startMonitor(i, effectiveSource)}
-              title={transportRunning ? (isSilence ? "Assign a source first" : "Listen to this channel") : "Stream must be running"}
-              style={{ height: 20, fontSize: 11 }}
-            >
-              {savingIdx === i ? "…" : "🎧 monitor"}
-            </button>
-          </div>
-        </td>
-      </tr>
+      <div key={`${streamId}-ch-${i}`}
+           style={{ display: "grid", gridTemplateColumns: "38px 110px 140px 1fr 44px 22px 22px",
+                    gap: 8, alignItems: "center", fontSize: 11,
+                    padding: "4px 10px", borderTop: "1px solid var(--ab-border-soft)",
+                    opacity: isMuted ? 0.55 : 1 }}>
+        <span className="ab-mono" style={{ color: "var(--ab-fg-4)" }}>ch-{String(i).padStart(2, "0")}</span>
+        <input
+          className="ab-mono"
+          value={(pending[i] && pending[i].label) ?? (ch.label || "")}
+          onChange={e => setPending(p => ({ ...p, [i]: { ...(p[i] || {}), label: e.target.value } }))}
+          onBlur={() => { const v = pending[i] && pending[i].label; if (v != null && v !== ch.label) persistChannel(i, { label: v }); }}
+          placeholder={`Ch ${String(i).padStart(2, "0")}`}
+          style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
+        />
+        {isRx ? (
+          <span className="ab-mono"
+                title="RX channels currently route to a decode sink. Per-channel Dante output routing is pending backend support."
+                style={{ fontSize: 11, color: "var(--ab-fg-4)", height: 20, lineHeight: "20px", paddingLeft: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            → Dante Out {String(i).padStart(2, "0")}
+          </span>
+        ) : (
+          <select
+            className="ab-mono"
+            value={effectiveSource}
+            onChange={e => setSource(i, e.target.value)}
+            style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
+          >
+            {sourceGroups.map(([groupLabel, opts]) => (
+              <optgroup key={groupLabel} label={groupLabel}>
+                {opts.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+          <Meter level={meter.rms_dbfs} peak={meter.peak_dbfs} w={null} />
+        </div>
+        <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-3)", textAlign: "right" }}>{fmtDb(meter.rms_dbfs)}</span>
+        <IconBtn
+          tone={isMuted ? "err" : "ghost"}
+          disabled={isRx}
+          title={isRx ? "Mute on RX is not wired yet" : (isMuted ? "Unmute (restore source)" : "Mute channel (route to silence)")}
+          onClick={() => !isRx && toggleMute(i, effectiveSource)}>
+          <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M2 4.5h2L7 2v8L4 7.5H2z" fill={isMuted ? "currentColor" : "none"} />
+            {isMuted && <path d="M9 4l2 4M11 4l-2 4" />}
+          </svg>
+        </IconBtn>
+        <IconBtn
+          tone="info"
+          disabled={!transportRunning || isMuted || isRx}
+          title={isRx ? "Per-channel monitor for RX is not wired yet" : (transportRunning ? (isMuted ? "Unmute first" : "Listen to this channel") : "Stream must be running")}
+          onClick={() => !isRx && startMonitor(i, effectiveSource)}>
+          <ActIcon.listen />
+        </IconBtn>
+      </div>
     );
   }
-  if (error) {
-    rows.push(
-      <tr key={`${streamId}-err`}><td colSpan={colSpan} style={{ padding: "3px 12px 3px 28px", background: "var(--ab-surface-2)", color: "var(--ab-err)", fontSize: 10.5 }} className="ab-mono">{error}</td></tr>
-    );
+  // Reserve slots so card height stays static when channel_count < perPage.
+  for (let i = end; i < start + perPage; i++) {
+    rows.push(<div key={`${streamId}-empty-${i}`} style={{ height: 28, borderTop: "1px solid var(--ab-border-soft)" }} />);
   }
-  return <>{rows}</>;
+  return (
+    <div>
+      {rows}
+      {error && <div className="ab-mono" style={{ padding: "3px 10px", color: "var(--ab-err)", fontSize: 10.5 }}>{error}</div>}
+    </div>
+  );
 }
 
 function AddStreamPanel({ onClose }) {
@@ -1411,31 +1624,32 @@ function AddStreamPanel({ onClose }) {
     try {
       if (kind === "srt_transport") {
         const encodeGroupIds = [];
-        if (direction === "tx") {
-          const n = clampInt(channelCount, 1, 8);
-          const channels = Array.from({ length: n }, (_, i) => ({
-            index: i + 1,
-            source_id: SILENCE_DEFAULT_SOURCE_ID,
-            label: `Ch ${String(i + 1).padStart(2, "0")}`,
-            gain_db: 0.0,
-          }));
-          await postJson("/api/encode-groups", {
-            id: groupPreviewId,
-            name: `${trimmedName} (${n}ch)`,
-            channel_count: n,
-            channels,
-            opus: opusOverride ? {
-              bitrate_kbps: clampInt(opus.bitrate_kbps, 16, 512),
-              bitrate_mode: opus.bitrate_mode || "cbr",
-              frame_ms: clampInt(opus.frame_ms, 2, 60),
-              complexity: clampInt(opus.complexity, 0, 10),
-              inband_fec: !!opus.inband_fec,
-              expected_packet_loss_percent: clampInt(opus.expected_packet_loss_percent, 0, 30),
-            } : { ...programDefaults },
-            enabled: true,
-          });
-          encodeGroupIds.push(groupPreviewId);
-        }
+        const n = clampInt(channelCount, 1, 255);
+        // Both TX and RX get a channel group — RX uses it as a channel-count
+        // carrier (channels are silence-filled and unused on the decode path
+        // until backend exposes Dante output routing).
+        const channels = Array.from({ length: n }, (_, i) => ({
+          index: i + 1,
+          source_id: SILENCE_DEFAULT_SOURCE_ID,
+          label: `Ch ${String(i + 1).padStart(2, "0")}`,
+          gain_db: 0.0,
+        }));
+        await postJson("/api/encode-groups", {
+          id: groupPreviewId,
+          name: `${trimmedName} (${n}ch)`,
+          channel_count: n,
+          channels,
+          opus: (direction === "tx" && opusOverride) ? {
+            bitrate_kbps: clampInt(opus.bitrate_kbps, 16, 512),
+            bitrate_mode: opus.bitrate_mode || "cbr",
+            frame_ms: clampInt(opus.frame_ms, 2, 60),
+            complexity: clampInt(opus.complexity, 0, 10),
+            inband_fec: !!opus.inband_fec,
+            expected_packet_loss_percent: clampInt(opus.expected_packet_loss_percent, 0, 30),
+          } : { ...programDefaults },
+          enabled: true,
+        });
+        encodeGroupIds.push(groupPreviewId);
         await postJson("/api/srt-transports", {
           id: previewId,
           name: trimmedName,
@@ -1502,11 +1716,11 @@ function AddStreamPanel({ onClose }) {
             <CfgField label="Latency">
               <NumberField value={latencyMs} min={20} max={8000} onChange={setLatencyMs} suffix="ms" />
             </CfgField>
+            <CfgField label="Channels">
+              <NumberField value={channelCount} min={1} max={255} onChange={setChannelCount} suffix="ch" />
+            </CfgField>
             {direction === "tx" && (
               <>
-                <CfgField label="Channels">
-                  <NumberField value={channelCount} min={1} max={8} onChange={setChannelCount} suffix="ch" />
-                </CfgField>
                 <CfgField label="Codec">
                   <Segmented value={opusOverride ? "override" : "default"} onChange={v => setOpusOverride(v === "override")} options={[["default", "Defaults"], ["override", "Override"]]} />
                 </CfgField>
@@ -1526,7 +1740,7 @@ function AddStreamPanel({ onClose }) {
         )}
         <CfgSection label="Preview">
           <CfgField label="ID"><span className="ab-mono" style={cfgVal}>{previewId}</span></CfgField>
-          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? `${clampInt(channelCount, 1, 8)}ch silence-filled · group -> SRT` : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
+          <CfgField label="Path"><span className="ab-mono" style={cfgVal}>{kind === "srt_transport" && direction === "tx" ? `${clampInt(channelCount, 1, 255)}ch silence-filled · group -> SRT` : kind === "srt_transport" ? "POST /api/srt-transports" : "POST /api/webrtc-streams"}</span></CfgField>
           {kind === "srt_transport" && direction === "tx" && (
             <CfgField label="Group ID"><span className="ab-mono" style={cfgVal}>{groupPreviewId}</span></CfgField>
           )}
@@ -1608,157 +1822,400 @@ function OpusFields({ opus, disabled, onChange }) {
   );
 }
 
-function StreamConfig({ ch, onClose }) {
+function StreamDrawer({ ch, onClose }) {
   const cfg = window.AB.config || {};
   const details = ch.details || {};
+  const isSrt = ch.entity_kind === "srt_transport";
+  const isTx = ch.direction === "out";
+  const programDefaults = (cfg.program && cfg.program.opus) || defaultOpus("srt");
+  const programSrt = cfg.program || {};
+  const groupId = isSrt ? ((details.encode_group_ids || [])[0]) : null;
+  const groupCfg = groupId ? (cfg.encode_groups || []).find(g => g.id === groupId) : null;
+
+  // Identity
   const [name, setName] = useState(ch.name || "");
-  const [direction, setDirection] = useState(details.direction || (ch.direction === "out" ? "tx" : "rx"));
+
+  // Transport
+  const [direction, setDirection] = useState(details.direction || (isTx ? "tx" : "rx"));
   const [mode, setMode] = useState(details.mode || "listener");
   const [host, setHost] = useState(details.host || "");
   const [port, setPort] = useState(String(details.port || ((cfg.network && cfg.network.srt_port) || 9000)));
-  const [latencyMs, setLatencyMs] = useState(String(details.latency_ms || ((cfg.program && cfg.program.srt_latency_ms) || 240)));
+  const [latencyMs, setLatencyMs] = useState(String(details.latency_ms || (programSrt.srt_latency_ms || 240)));
+
+  // SRT extras (per-transport overrides; backend may not persist all of these yet).
+  const hasEncryptionOverride = details.encryption_enabled != null;
+  const [overrideEncryption, setOverrideEncryption] = useState(hasEncryptionOverride);
+  const [encEnabled, setEncEnabled] = useState(details.encryption_enabled != null ? !!details.encryption_enabled : !!programSrt.encryption_enabled);
+  const [encStrength, setEncStrength] = useState(details.encryption_strength || programSrt.encryption_strength || "aes-256");
+
+  const hasOverheadOverride = details.srt_overhead_bandwidth_percent != null;
+  const [overrideOverhead, setOverrideOverhead] = useState(hasOverheadOverride);
+  const [overheadPct, setOverheadPct] = useState(String(details.srt_overhead_bandwidth_percent ?? (programSrt.srt_overhead_bandwidth_percent ?? 25)));
+
+  const hasBandwidthOverride = details.srt_bandwidth_mode != null || details.inbound_bandwidth_cap_kbps != null;
+  const [overrideBandwidth, setOverrideBandwidth] = useState(hasBandwidthOverride);
+  const [bandwidthMode, setBandwidthMode] = useState(details.srt_bandwidth_mode || programSrt.srt_bandwidth_mode || "auto");
+  const [bandwidthCap, setBandwidthCap] = useState(String(details.inbound_bandwidth_cap_kbps ?? programSrt.inbound_bandwidth_cap_kbps ?? ""));
+
+  // Clock (RX only — only meaningful when decoding)
+  const hasClockOverride = details.clock_recovery_mode != null || (details.free_running_clock && details.free_running_clock.jitter_buffer_ms != null);
+  const [overrideClock, setOverrideClock] = useState(hasClockOverride);
+  const [clockMode, setClockMode] = useState(details.clock_recovery_mode || programSrt.clock_recovery_mode || "adaptive");
+  const [clockBufferMs, setClockBufferMs] = useState(String(
+    (details.free_running_clock && details.free_running_clock.jitter_buffer_ms)
+    ?? (programSrt.free_running_clock && programSrt.free_running_clock.jitter_buffer_ms)
+    ?? 500));
+
+  // OPUS encode (TX only — bound to the encode group)
+  const groupOpus = (groupCfg && groupCfg.opus) || programDefaults;
+  const hasOpusOverride = groupCfg && groupCfg.opus
+    && JSON.stringify(groupCfg.opus) !== JSON.stringify(programDefaults);
+  const [overrideOpus, setOverrideOpus] = useState(!!hasOpusOverride);
+  const [opus, setOpus] = useState({ ...groupOpus });
+
+  // Channel count (editable post-create; bound to the encode group)
+  const [channelCount, setChannelCount] = useState(String(groupCfg ? groupCfg.channel_count : 2));
+
+  // WebRTC source
   const [sourceId, setSourceId] = useState(details.source_id || "");
+
   const [saveState, setSaveState] = useState("idle");
   const [saveError, setSaveError] = useState("");
-  const fields = ch.entity_kind === "srt_transport"
-    ? [
-        ["ID", details.id || ch.runtime_id],
-        ["Direction", details.direction || (ch.direction === "out" ? "tx" : "rx")],
-        ["Mode", details.mode || "listener"],
-        ["Host", details.host || "—"],
-        ["Port", details.port || ((cfg.network && cfg.network.srt_port) || "—")],
-        ["Latency", details.latency_ms != null ? `${details.latency_ms} ms` : "—"],
-        ["Groups", (details.encode_group_ids || []).join(", ") || "—"],
-        ["State", details.state || ch.state],
-      ]
-    : [
-        ["ID", details.id || ch.runtime_id],
-        ["Direction", details.direction || (ch.direction === "out" ? "tx" : "rx")],
-        ["Source", details.source_id || "—"],
-        ["Bitrate", details.bitrate_kbps != null ? `${details.bitrate_kbps} kbps` : "—"],
-        ["RTT", details.rtt_ms != null ? `${details.rtt_ms} ms` : "—"],
-        ["State", details.state || ch.state],
-      ];
 
-  const saveObject = async () => {
-    setSaveState("saving");
-    setSaveError("");
+  const endpointBase = isSrt
+    ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
+    : `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`;
+
+  const buildBody = () => {
+    if (!isSrt) {
+      return {
+        id: details.id || ch.runtime_id,
+        name: name.trim() || ch.name,
+        direction,
+        ...(sourceId.trim() ? { source_id: sourceId.trim() } : {}),
+      };
+    }
+    const body = {
+      id: details.id || ch.runtime_id,
+      name: name.trim() || ch.name,
+      direction,
+      mode,
+      port: clampInt(port, 1, 65535),
+      latency_ms: clampInt(latencyMs, 20, 8000),
+      ...(host.trim() ? { host: host.trim() } : {}),
+      encode_group_ids: details.encode_group_ids || [],
+    };
+    if (overrideEncryption) {
+      body.encryption_enabled = !!encEnabled;
+      body.encryption_strength = encStrength;
+    }
+    if (overrideOverhead) {
+      body.srt_overhead_bandwidth_percent = clampInt(overheadPct, 0, 100);
+    }
+    if (overrideBandwidth) {
+      body.srt_bandwidth_mode = bandwidthMode;
+      const cap = String(bandwidthCap).trim();
+      body.inbound_bandwidth_cap_kbps = bandwidthMode === "manual" && cap ? clampInt(cap, 64, 100000) : null;
+    }
+    if (!isTx && overrideClock) {
+      body.clock_recovery_mode = clockMode;
+      body.free_running_clock = { jitter_buffer_ms: clampInt(clockBufferMs, 20, 5000) };
+    }
+    return body;
+  };
+
+  const saveGroup = async () => {
+    if (!groupCfg) return;
+    const newCount = clampInt(channelCount, 1, 255);
+    const existing = new Map((groupCfg.channels || []).map(c => [c.index, c]));
+    const channels = [];
+    for (let i = 1; i <= newCount; i++) {
+      channels.push(existing.get(i) || {
+        index: i,
+        source_id: SILENCE_DEFAULT_SOURCE_ID,
+        label: `Ch ${String(i).padStart(2, "0")}`,
+        gain_db: 0,
+      });
+    }
+    const body = {
+      id: groupCfg.id,
+      name: groupCfg.name,
+      channel_count: newCount,
+      channels,
+      enabled: groupCfg.enabled !== false,
+      opus: overrideOpus ? {
+        bitrate_kbps: clampInt(opus.bitrate_kbps, 16, 512),
+        bitrate_mode: opus.bitrate_mode || "cbr",
+        frame_ms: clampInt(opus.frame_ms, 2, 60),
+        complexity: clampInt(opus.complexity, 0, 10),
+        inband_fec: !!opus.inband_fec,
+        expected_packet_loss_percent: clampInt(opus.expected_packet_loss_percent, 0, 30),
+      } : { ...programDefaults },
+    };
+    const r = await fetch(`/api/encode-groups/${encodeURIComponent(groupCfg.id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+  };
+
+  const save = async () => {
+    setSaveState("saving"); setSaveError("");
     try {
-      const endpoint = ch.entity_kind === "srt_transport"
-        ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
-        : `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`;
-      const body = ch.entity_kind === "srt_transport"
-        ? {
-            id: details.id || ch.runtime_id,
-            name: name.trim() || ch.name,
-            direction,
-            mode,
-            port: clampInt(port, 1, 65535),
-            latency_ms: clampInt(latencyMs, 20, 8000),
-            ...(host.trim() ? { host: host.trim() } : {}),
-            encode_group_ids: details.encode_group_ids || [],
-          }
-        : {
-            id: details.id || ch.runtime_id,
-            name: name.trim() || ch.name,
-            direction,
-            ...(sourceId.trim() ? { source_id: sourceId.trim() } : {}),
-          };
-      const response = await fetch(endpoint, {
+      const r = await fetch(endpointBase, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(buildBody()),
       });
-      if (!response.ok) throw new Error(await response.text());
+      if (!r.ok) throw new Error(await r.text());
+      if (isSrt && groupCfg) await saveGroup();
       await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
       setSaveState("saved");
       window.setTimeout(() => setSaveState("idle"), 1500);
     } catch (e) {
-      console.error("[object-config] save failed", e);
+      console.error("[stream-drawer] save failed", e);
       setSaveError(String(e.message || e));
       setSaveState("error");
     }
   };
 
-  const deleteObject = async () => {
-    setSaveState("saving");
-    setSaveError("");
+  const remove = async () => {
+    setSaveState("saving"); setSaveError("");
     try {
-      const endpoint = ch.entity_kind === "srt_transport"
-        ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
-        : `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`;
-      const response = await fetch(endpoint, { method: "DELETE" });
-      if (!response.ok) throw new Error(await response.text());
+      const r = await fetch(endpointBase, { method: "DELETE" });
+      if (!r.ok) throw new Error(await r.text());
       await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
       onClose();
     } catch (e) {
-      console.error("[object-config] delete failed", e);
+      console.error("[stream-drawer] delete failed", e);
       setSaveError(String(e.message || e));
       setSaveState("error");
     }
   };
 
+  const duplicate = async () => {
+    setSaveState("saving"); setSaveError("");
+    try {
+      const baseId = details.id || ch.runtime_id;
+      const newId = `${baseId}-copy`;
+      const newName = `${name || ch.name} (copy)`;
+      // Clone the encode group first (TX path), then the transport pointing at it.
+      let newGroupIds = [];
+      if (isSrt && isTx && groupCfg) {
+        const newGroupId = `${groupCfg.id}-copy`;
+        const groupBody = {
+          id: newGroupId,
+          name: `${groupCfg.name} (copy)`,
+          channel_count: groupCfg.channel_count,
+          channels: groupCfg.channels,
+          opus: groupCfg.opus,
+          enabled: groupCfg.enabled !== false,
+        };
+        const gr = await fetch(`/api/encode-groups`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(groupBody),
+        });
+        if (!gr.ok) throw new Error(await gr.text());
+        newGroupIds = [newGroupId];
+      }
+      const body = { ...buildBody(), id: newId, name: newName };
+      if (isSrt) body.encode_group_ids = newGroupIds;
+      const post = await fetch(isSrt ? "/api/srt-transports" : "/api/webrtc-streams", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!post.ok) throw new Error(await post.text());
+      await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
+      setSaveState("saved");
+      window.setTimeout(() => setSaveState("idle"), 1500);
+    } catch (e) {
+      console.error("[stream-drawer] duplicate failed", e);
+      setSaveError(String(e.message || e));
+      setSaveState("error");
+    }
+  };
+
+  const inheritEncSummary = `${programSrt.encryption_enabled ? "on" : "off"}${programSrt.encryption_strength ? " · " + programSrt.encryption_strength : ""}`;
+  const inheritBwSummary = `${programSrt.srt_bandwidth_mode || "auto"} · overhead ${programSrt.srt_overhead_bandwidth_percent ?? 25}%`;
+  const inheritClkSummary = `${programSrt.clock_recovery_mode || "adaptive"}`;
+  const inheritOpusSummary = `${programDefaults.bitrate_kbps} kbps · ${(programDefaults.bitrate_mode || "cbr").toUpperCase()} · ${programDefaults.frame_ms}ms`;
+
   return (
-    <div style={{ padding: "14px 16px 16px", display: "flex", flexDirection: "column", gap: 14 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-3)" }}>
-          {ch.entity_kind === "srt_transport" ? "SRT transport" : "WebRTC stream"} details
-        </span>
-        <TypeChip type={ch.type} transport={ch.transport} />
-        <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-4)" }}>
-          {ch.direction === "in" ? "RX · peer → us" : "TX · us → peer"} · {ch.transport} · {ch.route}
-        </span>
-        <button className="ab-btn" data-variant="ghost" style={{ marginLeft: "auto", height: 22, fontSize: 11 }} onClick={onClose}>close</button>
+    <div style={{ padding: "10px 12px 12px", display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* Identity row */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "center" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "4px 10px", alignItems: "center" }}>
+          <span className="ab-mono" style={dlbl}>Name</span>
+          <input value={name} onChange={e => setName(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} />
+          <span className="ab-mono" style={dlbl}>ID</span>
+          <span className="ab-mono" style={{ ...cfgVal, color: "var(--ab-fg-3)" }}>{details.id || ch.runtime_id}</span>
+        </div>
+        <button className="ab-btn" data-variant="ghost" style={{ height: 22, fontSize: 11, alignSelf: "start" }} onClick={onClose}>close</button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 14 }}>
-        <CfgSection label="Identity">
-          <CfgField label="Name"><input value={name} onChange={e => setName(e.target.value)} className="ab-mono" style={cfgInputStyle} /></CfgField>
-          <CfgField label="Kind"><span className="ab-mono" style={cfgVal}>{ch.entity_kind}</span></CfgField>
-          <CfgField label="Route"><span className="ab-mono" style={cfgVal}>{ch.route}</span></CfgField>
-          <CfgField label="State"><span className="ab-mono" style={cfgVal}>{ch.state}</span></CfgField>
-        </CfgSection>
+      {/* Transport — packed horizontally */}
+      {isSrt && (
+        <DrawerSection title="Transport">
+          <FieldRow>
+            <Field label="Direction" w={160}><Segmented value={direction} onChange={setDirection} options={[["tx", "TX"], ["rx", "RX"]]} /></Field>
+            <Field label="Mode" w={240}><Segmented value={mode} onChange={setMode} options={[["listener", "Listen"], ["caller", "Call"], ["rendezvous", "Rendez."]]} /></Field>
+          </FieldRow>
+          <FieldRow>
+            <Field label="Host" grow><input value={host} onChange={e => setHost(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} placeholder={mode === "listener" ? "optional" : "required"} /></Field>
+            <Field label="Port" w={90}><input type="number" min={1} max={65535} value={port} onChange={e => setPort(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            <Field label="Latency" w={90}><input type="number" min={20} max={8000} value={latencyMs} onChange={e => setLatencyMs(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            {groupCfg && (
+              <Field label="Channels" w={90}>
+                <input type="number" min={1} max={255} value={channelCount}
+                       onChange={e => setChannelCount(e.target.value)}
+                       title="OPUS supports up to 255 channels (multistream). TX currently encodes up to 8 channels natively; >8 requires multistream encoding in the gstreamer pipeline — not yet wired, will fail to start."
+                       className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} />
+              </Field>
+            )}
+          </FieldRow>
+        </DrawerSection>
+      )}
 
-        <CfgSection label="Config" hint="persisted object editor">
-          <CfgField label="Direction">
-            <Segmented value={direction} onChange={setDirection} options={[["tx", "TX"], ["rx", "RX"]]} />
-          </CfgField>
-          {ch.entity_kind === "srt_transport" ? (
-            <>
-              <CfgField label="Mode">
-                <Segmented value={mode} onChange={setMode} options={[["listener", "Listen"], ["caller", "Call"], ["rendezvous", "Rendezvous"]]} />
-              </CfgField>
-              <CfgField label="Host"><input value={host} onChange={e => setHost(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder="optional for listener" /></CfgField>
-              <CfgField label="Port"><NumberField value={port} min={1} max={65535} onChange={setPort} suffix="port" /></CfgField>
-              <CfgField label="Latency"><NumberField value={latencyMs} min={20} max={8000} onChange={setLatencyMs} suffix="ms" /></CfgField>
-            </>
-          ) : (
-            <>
-              <CfgField label="Source id"><input value={sourceId} onChange={e => setSourceId(e.target.value)} className="ab-mono" style={cfgInputStyle} placeholder="optional source link" /></CfgField>
-              <CfgField label="Codec"><span className="ab-mono" style={cfgVal}>inherits talkback defaults</span></CfgField>
-            </>
-          )}
-        </CfgSection>
+      {/* Compact override sections — collapsed by default, fields appear on toggle */}
+      {isSrt && (
+        <OverrideSection
+          title="Encryption"
+          inheritSummary={inheritEncSummary}
+          on={overrideEncryption}
+          onToggle={setOverrideEncryption}>
+          <FieldRow>
+            <Field label="Encryption" w={120}><ToggleButton value={encEnabled} onChange={setEncEnabled} /></Field>
+            <Field label="Strength" grow>
+              <select value={encStrength} onChange={e => setEncStrength(e.target.value)} disabled={!encEnabled} className="ab-mono" style={{ ...cfgInputStyle, height: 22, opacity: encEnabled ? 1 : 0.5 }}>
+                <option value="aes-128">aes-128</option>
+                <option value="aes-192">aes-192</option>
+                <option value="aes-256">aes-256</option>
+              </select>
+            </Field>
+          </FieldRow>
+        </OverrideSection>
+      )}
 
-        <CfgSection label="Runtime" hint="read-only summary from /api/status">
-          {fields.map(([label, value]) => (
-            <CfgField key={label} label={label}><span className="ab-mono" style={cfgVal}>{String(value)}</span></CfgField>
-          ))}
-        </CfgSection>
-      </div>
+      {isSrt && (
+        <OverrideSection
+          title="Bandwidth & Overhead"
+          inheritSummary={inheritBwSummary}
+          on={overrideOverhead || overrideBandwidth}
+          onToggle={v => { setOverrideOverhead(v); setOverrideBandwidth(v); }}>
+          <FieldRow>
+            <Field label="Overhead" w={120}><input type="number" min={0} max={100} value={overheadPct} onChange={e => setOverheadPct(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            <Field label="Bandwidth" w={180}><Segmented value={bandwidthMode} onChange={setBandwidthMode} options={[["auto", "Auto"], ["manual", "Manual"]]} /></Field>
+            {bandwidthMode === "manual" && (
+              <Field label="Cap (kbps)" grow><input type="number" min={64} max={100000} value={bandwidthCap} onChange={e => setBandwidthCap(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} placeholder="none" /></Field>
+            )}
+          </FieldRow>
+        </OverrideSection>
+      )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingTop: 10, borderTop: "1px solid var(--ab-border-soft)", flexWrap: "wrap" }}>
-        {saveError && <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-err)" }}>{saveError}</span>}
+      {isSrt && !isTx && (
+        <OverrideSection
+          title="Clock recovery"
+          inheritSummary={inheritClkSummary}
+          on={overrideClock}
+          onToggle={setOverrideClock}>
+          <FieldRow>
+            <Field label="Mode" w={220}><Segmented value={clockMode} onChange={setClockMode} options={[["adaptive", "Adaptive"], ["free_running", "Free run"]]} /></Field>
+            {clockMode === "free_running" && (
+              <Field label="Buffer (ms)" grow><input type="number" min={20} max={5000} step={10} value={clockBufferMs} onChange={e => setClockBufferMs(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            )}
+          </FieldRow>
+        </OverrideSection>
+      )}
+
+      {isSrt && isTx && groupCfg && (
+        <OverrideSection
+          title="OPUS encode"
+          inheritSummary={inheritOpusSummary}
+          on={overrideOpus}
+          onToggle={setOverrideOpus}>
+          <FieldRow>
+            <Field label="Bitrate" w={120}><input type="number" min={16} max={512} step={8} value={opus.bitrate_kbps} onChange={e => setOpus({ ...opus, bitrate_kbps: parseInt(e.target.value, 10) || 0 })} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            <Field label="Mode" grow><Segmented value={opus.bitrate_mode || "cbr"} onChange={v => setOpus({ ...opus, bitrate_mode: v })} options={OPUS_RATE_MODES} /></Field>
+          </FieldRow>
+          <FieldRow>
+            <Field label="Frame (ms)" w={100}><input type="number" min={2} max={60} value={opus.frame_ms} onChange={e => setOpus({ ...opus, frame_ms: parseInt(e.target.value, 10) || 0 })} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            <Field label="Complexity" w={100}><input type="number" min={0} max={10} value={opus.complexity} onChange={e => setOpus({ ...opus, complexity: parseInt(e.target.value, 10) || 0 })} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+            <Field label="FEC" w={64}><ToggleButton value={!!opus.inband_fec} onChange={v => setOpus({ ...opus, inband_fec: v })} /></Field>
+            <Field label="Exp. loss %" grow><input type="number" min={0} max={30} value={opus.expected_packet_loss_percent} onChange={e => setOpus({ ...opus, expected_packet_loss_percent: parseInt(e.target.value, 10) || 0 })} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} /></Field>
+          </FieldRow>
+        </OverrideSection>
+      )}
+
+      {!isSrt && (
+        <DrawerSection title="Stream">
+          <FieldRow>
+            <Field label="Direction" w={160}><Segmented value={direction} onChange={setDirection} options={[["tx", "TX"], ["rx", "RX"]]} /></Field>
+            <Field label="Source id" grow><input value={sourceId} onChange={e => setSourceId(e.target.value)} className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} placeholder="optional" /></Field>
+          </FieldRow>
+        </DrawerSection>
+      )}
+
+      {/* Footer actions */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {saveError && <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-err)", flex: "1 1 100%" }}>{saveError}</span>}
+        <button className="ab-btn" data-variant="danger" disabled={saveState === "saving"} onClick={remove} style={{ height: 24, fontSize: 11 }}>delete</button>
+        <button className="ab-btn" data-variant="ghost" disabled={saveState === "saving"} onClick={duplicate} style={{ height: 24, fontSize: 11 }}>duplicate</button>
         <div style={{ flex: 1 }} />
-        <button className="ab-btn" data-variant="danger" disabled={saveState === "saving"} onClick={deleteObject} style={{ height: 24, fontSize: 11 }}>delete</button>
-        <button className="ab-btn" data-variant="primary" disabled={saveState === "saving"} onClick={saveObject} style={{ height: 24, fontSize: 11 }}>
-          {saveState === "saving" ? "saving..." : saveState === "saved" ? "saved" : saveState === "error" ? "retry save" : "save changes"}
+        <button className="ab-btn" data-variant="primary" disabled={saveState === "saving"} onClick={save} style={{ height: 24, fontSize: 11 }}>
+          {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved" : saveState === "error" ? "retry save" : "save changes"}
         </button>
       </div>
     </div>
   );
 }
 
+// Compact drawer primitives
+const dlbl = { fontSize: 10, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-4)" };
+
+function DrawerSection({ title, right, children }) {
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: "1px solid var(--ab-border-soft)", marginBottom: 6 }}>
+        <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-2)", fontWeight: 600 }}>{title}</span>
+        {right && <div style={{ marginLeft: "auto" }}>{right}</div>}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{children}</div>
+    </div>
+  );
+}
+
+function OverrideSection({ title, inheritSummary, on, onToggle, children }) {
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: "1px solid var(--ab-border-soft)", marginBottom: on ? 6 : 0 }}>
+        <span className="ab-mono" style={{ fontSize: 10.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-2)", fontWeight: 600 }}>{title}</span>
+        {!on && (
+          <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-5)" }} title="Value inherited from global defaults">
+            inherits · {inheritSummary}
+          </span>
+        )}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+          <span className="ab-mono" style={{ fontSize: 10, color: "var(--ab-fg-4)" }}>override</span>
+          <ToggleButton value={on} onChange={onToggle} />
+        </div>
+      </div>
+      {on && <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{children}</div>}
+    </div>
+  );
+}
+
+function FieldRow({ children }) {
+  return <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>{children}</div>;
+}
+function Field({ label, w, grow, children }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, width: w || undefined, flex: grow ? "1 1 0" : "0 0 auto" }}>
+      <span className="ab-mono" style={dlbl}>{label}</span>
+      {children}
+    </div>
+  );
+}
 const cfgInputStyle = {
   flex: 1, width: "100%", minWidth: 0, boxSizing: "border-box",
   height: 24, padding: "0 8px", fontSize: 11.5,

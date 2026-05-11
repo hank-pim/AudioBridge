@@ -25,11 +25,13 @@ function Chip({ tone="muted", children, mono=true }) {
 function Dot({ tone="ok" }) { return <span className="ab-dot" data-tone={tone} />; }
 
 // ── Sparkline (SVG path, area + line) ─────────────────────────────────────
-function Sparkline({ data, w=84, h=22, tone, area=true }) {
+function Sparkline({ data, w=84, h=22, tone, area=true, fluid=false }) {
+  const widthAttr = fluid ? "100%" : w;
+  const svgStyle = fluid ? { display: "block", maxWidth: "100%" } : undefined;
+  const preserve = fluid ? "none" : undefined;
   const nums = (data || []).filter(v => Number.isFinite(v));
   if (nums.length < 2) {
-    // Reserve the space so layout doesn't jump once samples accumulate.
-    return <svg className="ab-spark" data-tone={tone} width={w} height={h} viewBox={`0 0 ${w} ${h}`} />;
+    return <svg className="ab-spark" data-tone={tone} width={widthAttr} height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio={preserve} style={svgStyle} />;
   }
   const min = Math.min(...nums), max = Math.max(...nums);
   const span = (max - min) || 1;
@@ -42,7 +44,7 @@ function Sparkline({ data, w=84, h=22, tone, area=true }) {
   const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   const fill = line + ` L ${w} ${h} L 0 ${h} Z`;
   return (
-    <svg className="ab-spark" data-tone={tone} width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
+    <svg className="ab-spark" data-tone={tone} width={widthAttr} height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio={preserve} style={svgStyle}>
       {area && <path className="ab-spark-area" d={fill} />}
       <path className="ab-spark-line" d={line} />
     </svg>

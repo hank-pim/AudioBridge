@@ -75,6 +75,12 @@ class SourceConfig(BaseModel):
     name: str
     kind: SourceKind = SourceKind.dante_input
     dante_channel: int | None = Field(default=None, ge=1, le=64)
+    # Per-source capture device. Required for dante_input sources so the
+    # pipeline can open one capture node per distinct device. Sources from
+    # different devices coexist in the same TX encode group.
+    interface_name: str | None = None
+    interface_driver: Literal["wasapi", "coreaudio", "alsa", "asio", "unknown"] | None = None
+    interface_device_id: str | None = None
     webrtc_stream_id: str | None = None
     tone_frequency_hz: float | None = Field(default=None, gt=0)
     tone_level_dbfs: float = Field(default=-20.0, le=0.0, ge=-60.0)
@@ -100,7 +106,7 @@ class WebRtcStreamConfig(BaseModel):
 
 
 class EncodeGroupChannelConfig(BaseModel):
-    index: int = Field(ge=1, le=64)
+    index: int = Field(ge=1, le=255)
     source_id: str | None = None
     label: str | None = None
     gain_db: float = 0.0
@@ -109,7 +115,7 @@ class EncodeGroupChannelConfig(BaseModel):
 class EncodeGroupConfig(BaseModel):
     id: str
     name: str
-    channel_count: int = Field(default=2, ge=1, le=64)
+    channel_count: int = Field(default=2, ge=1, le=255)
     channels: list[EncodeGroupChannelConfig] = Field(default_factory=list)
     opus: OpusStreamConfig = Field(default_factory=OpusStreamConfig)
     enabled: bool = True

@@ -512,6 +512,57 @@ def create_api_router(
         events.append("info", "system", f"audio interface set to '{name}' ({channel_count} ch)")
         return saved.audio.model_dump(mode="json", exclude_none=True)
 
+    @router.get("/devices/audio")
+    def list_registered_audio_devices() -> dict[str, Any]:
+        """Distinct capture devices currently referenced by configured sources,
+        with their source counts. The host's available audio interfaces come
+        from /api/interfaces/audio — this endpoint is the *registered* set."""
+        in_use: dict[str, dict[str, Any]] = {}
+        for source in store.config.sources:
+            if source.kind != "dante_input":
+                continue
+            name = source.interface_name
+            if not name:
+                continue
+            entry = in_use.setdefault(name, {
+                "name": name,
+                "driver": source.interface_driver or "unknown",
+                "device_id": source.interface_device_id,
+                "source_count": 0,
+                "max_channel": 0,
+            })
+            entry["source_count"] += 1
+            entry["max_channel"] = max(entry["max_channel"], source.dante_channel or 0)
+        return {"devices": list(in_use.values())}
+
+    @router.post("/devices/audio")
+    def add_audio_device(body: dict[str, Any]) -> dict[str, Any]:
+        """Register a capture device + seed dante_input sources for it. Uses
+        '{slug}-in-NN' IDs (slug derived from device name) so multiple devices
+        coexist without ID collision."""
+        name = body.get("name")
+        if not name:
+            raise HTTPException(status_code=422, detail="name is required")
+        interfaces = media.discover_audio_interfaces()
+        match = next((i for i in interfaces if i["name"] == name or i.get("id") == name), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail=f"audio interface '{name}' not found")
+        channel_count = max(1, min(int(body.get("channel_count", match.get("channel_count") or 8)), 64))
+        added = store.add_audio_device(
+            interface_name=match["name"],
+            interface_driver=normalize_config_driver(match.get("driver")),
+            interface_device_id=match.get("device_id"),
+            channel_count=channel_count,
+        )
+        events.append("info", "system", f"capture device '{name}' registered ({channel_count} ch, {len(added)} sources)")
+        return {"device": {"name": match["name"], "driver": normalize_config_driver(match.get("driver")), "channel_count": channel_count}, "sources_added": added}
+
+    @router.delete("/devices/audio/{name}")
+    def remove_audio_device(name: str) -> dict[str, Any]:
+        removed = store.remove_audio_device(name)
+        events.append("info", "system", f"capture device '{name}' removed ({len(removed)} sources)")
+        return {"removed_sources": removed}
+
     @router.get("/interfaces/network")
     def list_network_interfaces() -> dict[str, Any]:
         cfg = store.config.network
