@@ -11,6 +11,27 @@
 (function (g) {
   const subs = new Set();
   const HISTORY = 60;
+  // Per-stream history retained at 1Hz. 900 samples = 15 minutes; longer
+  // windows would need server-side retention so we don't pile MB into the tab.
+  // Status pushes arrive at ~30Hz from the backend, so samples are bucketed
+  // into 1s slots client-side (aggregator below) before being committed here.
+  const STREAM_HISTORY = 900;
+  const STREAM_BUCKET_MS = 1000;
+  // Per-metric reducer for the in-flight 1s bucket. Bitrate/loss keep the
+  // max so brief peaks survive aggregation; RTT and buffer keep the mean so
+  // a single spike doesn't dominate the trace.
+  const STREAM_METRIC_REDUCERS = {
+    bitrate: "max",
+    loss:    "max",
+    rtt:     "mean",
+    buffer:  "mean",
+  };
+  const STREAM_METRICS = Object.keys(STREAM_METRIC_REDUCERS);
+  const TIME_WINDOWS = [
+    { id: "1m",  label: "1m",  samples: 60  },
+    { id: "5m",  label: "5m",  samples: 300 },
+    { id: "15m", label: "15m", samples: 900 },
+  ];
 
   const store = {
     PEER:    { self: { name: "endpoint", addr: "—" }, peer: { name: "—", addr: "—" }, version: "0.1.0" },
@@ -34,7 +55,82 @@
     config: null,
     status: null,
     runtime: null,
+    // Per-stream telemetry series keyed by runtime_id.
+    // Shape: STREAM_SERIES[id] = { bitrate: [], rtt: [], loss: [], buffer: [] }
+    STREAM_SERIES: {},
+    TIME_WINDOWS: TIME_WINDOWS,
+    timeWindow: "5m",
   };
+
+  function ensureStreamSeries(id) {
+    if (!store.STREAM_SERIES[id]) {
+      store.STREAM_SERIES[id] = {};
+      STREAM_METRICS.forEach(k => { store.STREAM_SERIES[id][k] = []; });
+    }
+    return store.STREAM_SERIES[id];
+  }
+  // In-flight 1s aggregation bucket per (id, metric). When wall-clock crosses
+  // into the next bucket we flush the previous bucket's reduced value into the
+  // history ring and start a new one. Any 1s windows with no samples are
+  // back-filled with null so the time axis stays aligned even if the WS
+  // briefly drops.
+  const streamBuckets = {};
+  function streamBucketFor(id) {
+    if (!streamBuckets[id]) {
+      streamBuckets[id] = { startedAt: null };
+      STREAM_METRICS.forEach(k => { streamBuckets[id][k] = { count: 0, sum: 0, max: -Infinity }; });
+    }
+    return streamBuckets[id];
+  }
+  function reduceBucket(b, reducer) {
+    if (b.count === 0) return null;
+    return reducer === "max" ? b.max : b.sum / b.count;
+  }
+  function flushBucket(id, bucket) {
+    const series = ensureStreamSeries(id);
+    STREAM_METRICS.forEach(k => {
+      const value = reduceBucket(bucket[k], STREAM_METRIC_REDUCERS[k]);
+      series[k].push(value);
+      while (series[k].length > STREAM_HISTORY) series[k].shift();
+      bucket[k] = { count: 0, sum: 0, max: -Infinity };
+    });
+  }
+  function pushStreamSample(id, key, val) {
+    const bucket = streamBucketFor(id);
+    const now = Date.now();
+    if (bucket.startedAt === null) {
+      bucket.startedAt = now;
+    } else {
+      const gap = Math.floor((now - bucket.startedAt) / STREAM_BUCKET_MS);
+      if (gap >= 1) {
+        flushBucket(id, bucket);
+        // Pad any whole-second gaps with null so 1 sample == 1 second.
+        for (let i = 1; i < gap; i++) {
+          const series = ensureStreamSeries(id);
+          STREAM_METRICS.forEach(k => {
+            series[k].push(null);
+            while (series[k].length > STREAM_HISTORY) series[k].shift();
+          });
+        }
+        bucket.startedAt = bucket.startedAt + gap * STREAM_BUCKET_MS;
+      }
+    }
+    if (Number.isFinite(val)) {
+      const slot = bucket[key];
+      slot.count += 1;
+      slot.sum += val;
+      if (val > slot.max) slot.max = val;
+    }
+  }
+  function pruneStreamSeries(activeIds) {
+    const keep = new Set(activeIds);
+    Object.keys(store.STREAM_SERIES).forEach(id => {
+      if (!keep.has(id)) delete store.STREAM_SERIES[id];
+    });
+    Object.keys(streamBuckets).forEach(id => {
+      if (!keep.has(id)) delete streamBuckets[id];
+    });
+  }
 
   const notify = () => subs.forEach(fn => fn());
   const pushSeries = (key, val) => {
@@ -226,6 +322,23 @@
     pushSeries("tb_rtt",  store.TALKBACK.rtt_ms);
     pushSeries("tb_jitter", store.TALKBACK.jitter_ms);
 
+    const activeIds = [];
+    (st.srt_transports || []).forEach(t => {
+      activeIds.push(t.id);
+      pushStreamSample(t.id, "bitrate", t.bitrate_kbps);
+      pushStreamSample(t.id, "rtt",     t.rtt_ms);
+      pushStreamSample(t.id, "loss",    t.packet_loss_percent);
+      pushStreamSample(t.id, "buffer",  t.buffer_occupancy_ms != null ? t.buffer_occupancy_ms : t.latency_ms);
+    });
+    (st.webrtc_streams || []).forEach(w => {
+      activeIds.push(w.id);
+      pushStreamSample(w.id, "bitrate", w.bitrate_kbps);
+      pushStreamSample(w.id, "rtt",     w.rtt_ms);
+      pushStreamSample(w.id, "loss",    w.packet_loss_percent);
+      pushStreamSample(w.id, "buffer",  null);
+    });
+    pruneStreamSeries(activeIds);
+
     notify();
   }
 
@@ -301,6 +414,18 @@
   };
   g.AB.refreshAll = async () => {
     await Promise.all([g.AB.refreshConfig(), g.AB.refreshStatus()]);
+  };
+  g.AB.setTimeWindow = (id) => {
+    if (!TIME_WINDOWS.find(w => w.id === id)) return;
+    store.timeWindow = id;
+    notify();
+  };
+  g.AB.getStreamSeries = (runtimeId, metric) => {
+    const s = store.STREAM_SERIES[runtimeId];
+    if (!s) return [];
+    const win = TIME_WINDOWS.find(w => w.id === store.timeWindow) || TIME_WINDOWS[1];
+    const arr = s[metric] || [];
+    return arr.slice(-win.samples);
   };
 
   if (document.readyState === "loading") {

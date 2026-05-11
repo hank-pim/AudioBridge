@@ -447,17 +447,35 @@ class CtypesManagedPipeline:
             self.output_tail.append(f"srtstats: {text}")
             self._last_stats_tail_at = now
         fields = _parse_stats(text)
-        bytes_total = _first_int(fields, "pkti-send-bytes", "bytes-sent-total", "bytes-received-total")
-        bitrate_kbps = _mbps_to_kbps(_first_float(fields, "send-rate-mbps"))
+        # Compute bitrate from byte-counter deltas so the value is instantaneous.
+        # SRT's own send-rate-mbps / receive-rate-mbps are trailing averages maintained
+        # inside libsrt since stat reset, so they slowly ramp up over the first minute
+        # of a fresh stream — fine for an averaged headline value, wrong for a
+        # 1Hz sparkline. Fall back to the SRT-reported rate only if no byte counter
+        # is exposed yet (e.g. first poll after start).
+        bytes_total = _first_int(
+            fields,
+            "bytes-received-total", "bytes-sent-total",
+            "pkti-recv-bytes", "pkti-send-bytes",
+        )
+        bitrate_kbps: float | None = None
         if bytes_total is not None and self._last_bytes is not None and self._last_stats_at is not None:
             elapsed = max(now - self._last_stats_at, 0.001)
-            delta_bitrate_kbps = max((bytes_total - self._last_bytes) * 8 / elapsed / 1000, 0)
-            bitrate_kbps = bitrate_kbps if bitrate_kbps is not None else delta_bitrate_kbps
+            bitrate_kbps = max((bytes_total - self._last_bytes) * 8 / elapsed / 1000, 0)
+        if bitrate_kbps is None:
+            send_rate = _mbps_to_kbps(_first_float(fields, "send-rate-mbps"))
+            recv_rate = _mbps_to_kbps(_first_float(fields, "receive-rate-mbps", "recv-rate-mbps"))
+            bitrate_kbps = recv_rate if (recv_rate and recv_rate > 0) else send_rate
         if bytes_total is not None:
             self._last_bytes = bytes_total
             self._last_stats_at = now
-        packets_sent = _first_int(fields, "packets-sent")
-        packets_lost = _first_int(fields, "packets-sent-lost", "pkti-send-loss", "packets-lost", "pkt-snd-loss-total", "pkt-rcv-loss-total")
+        packets_sent = _first_int(fields, "packets-sent", "packets-received")
+        packets_lost = _first_int(
+            fields,
+            "packets-sent-lost", "packets-received-lost",
+            "pkti-send-loss", "pkti-recv-loss",
+            "packets-lost", "pkt-snd-loss-total", "pkt-rcv-loss-total",
+        )
         self.telemetry.observe_srt_transport(
             self.transport_id,
             bitrate_kbps=bitrate_kbps,
@@ -466,7 +484,7 @@ class CtypesManagedPipeline:
             rtt_variance_ms=_first_float(fields, "pkti-link-jitter-ms", "rtt-variance-ms"),
             packets_lost=packets_lost,
             packet_loss_percent=_loss_percent(packets_lost, packets_sent),
-            packets_retransmitted=_first_int(fields, "packets-retransmitted", "pkti-send-retrans", "pkt-retrans-total"),
+            packets_retransmitted=_first_int(fields, "packets-retransmitted", "packets-received-retransmitted", "pkti-send-retrans", "pkti-recv-retrans", "pkt-retrans-total"),
             raw_stats=text,
         )
 

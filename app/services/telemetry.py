@@ -169,6 +169,8 @@ class TelemetryService:
                 "configured_bitrate_kbps": self._configured_srt_bitrate_kbps(config, transport.encode_group_ids),
                 "bitrate_kbps": observation.bitrate_kbps if observation else None,
                 "rtt_ms": observation.rtt_ms if observation else None,
+                "packet_loss_percent": observation.packet_loss_percent if observation else None,
+                "buffer_occupancy_ms": observation.buffer_occupancy_ms if observation else None,
                 "latency_ms": transport.latency_ms or config.program.srt_latency_ms,
             })
 
