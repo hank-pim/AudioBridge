@@ -618,6 +618,7 @@ class MediaController:
         pipeline = self._spawn_managed_spine_pipeline(
             name="spine_full_duplex",
             graph=plan["gstreamer"]["graph"],
+            channel_count=plan["channel_count"],
         )
         self._spine_pipeline = pipeline
         return {
@@ -715,20 +716,39 @@ class MediaController:
             remaining.append((tid, element_ptr))
         spine.srt_endpoints = remaining
 
-    def _spawn_managed_spine_pipeline(self, *, name: str, graph: str) -> Any:
+    def _spawn_managed_spine_pipeline(
+        self,
+        *,
+        name: str,
+        graph: str,
+        channel_count: int,
+    ) -> Any:
         """Like _spawn_managed_gst_pipeline but with no srt endpoint registration.
 
         The spine has no srtsink/srtsrc; it owns DVS only. Bus polling still
         runs so we get level messages and pipeline error visibility.
+
+        ``meter_lookup`` attributes the spine's per-channel ``dbmeter_in_spine_K``
+        level elements to a sentinel transport id ("spine") instead of letting
+        them fall through to the legacy "trailing-int is the channel" parser,
+        which would write local DVS capture levels into the per-channel global
+        ``input_meters[K]`` slot and clobber per-transport RX observations on
+        the same channel index — causing the UI to display local capture audio
+        as if it were RX activity.
         """
         if self._gst_runtime is None:
             self._gst_runtime = CtypesGst.load(self.gst_launch_executable)
+        meter_lookup: dict[str, tuple[str, str, int]] = {
+            f"dbmeter_in_spine_{ch}": ("spine", "in", ch)
+            for ch in range(1, channel_count + 1)
+        }
         return CtypesManagedPipeline.start_bundle(
             name=name,
             graph=graph,
             srt_endpoints=[],
             telemetry=self.telemetry,
             runtime=self._gst_runtime,
+            meter_lookup=meter_lookup,
         )
 
     def start_tx_capture_spine(self, config: EndpointConfig) -> dict[str, Any]:
@@ -749,6 +769,7 @@ class MediaController:
         pipeline = self._spawn_managed_spine_pipeline(
             name="tx_capture_spine",
             graph=plan["gstreamer"]["graph"],
+            channel_count=plan["channel_count"],
         )
         self._spine_pipeline = pipeline
         return {

@@ -139,7 +139,13 @@ class TelemetryService:
         transport_id: str | None = None,
     ) -> None:
         observation = AudioMeterObservation(peak_dbfs=peak_dbfs, rms_dbfs=rms_dbfs)
-        self.input_meters[channel] = observation
+        # The "spine" sentinel is for the always-on DVS capture level meters.
+        # Those should be visible per-channel under the spine transport key, but
+        # must NOT be written into the per-channel global input_meters map —
+        # otherwise they overwrite per-transport RX observations on the same
+        # channel index and the UI shows local capture audio as RX activity.
+        if transport_id != "spine":
+            self.input_meters[channel] = observation
         if transport_id is not None:
             self.input_meters_by_transport.setdefault(transport_id, {})[channel] = observation
 
