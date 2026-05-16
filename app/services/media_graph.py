@@ -764,11 +764,17 @@ class MediaGraphBuilder:
         interaudio_channels: list[str] = []
         meter_endpoints: list[dict[str, Any]] = []
         for channel in sorted_channels:
-            if channel.index > config.audio.channel_count:
+            output_channel_idx = channel.index
+            if channel.source_id and channel.source_id != "system-silence-00":
+                src_conf = next((s for s in config.sources if s.id == channel.source_id), None)
+                if src_conf and src_conf.dante_channel is not None:
+                    output_channel_idx = src_conf.dante_channel
+
+            if output_channel_idx > config.audio.channel_count:
                 error = self._error(
                     transport.id, group.id, "rx_output_channel_out_of_range",
-                    f"RX channel {channel.index} exceeds interface channel_count {config.audio.channel_count}",
-                    channel.index,
+                    f"RX output destination {output_channel_idx} exceeds interface channel_count {config.audio.channel_count}",
+                    output_channel_idx,
                 )
                 if raise_on_error:
                     raise MediaGraphValidationError([error])
@@ -779,10 +785,10 @@ class MediaGraphBuilder:
                     "mixer_names": [], "exit_element_names": [],
                     "srt_element_name": None, "meter_endpoints": [],
                 }
-            mixer_names.append(self.spine_playback_mixer_name(channel.index))
-            interaudio_channel = self.spine_playback_interaudio_channel(channel.index)
+            mixer_names.append(self.spine_playback_mixer_name(output_channel_idx))
+            interaudio_channel = self.spine_playback_interaudio_channel(output_channel_idx)
             interaudio_channels.append(interaudio_channel)
-            exit_name = f"out_{channel.index}"
+            exit_name = f"out_{output_channel_idx}"
             exit_element_names.append(exit_name)
             meter_name = self._rx_meter_element_name(transport.id, channel.index)
             meter_endpoints.append({
@@ -796,8 +802,8 @@ class MediaGraphBuilder:
                 f"! queue "
                 f"! level name={meter_name} message=true interval=100000000 "
                 f"! audioconvert "
-                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
-                f"! interaudiosink name={exit_name} channel={interaudio_channel} sync=false async=false"
+                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 "
+                f"! queue name={exit_name}"
             )
 
         return {
@@ -974,7 +980,9 @@ class MediaGraphBuilder:
             "!",
             "audioconvert",
             "!",
-            f"audio/x-raw,format=S16LE,rate=48000,channels={n},layout=interleaved,channel-mask=(bitmask)0x0",
+            "audioresample",
+            "!",
+            f"audio/x-raw,rate=48000,channels={n},layout=interleaved,channel-mask=(bitmask)0x0",
             "!",
             *sink_args,
             f"name={self.SPINE_ASIOSINK_NAME}",
@@ -985,13 +993,15 @@ class MediaGraphBuilder:
             # The silence feeder is the always-on default input; RX legs add
             # additional sink pads on the same mixer at runtime.
             argv.extend([
-                "adder",
+                "audiomixer",
                 f"name={mixer_name}",
-                'caps="audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved"',
+                "latency=20000000",
+                "!",
+                "audioconvert",
+                "!",
+                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0",
                 "!",
                 "queue",
-                "!",
-                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
                 "!",
                 f"{self.SPINE_PLAYBACK_INTERLEAVE_NAME}.sink_{channel - 1}",
                 "audiotestsrc",
@@ -1000,18 +1010,7 @@ class MediaGraphBuilder:
                 "!",
                 "audioconvert",
                 "!",
-                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
-                "!",
-                f"{mixer_name}.",
-                "interaudiosrc",
-                f"channel={self.spine_playback_interaudio_channel(channel)}",
-                "do-timestamp=true",
-                "buffer-time=20000000",
-                "latency-time=10000000",
-                "!",
-                "audioconvert",
-                "!",
-                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0",
                 "!",
                 f"{mixer_name}.",
             ])

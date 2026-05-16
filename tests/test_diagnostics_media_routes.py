@@ -1415,7 +1415,7 @@ def test_plan_spine_full_duplex_shape() -> None:
     # output attach points dynamically linkable after the spine is already PLAYING.
     assert "interleave name=spine_out_interleave" in graph
     for mixer in plan["playback_mixer_names"]:
-        assert f'adder name={mixer} caps="audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved"' in graph
+        assert f"audiomixer name={mixer} latency=20000000 ! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue ! spine_out_interleave" in graph
     # Default silence feeders keep each mixer producing buffers when no RX
     # leg is attached, so asiosink never starves.
     assert graph.count("audiotestsrc is-live=true wave=silence") == 4
@@ -1697,8 +1697,8 @@ def test_plan_rx_leg_branch_emits_mixer_outputs_and_no_fakesink() -> None:
     assert "deinterleave name=rx_split_rx_a" in desc
     assert "rx_split_rx_a.src_0 ! queue ! level name=dbmeter_in_rx_a_1" in desc
     assert "rx_split_rx_a.src_1 ! queue ! level name=dbmeter_in_rx_a_2" in desc
-    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! interaudiosink name=out_1 channel=spine_out_1 sync=false async=false" in desc
-    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! interaudiosink name=out_2 channel=spine_out_2 sync=false async=false" in desc
+    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_1" in desc
+    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_2" in desc
     assert "fakesink" not in desc
 
 
@@ -1828,6 +1828,7 @@ def test_spine_tx_path_attaches_branch_without_restarting_spine(monkeypatch) -> 
 def test_spine_rx_path_decodes_to_output_spine_bus(monkeypatch) -> None:
     spine_starts: list[str] = []
     spawn_calls: list[dict[str, Any]] = []
+    attach_calls: list[dict[str, Any]] = []
 
     from typing import Any as _Any
     Any = _Any  # noqa: F841
@@ -1837,6 +1838,7 @@ def test_spine_rx_path_decodes_to_output_spine_bus(monkeypatch) -> None:
             self.pipeline = 0
             self.srt_endpoints: list[tuple[str, int]] = []
             self.meter_lookup: dict[str, tuple[str, str, int]] = {}
+            self._next_handle = 0
             self.detached: list[str] = []
 
         def describe(self, *, include_output_tail: bool = True):
@@ -1844,6 +1846,25 @@ def test_spine_rx_path_decodes_to_output_spine_bus(monkeypatch) -> None:
 
         def stop(self) -> None:
             pass
+
+        def attach_branch_outputs_multi(self, mixer_names, exit_element_names, description):
+            self._next_handle += 1
+            handle = f"branch_{self._next_handle}"
+            attach_calls.append({
+                "mixer_names": list(mixer_names),
+                "exit_element_names": list(exit_element_names),
+                "description": description,
+                "handle": handle,
+            })
+            class _Branch:
+                pass
+            b = _Branch()
+            b.handle = handle
+            return b
+
+        def detach_branch(self, handle: str) -> bool:
+            self.detached.append(handle)
+            return True
 
     fake_spine = FakeSpine()
 
@@ -1907,10 +1928,9 @@ def test_spine_rx_path_decodes_to_output_spine_bus(monkeypatch) -> None:
 
         assert client.post("/api/srt-transports/rx-a/start", json={}).status_code == 200
         assert spine_starts == ["started"]
-        assert len(spawn_calls) == 1
-        assert spawn_calls[0]["srt_endpoints"] == [("rx-a", "srtstats_rx_rx_a")]
-        assert "srtsrc name=srtstats_rx_rx_a" in spawn_calls[0]["graph"]
-        assert "interaudiosink name=out_1 channel=spine_out_1" in spawn_calls[0]["graph"]
-        assert "fakesink" not in spawn_calls[0]["graph"]
+        assert len(attach_calls) == 1
+        assert "srtsrc name=srtstats_rx_rx_a" in attach_calls[0]["description"]
+        assert "queue name=out_1" in attach_calls[0]["description"]
+        assert "fakesink" not in attach_calls[0]["description"]
 
         assert client.post("/api/srt-transports/rx-a/stop").status_code == 200

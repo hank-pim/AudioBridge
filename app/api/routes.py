@@ -548,6 +548,17 @@ def create_api_router(
         if match is None:
             raise HTTPException(status_code=404, detail=f"audio interface '{name}' not found")
         channel_count = max(1, min(int(body.get("channel_count", match.get("channel_count") or 8)), 64))
+        
+        # Always sync the master spine device to the newly added device to ensure GStreamer starts up
+        store.update({
+            "audio": {
+                "interface_name": match["name"],
+                "interface_driver": normalize_config_driver(match.get("driver")),
+                "interface_device_id": match.get("device_id"),
+                "channel_count": channel_count,
+            }
+        })
+            
         added = store.add_audio_device(
             interface_name=match["name"],
             interface_driver=normalize_config_driver(match.get("driver")),

@@ -213,7 +213,7 @@ class CtypesGst:
         return self.request_pad(
             mixer,
             b"sink_%u",
-            b"audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+            None,
         )
 
     def bind_appsink(self) -> None:
@@ -810,25 +810,34 @@ class CtypesManagedPipeline:
             (branch.tap_name, branch.tee_element, branch.tee_src_pad, branch.branch_sink_pad)
         ]
         try:
-            # Push EOS into every ghost sink pad before the NULL transition.
-            # set_state(NULL) blocks until the branch has fully stopped, so
-            # sending EOS first lets srtsink (and any other socket-bound sink)
-            # flush its buffers and close cleanly inside the same blocking call.
-            # Unlinking before NULL would strand the sink without an end-of-
-            # stream marker and can hang the transition. gst_pad_send_event takes
-            # ownership of the event, so we allocate one per pad.
-            for _tap, _tee, _tee_src, ghost_pad in links:
-                if ghost_pad:
-                    eos_event = gst.gst_event_new_eos()
-                    if eos_event:
-                        gst.gst_pad_send_event(ghost_pad, eos_event)
-            gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
-            for _tap, _tee, tee_src, ghost_pad in links:
-                if tee_src and ghost_pad:
-                    if branch.link_direction == "branch_to_mixer":
+            # For RX branches (branch_to_mixer), we must unlink BEFORE setting
+            # the state to NULL, otherwise the shutting-down source elements
+            # inside the branch will send an EOS downstream into our master
+            # mixer, killing the entire spine playback chain.
+            if branch.link_direction == "branch_to_mixer":
+                for _tap, _tee, tee_src, ghost_pad in links:
+                    if tee_src and ghost_pad:
                         gst.gst_pad_unlink(ghost_pad, tee_src)
-                    else:
+
+            # For TX branches (tee_to_branch), we keep them linked and push an
+            # explicit EOS into every ghost sink pad before the NULL transition.
+            # set_state(NULL) blocks until the branch has fully stopped, so
+            # sending EOS first lets srtsink flush its buffers and close cleanly.
+            if branch.link_direction == "tee_to_branch":
+                for _tap, _tee, _tee_src, ghost_pad in links:
+                    if ghost_pad:
+                        eos_event = gst.gst_event_new_eos()
+                        if eos_event:
+                            gst.gst_pad_send_event(ghost_pad, eos_event)
+
+            gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
+
+            # TX branches wait to be unlinked until after they enter NULL state
+            if branch.link_direction == "tee_to_branch":
+                for _tap, _tee, tee_src, ghost_pad in links:
+                    if tee_src and ghost_pad:
                         gst.gst_pad_unlink(tee_src, ghost_pad)
+
             gst.gst_bin_remove(self.pipeline, branch.bin_element)
             for _tap, tee, tee_src, _ghost in links:
                 if tee_src:

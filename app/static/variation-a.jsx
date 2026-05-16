@@ -1517,26 +1517,19 @@ function ChannelStrip({ streamId, transportRunning, group, sources, inputMeters,
           placeholder={`Ch ${String(i).padStart(2, "0")}`}
           style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
         />
-        {isRx ? (
-          <span className="ab-mono"
-                title="RX channels currently route to a decode sink. Per-channel Dante output routing is pending backend support."
-                style={{ fontSize: 11, color: "var(--ab-fg-4)", height: 20, lineHeight: "20px", paddingLeft: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            → Dante Out {String(i).padStart(2, "0")}
-          </span>
-        ) : (
-          <select
-            className="ab-mono"
-            value={effectiveSource}
-            onChange={e => setSource(i, e.target.value)}
-            style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
-          >
-            {sourceGroups.map(([groupLabel, opts]) => (
-              <optgroup key={groupLabel} label={groupLabel}>
-                {opts.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
-              </optgroup>
-            ))}
-          </select>
-        )}
+        {/* RX or TX routing map */}
+        <select
+          className="ab-mono"
+          value={effectiveSource}
+          onChange={e => setSource(i, e.target.value)}
+          style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
+        >
+          {sourceGroups.map(([groupLabel, opts]) => (
+            <optgroup key={groupLabel} label={isRx ? groupLabel.replace("Input", "Output") : groupLabel}>
+              {opts.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
+            </optgroup>
+          ))}
+        </select>
         <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
           <Meter level={meter.rms_dbfs} peak={meter.peak_dbfs} w={null} />
         </div>

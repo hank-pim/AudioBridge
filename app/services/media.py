@@ -290,11 +290,7 @@ class MediaController:
             # when only RX is in use. Non-dante-input legs (e.g. diagnostic
             # tone TX) fall through to the legacy bundle path below.
             if self._spine_pipeline is None:
-                # Capture-only spine: full-duplex (capture + asiosink playback) is
-                # broken; the playback chain stalls the entire pipeline when added,
-                # taking TX down with it. Until the playback side is fixed in its
-                # own branch, TX path runs against capture-only spine.
-                self.start_tx_capture_spine(config)
+                self.start_spine(config)
             spine = self._spine_pipeline
             assert spine is not None
             builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
@@ -322,22 +318,25 @@ class MediaController:
                 self.start_spine(config)
             spine = self._spine_pipeline
             assert spine is not None
+            builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
             leg_plan = builder.plan_rx_leg_branch(config, transport_id, raise_on_error=True)
-            meter_lookup = {
-                endpoint["element_name"]: (
+            
+            branch = spine.attach_branch_outputs_multi(
+                mixer_names=leg_plan["mixer_names"],
+                exit_element_names=leg_plan["exit_element_names"],
+                description=leg_plan["branch_description"],
+            )
+            self._spine_rx_branches[transport_id] = branch.handle
+
+            self._register_spine_srt_endpoint(transport_id, leg_plan["srt_element_name"])
+            for endpoint in leg_plan["meter_endpoints"]:
+                spine.meter_lookup[endpoint["element_name"]] = (
                     endpoint["transport_id"], endpoint["direction"], endpoint["channel"],
                 )
-                for endpoint in leg_plan["meter_endpoints"]
-            }
-            pipeline = self._spawn_managed_tx_bundle(
-                name=f"srt_transport_{transport_id}_rx_spine_output",
-                graph=leg_plan["branch_description"],
-                srt_endpoints=[(transport_id, leg_plan["srt_element_name"])],
-                meter_lookup=meter_lookup,
-            )
+            pipeline = spine
             self._srt_transport_pipelines[transport_id] = pipeline
             runtime_note = (
-                "RX leg decodes into the always-on spine output bus; DVS stays open in the spine"
+                "RX leg decodes into the always-on spine output bus directly via audiomixer; DVS stays open in the spine"
             )
         elif transport.direction == SrtTransportDirection.tx:
             # Legacy bundle path: kept for non-dante TX legs (tones/silence in
@@ -670,12 +669,6 @@ class MediaController:
     def _rx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
         """RX spine legs require a configured playback device and an encode
         group whose decoded channels fit the DVS output channel count."""
-        # Disabled: spine RX legs feed interaudiosink into the spine playback
-        # chain (audiomixer → interleave → asiosink). That playback chain stalls
-        # the whole pipeline; until it's fixed we route RX through the legacy
-        # standalone leg path (srtsrc → opusdec → fakesink), matching the prior
-        # working state where SRT RX terminated at fakesink.
-        return False
         if config.audio.interface_driver not in {"asio", "wasapi", "coreaudio", "alsa"}:
             return False
         if not config.audio.interface_name:

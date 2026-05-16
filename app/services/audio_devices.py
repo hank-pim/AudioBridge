@@ -37,7 +37,30 @@ def discover_audio_interfaces(gst_launch_executable: str = "gst-launch-1.0") -> 
     devices = _discover_gstreamer_devices(gst_launch_executable)
     if not devices:
         devices = _discover_platform_devices()
-    return devices or [dict(device) for device in _FALLBACK_AUDIO_INTERFACES]
+        
+    if sys.platform == "win32":
+        # Strip {} from GStreamer device_ids so registry matches logic works
+        seen_ids = {str(d.get("device_id")).strip("{}").lower() for d in devices if d.get("device_id")}
+        for asio_dev in _discover_windows_asio_devices():
+            asio_id = str(asio_dev.get("device_id")).strip("{}").lower()
+            if asio_id not in seen_ids:
+                devices.append(asio_dev)
+                seen_ids.add(asio_id)
+                
+    merged = devices or [dict(device) for device in _FALLBACK_AUDIO_INTERFACES]
+    
+    unique_devices = {}
+    for d in merged:
+        key = (d.get("name"), d.get("driver"))
+        if key not in unique_devices:
+            unique_devices[key] = d
+        else:
+            # If we already have it but found another direction, mark it duplex
+            existing = unique_devices[key]
+            if existing.get("direction") != d.get("direction") and existing.get("direction") != "duplex":
+                existing["direction"] = "duplex"
+                
+    return list(unique_devices.values())
 
 
 def normalize_config_driver(driver: str | None) -> str:
@@ -288,3 +311,37 @@ def _stable_token(value: str) -> str:
 
 def platform_audio_driver() -> str:
     return _normalize_driver(platform.system())
+
+
+def _discover_windows_asio_devices() -> list[dict[str, Any]]:
+    import winreg
+    
+    devices: list[dict[str, Any]] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ASIO") as asio_key:
+            for i in range(1024):
+                try:
+                    sub_key_name = winreg.EnumKey(asio_key, i)
+                    with winreg.OpenKey(asio_key, sub_key_name) as sub_key:
+                        clsid, _ = winreg.QueryValueEx(sub_key, "CLSID")
+                        try:
+                            desc, _ = winreg.QueryValueEx(sub_key, "Description")
+                        except OSError:
+                            desc = sub_key_name
+                            
+                        devices.append({
+                            "id": f"asio:{_stable_token(clsid)}",
+                            "name": str(desc),
+                            "driver": "asio",
+                            "direction": "duplex",
+                            "sample_rate": 48000,
+                            "device_id": str(clsid),
+                            "source": "windows_registry",
+                        })
+                except OSError:
+                    break
+    except OSError:
+        pass
+        
+    return devices
+
