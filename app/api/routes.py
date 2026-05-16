@@ -671,6 +671,25 @@ def create_api_router(
     # Diagnostics
     # -----------------------------------------------------------------------
 
+    @router.post("/diagnostics/spine/start")
+    def spine_start() -> dict[str, Any]:
+        try:
+            result = media.start_spine(store.config)
+        except (RuntimeError, ValueError) as exc:
+            _raise_media_error(exc)
+        events.append("info", "diagnostics", "spine started")
+        return result
+
+    @router.post("/diagnostics/spine/stop")
+    def spine_stop() -> dict[str, str]:
+        media.stop_spine()
+        events.append("info", "diagnostics", "spine stopped")
+        return {"spine": "stopped"}
+
+    @router.get("/diagnostics/spine")
+    def spine_status() -> dict[str, Any]:
+        return media.describe_spine()
+
     @router.post("/diagnostics/tone")
     def tone_start(body: dict[str, Any]) -> dict[str, Any]:
         freq = float(body.get("frequency_hz", 1000))

@@ -2,6 +2,8 @@
 
 Prototype endpoint app for a point-to-point Dante WAN bridge. The current build is a runnable control-plane and operator UI skeleton based on `planv2.md`; the GStreamer/Dante media plane is represented by explicit controller boundaries, subprocess diagnostics, and truthful null telemetry for observations that are not wired yet.
 
+The current media architecture pivot is documented in `docs/jack-audio-engine-plan.md`: JACK owns Dante Virtual Soundcard's ASIO driver once, while the app manages dynamic stream workers and Dante-facing routes.
+
 ## What Exists
 
 - FastAPI service with REST and WebSocket APIs.

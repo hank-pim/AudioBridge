@@ -140,19 +140,81 @@ class CtypesGst:
         self.gst.gst_element_sync_state_with_parent.restype = ctypes.c_int
         self.gst.gst_pad_link.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.gst.gst_pad_link.restype = ctypes.c_int
+        self.gst.gst_pad_get_peer.argtypes = [ctypes.c_void_p]
+        self.gst.gst_pad_get_peer.restype = ctypes.c_void_p
+        self.gst.gst_pad_set_active.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.gst.gst_pad_set_active.restype = ctypes.c_int
+        self.gst.gst_element_link_pads_filtered.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p,
+        ]
+        self.gst.gst_element_link_pads_filtered.restype = ctypes.c_int
+        self.gst.gst_caps_from_string.argtypes = [ctypes.c_char_p]
+        self.gst.gst_caps_from_string.restype = ctypes.c_void_p
+        self.gst.gst_caps_to_string.argtypes = [ctypes.c_void_p]
+        self.gst.gst_caps_to_string.restype = ctypes.c_void_p
+        self.gst.gst_pad_query_caps.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.gst.gst_pad_query_caps.restype = ctypes.c_void_p
+        if hasattr(self.gst, "gst_caps_unref"):
+            self.gst.gst_caps_unref.argtypes = [ctypes.c_void_p]
+            self.gst.gst_caps_unref.restype = None
         self.gst.gst_pad_unlink.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.gst.gst_pad_unlink.restype = ctypes.c_int
+        # Used by detach_branch to flush a branch (notably srtsink) cleanly before
+        # the NULL state transition. Without the EOS push, srtsink can hang in
+        # PAUSED→NULL waiting on its own internal flush.
+        self.gst.gst_event_new_eos.argtypes = []
+        self.gst.gst_event_new_eos.restype = ctypes.c_void_p
+        self.gst.gst_pad_send_event.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.gst.gst_pad_send_event.restype = ctypes.c_int
+        # Used by attach_branch_multi to create predictable ghost sink pads on a
+        # parsed bin so multi-channel TX legs can be wired to multiple spine
+        # capture tees in one attach operation.
+        self.gst.gst_ghost_pad_new.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        self.gst.gst_ghost_pad_new.restype = ctypes.c_void_p
+        if hasattr(self.gst, "gst_ghost_pad_new_from_template"):
+            self.gst.gst_ghost_pad_new_from_template.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p]
+            self.gst.gst_ghost_pad_new_from_template.restype = ctypes.c_void_p
+        if hasattr(self.gst, "gst_pad_get_pad_template"):
+            self.gst.gst_pad_get_pad_template.argtypes = [ctypes.c_void_p]
+            self.gst.gst_pad_get_pad_template.restype = ctypes.c_void_p
+        self.gst.gst_element_add_pad.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.gst.gst_element_add_pad.restype = ctypes.c_int
         # request_pad_simple is GStreamer 1.20+; fall back to get_request_pad on older builds.
+        self.gst.gst_element_request_pad.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+        self.gst.gst_element_request_pad.restype = ctypes.c_void_p
+        self.gst.gst_element_get_pad_template.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self.gst.gst_element_get_pad_template.restype = ctypes.c_void_p
         if hasattr(self.gst, "gst_element_request_pad_simple"):
             self.gst.gst_element_request_pad_simple.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             self.gst.gst_element_request_pad_simple.restype = ctypes.c_void_p
         self.gst.gst_element_get_request_pad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         self.gst.gst_element_get_request_pad.restype = ctypes.c_void_p
 
-    def request_tee_src_pad(self, tee: int) -> int | None:
+    def request_pad(self, element: int, template: bytes, caps_string: bytes | None = None) -> int | None:
+        if caps_string:
+            pad_template = self.gst.gst_element_get_pad_template(element, template)
+            caps = self.gst.gst_caps_from_string(caps_string)
+            try:
+                if pad_template and caps:
+                    pad = self.gst.gst_element_request_pad(element, pad_template, None, caps)
+                    if pad:
+                        return pad
+            finally:
+                if caps and hasattr(self.gst, "gst_caps_unref"):
+                    self.gst.gst_caps_unref(caps)
         fn = getattr(self.gst, "gst_element_request_pad_simple", None) or self.gst.gst_element_get_request_pad
-        pad = fn(tee, b"src_%u")
+        pad = fn(element, template)
         return pad or None
+
+    def request_tee_src_pad(self, tee: int) -> int | None:
+        return self.request_pad(tee, b"src_%u")
+
+    def request_mixer_sink_pad(self, mixer: int) -> int | None:
+        return self.request_pad(
+            mixer,
+            b"sink_%u",
+            b"audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+        )
 
     def bind_appsink(self) -> None:
         if self.gstapp is None:
@@ -196,9 +258,29 @@ class CtypesGst:
         finally:
             self.glib.g_free(ptr)
 
+    def pad_caps_string(self, pad: int, filter_caps: int | None = None) -> str:
+        caps = self.gst.gst_pad_query_caps(pad, filter_caps or 0)
+        if not caps:
+            return "<no caps>"
+        try:
+            return self.string_and_free(self.gst.gst_caps_to_string(caps)) or "<caps unavailable>"
+        finally:
+            if hasattr(self.gst, "gst_caps_unref"):
+                self.gst.gst_caps_unref(caps)
+
 
 @dataclass
 class AttachedBranch:
+    """A bin attached to one or more tee taps in a running pipeline.
+
+    Single-tap branches (existing monitor-branch use case) populate the
+    ``tee_links`` list with a single entry. Multi-tap branches (multichannel TX
+    legs pulling from N spine capture tees) populate it with one entry per tap.
+    The scalar ``tap_name``/``tee_element``/``tee_src_pad``/``branch_sink_pad``
+    fields are kept as a convenience view of the first link so the existing
+    single-tap callers and tests do not need to be rewritten.
+    """
+
     handle: str
     tap_name: str
     description: str
@@ -206,27 +288,53 @@ class AttachedBranch:
     tee_element: int
     tee_src_pad: int
     branch_sink_pad: int
+    tee_links: list[tuple[str, int, int, int]] = field(default_factory=list)
+    link_direction: str = "tee_to_branch"
+    """List of (tap_name, tee_element, tee_src_pad, branch_sink_pad) for each
+    tee → ghost-pad connection in this branch."""
 
 
 @dataclass
 class CtypesManagedPipeline:
     name: str
     graph: str
-    transport_id: str
     telemetry: TelemetryService
     runtime: CtypesGst
     pipeline: int
-    srt_element: int | None
+    # Each entry is (transport_id, gst_element_ptr) for one srtsink/srtsrc inside
+    # the pipeline. Single-transport pipelines (RX, single-leg TX, diagnostic
+    # streams) have one entry. The endpoint TX bundle has one entry per enabled
+    # TX SRT transport so the poll thread can attribute stats per transport.
+    srt_endpoints: list[tuple[str, int]]
     bus: int | None
+    # Maps a meter element name (the GStreamer ``level`` element's name field)
+    # to (transport_id, direction, channel_index). Lets bus message handling
+    # attribute per-channel level activity to the right transport in a bundled
+    # pipeline. Single-transport pipelines may leave this empty; bus parsing
+    # falls back to the legacy channel-only path when a name is unknown.
+    meter_lookup: dict[str, tuple[str, str, int]] = field(default_factory=dict)
     output_tail: deque[str] = field(default_factory=lambda: deque(maxlen=120))
     started_at: float = field(default_factory=time.time)
     _stopped: bool = False
-    _last_bytes: int | None = None
-    _last_stats_at: float | None = None
+    _last_bytes: dict[str, int] = field(default_factory=dict)
+    _last_stats_at: dict[str, float] = field(default_factory=dict)
     _last_stats_tail_at: float | None = None
     _thread: threading.Thread | None = None
     _branches: dict[str, AttachedBranch] = field(default_factory=dict)
     _branch_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @property
+    def transport_id(self) -> str | None:
+        """First transport id; convenient for single-transport pipelines.
+
+        Returns None for empty bundles. Bundled TX pipelines should iterate
+        ``srt_endpoints`` instead of relying on this field.
+        """
+        return self.srt_endpoints[0][0] if self.srt_endpoints else None
+
+    @property
+    def transport_ids(self) -> list[str]:
+        return [tid for tid, _ in self.srt_endpoints]
 
     @classmethod
     def start(
@@ -239,25 +347,61 @@ class CtypesManagedPipeline:
         telemetry: TelemetryService,
         runtime: CtypesGst,
     ) -> "CtypesManagedPipeline":
+        return cls.start_bundle(
+            name=name,
+            graph=graph,
+            srt_endpoints=[(transport_id, srt_element_name)],
+            telemetry=telemetry,
+            runtime=runtime,
+        )
+
+    @classmethod
+    def start_bundle(
+        cls,
+        *,
+        name: str,
+        graph: str,
+        srt_endpoints: list[tuple[str, str]],
+        telemetry: TelemetryService,
+        runtime: CtypesGst,
+        meter_lookup: dict[str, tuple[str, str, int]] | None = None,
+    ) -> "CtypesManagedPipeline":
         error = ctypes.c_void_p()
         pipeline = runtime.gst.gst_parse_launch(graph.encode("utf-8"), ctypes.byref(error))
         if not pipeline:
             raise RuntimeError(f"failed to create GStreamer pipeline for {name}")
-        srt_element = runtime.gst.gst_bin_get_by_name(pipeline, srt_element_name.encode("utf-8"))
+        resolved_endpoints: list[tuple[str, int]] = []
+        for transport_id, element_name in srt_endpoints:
+            element_ptr = runtime.gst.gst_bin_get_by_name(pipeline, element_name.encode("utf-8"))
+            if not element_ptr:
+                # Unwind on failure: drop everything already taken, free the pipeline.
+                for _tid, ptr in resolved_endpoints:
+                    runtime.gobject.g_object_unref(ptr)
+                runtime.gst.gst_element_set_state(pipeline, GST_STATE_NULL)
+                runtime.gobject.g_object_unref(pipeline)
+                raise RuntimeError(
+                    f"{name} pipeline does not contain srt element '{element_name}' for transport '{transport_id}'"
+                )
+            resolved_endpoints.append((transport_id, element_ptr))
         bus = runtime.gst.gst_element_get_bus(pipeline)
         result = runtime.gst.gst_element_set_state(pipeline, GST_STATE_PLAYING)
         if result == 0:
             runtime.gst.gst_element_set_state(pipeline, GST_STATE_NULL)
+            for _tid, ptr in resolved_endpoints:
+                runtime.gobject.g_object_unref(ptr)
+            if bus:
+                runtime.gobject.g_object_unref(bus)
+            runtime.gobject.g_object_unref(pipeline)
             raise RuntimeError(f"{name} pipeline failed to enter PLAYING")
         managed = cls(
             name=name,
             graph=graph,
-            transport_id=transport_id,
             telemetry=telemetry,
             runtime=runtime,
             pipeline=pipeline,
-            srt_element=srt_element,
+            srt_endpoints=resolved_endpoints,
             bus=bus,
+            meter_lookup=dict(meter_lookup) if meter_lookup else {},
         )
         managed._thread = threading.Thread(target=managed._poll, name=f"{name}_gst_runtime", daemon=True)
         managed._thread.start()
@@ -293,9 +437,10 @@ class CtypesManagedPipeline:
         if self.bus:
             self.runtime.gobject.g_object_unref(self.bus)
             self.bus = None
-        if self.srt_element:
-            self.runtime.gobject.g_object_unref(self.srt_element)
-            self.srt_element = None
+        for _transport_id, element_ptr in self.srt_endpoints:
+            if element_ptr:
+                self.runtime.gobject.g_object_unref(element_ptr)
+        self.srt_endpoints = []
         if self.pipeline:
             self.runtime.gobject.g_object_unref(self.pipeline)
             self.pipeline = 0
@@ -350,6 +495,7 @@ class CtypesManagedPipeline:
                 tee_element=tee,
                 tee_src_pad=tee_src_pad,
                 branch_sink_pad=branch_sink_pad,
+                tee_links=[(tap_name, tee, tee_src_pad, branch_sink_pad)],
             )
             with self._branch_lock:
                 self._branches[handle] = branch
@@ -365,6 +511,278 @@ class CtypesManagedPipeline:
             elif bin_element:
                 gobject.g_object_unref(bin_element)
             gobject.g_object_unref(tee)
+            raise
+
+    def attach_branch_multi(
+        self,
+        *,
+        tap_names: list[str],
+        entry_element_names: list[str],
+        description: str,
+    ) -> AttachedBranch:
+        """Attach a bin to N tees in one operation.
+
+        ``tap_names`` and ``entry_element_names`` are parallel lists. For each
+        position K, the spine tee named ``tap_names[K]`` is linked to a ghost
+        sink pad on the new bin that proxies the sink pad of the bin-internal
+        element named ``entry_element_names[K]`` (typically a ``queue`` placed at
+        the head of the per-channel chain in the branch description).
+
+        The description must NOT use ``gst_parse_bin_from_description``'s auto-
+        ghosting; this method creates explicit, deterministically-named ghost
+        pads (``sink_0``, ``sink_1``, ...) so callers do not have to discover
+        them. The description may have any internal topology after the named
+        entry elements — common shape is per-channel ``audioconvert/level``
+        legs feeding a single ``interleave`` followed by encode + transport.
+        """
+        if self._stopped:
+            raise RuntimeError("pipeline is stopped")
+        if len(tap_names) != len(entry_element_names):
+            raise ValueError("tap_names and entry_element_names must be parallel lists")
+        if not tap_names:
+            raise ValueError("attach_branch_multi requires at least one tap")
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+
+        # Resolve all tees up front. Failing fast here means we have nothing to
+        # unwind beyond a few unrefs.
+        tees: list[tuple[str, int]] = []
+        try:
+            for tap_name in tap_names:
+                tee = gst.gst_bin_get_by_name(self.pipeline, tap_name.encode("utf-8"))
+                if not tee:
+                    raise RuntimeError(f"tap '{tap_name}' not found in pipeline '{self.name}'")
+                tees.append((tap_name, tee))
+        except Exception:
+            for _name, ptr in tees:
+                gobject.g_object_unref(ptr)
+            raise
+
+        bin_element = 0
+        added_to_pipeline = False
+        created_ghosts: list[int] = []
+        link_records: list[tuple[str, int, int, int]] = []
+        try:
+            error = ctypes.c_void_p()
+            # ghost_unlinked_pads=0: we create our own ghost pads with predictable
+            # names instead of relying on the parser to auto-ghost.
+            bin_element = gst.gst_parse_bin_from_description(
+                description.encode("utf-8"), 0, ctypes.byref(error)
+            )
+            if not bin_element:
+                raise RuntimeError(f"failed to parse branch description: {description!r}")
+
+            # For each entry element, fetch its static sink pad, wrap in a ghost
+            # pad with a predictable name, and add the ghost to the bin. The
+            # ghost pad takes a ref on the internal target pad, so we drop ours
+            # immediately after add_pad.
+            for index, entry_name in enumerate(entry_element_names):
+                entry_element = gst.gst_bin_get_by_name(bin_element, entry_name.encode("utf-8"))
+                if not entry_element:
+                    raise RuntimeError(
+                        f"branch description has no entry element named '{entry_name}'"
+                    )
+                entry_sink_pad = 0
+                try:
+                    entry_sink_pad = gst.gst_element_get_static_pad(entry_element, b"sink")
+                    if not entry_sink_pad:
+                        raise RuntimeError(
+                            f"entry element '{entry_name}' has no static sink pad"
+                        )
+                    ghost_name = f"sink_{index}".encode("ascii")
+                    ghost = gst.gst_ghost_pad_new(ghost_name, entry_sink_pad)
+                    if not ghost:
+                        raise RuntimeError(f"gst_ghost_pad_new failed for '{entry_name}'")
+                    if not gst.gst_element_add_pad(bin_element, ghost):
+                        gobject.g_object_unref(ghost)
+                        raise RuntimeError(f"gst_element_add_pad rejected ghost for '{entry_name}'")
+                    created_ghosts.append(ghost)
+                finally:
+                    if entry_sink_pad:
+                        gobject.g_object_unref(entry_sink_pad)
+                    gobject.g_object_unref(entry_element)
+
+            if not gst.gst_bin_add(self.pipeline, bin_element):
+                raise RuntimeError("gst_bin_add rejected the branch bin")
+            added_to_pipeline = True
+
+            # Link each tee to its ghost pad. Failure unwinds via the outer
+            # except by releasing all request pads recorded so far.
+            for (tap_name, tee), ghost in zip(tees, created_ghosts):
+                tee_src_pad = self.runtime.request_tee_src_pad(tee) or 0
+                if not tee_src_pad:
+                    raise RuntimeError(f"tap '{tap_name}' refused a request src pad")
+                link_result = gst.gst_pad_link(tee_src_pad, ghost)
+                if link_result != 0:
+                    gst.gst_element_release_request_pad(tee, tee_src_pad)
+                    gobject.g_object_unref(tee_src_pad)
+                    raise RuntimeError(
+                        f"gst_pad_link failed (code {link_result}) for tap '{tap_name}'"
+                    )
+                link_records.append((tap_name, tee, tee_src_pad, ghost))
+
+            if not gst.gst_element_sync_state_with_parent(bin_element):
+                raise RuntimeError("branch failed to sync state with parent")
+
+            handle = uuid.uuid4().hex
+            first_tap, first_tee, first_tee_src, first_ghost = link_records[0]
+            branch = AttachedBranch(
+                handle=handle,
+                tap_name=first_tap,
+                description=description,
+                bin_element=bin_element,
+                tee_element=first_tee,
+                tee_src_pad=first_tee_src,
+                branch_sink_pad=first_ghost,
+                tee_links=list(link_records),
+            )
+            with self._branch_lock:
+                self._branches[handle] = branch
+            return branch
+        except Exception:
+            for tap_name, tee, tee_src_pad, _ghost in link_records:
+                if tee_src_pad:
+                    gst.gst_element_release_request_pad(tee, tee_src_pad)
+                    gobject.g_object_unref(tee_src_pad)
+            if added_to_pipeline and bin_element:
+                gst.gst_bin_remove(self.pipeline, bin_element)
+            elif bin_element:
+                gobject.g_object_unref(bin_element)
+            for _tap_name, tee in tees:
+                gobject.g_object_unref(tee)
+            raise
+
+    def attach_branch_outputs_multi(
+        self,
+        *,
+        mixer_names: list[str],
+        exit_element_names: list[str],
+        description: str,
+    ) -> AttachedBranch:
+        """Attach a bin's N source pads to N spine audiomixers."""
+        if self._stopped:
+            raise RuntimeError("pipeline is stopped")
+        if len(mixer_names) != len(exit_element_names):
+            raise ValueError("mixer_names and exit_element_names must be parallel lists")
+        if not mixer_names:
+            raise ValueError("attach_branch_outputs_multi requires at least one mixer")
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+
+        mixers: list[tuple[str, int]] = []
+        try:
+            for mixer_name in mixer_names:
+                mixer = gst.gst_bin_get_by_name(self.pipeline, mixer_name.encode("utf-8"))
+                if not mixer:
+                    raise RuntimeError(f"mixer '{mixer_name}' not found in pipeline '{self.name}'")
+                mixers.append((mixer_name, mixer))
+        except Exception:
+            for _name, ptr in mixers:
+                gobject.g_object_unref(ptr)
+            raise
+
+        bin_element = 0
+        added_to_pipeline = False
+        created_ghosts: list[int] = []
+        link_records: list[tuple[str, int, int, int]] = []
+        try:
+            error = ctypes.c_void_p()
+            bin_element = gst.gst_parse_bin_from_description(
+                description.encode("utf-8"), 0, ctypes.byref(error)
+            )
+            if not bin_element:
+                raise RuntimeError(f"failed to parse branch description: {description!r}")
+
+            for index, exit_name in enumerate(exit_element_names):
+                exit_element = gst.gst_bin_get_by_name(bin_element, exit_name.encode("utf-8"))
+                if not exit_element:
+                    raise RuntimeError(f"branch description has no exit element named '{exit_name}'")
+                exit_src_pad = 0
+                try:
+                    exit_src_pad = gst.gst_element_get_static_pad(exit_element, b"src")
+                    if not exit_src_pad:
+                        raise RuntimeError(f"exit element '{exit_name}' has no static src pad")
+                    ghost_name = f"src_{index}".encode("ascii")
+                    template = (
+                        gst.gst_pad_get_pad_template(exit_src_pad)
+                        if hasattr(gst, "gst_pad_get_pad_template")
+                        else 0
+                    )
+                    new_from_template = getattr(gst, "gst_ghost_pad_new_from_template", None)
+                    ghost = (
+                        new_from_template(ghost_name, exit_src_pad, template)
+                        if new_from_template and template
+                        else gst.gst_ghost_pad_new(ghost_name, exit_src_pad)
+                    )
+                    if not ghost:
+                        raise RuntimeError(f"gst_ghost_pad_new failed for '{exit_name}'")
+                    if not gst.gst_pad_set_active(ghost, 1):
+                        gobject.g_object_unref(ghost)
+                        raise RuntimeError(f"gst_pad_set_active failed for ghost '{exit_name}'")
+                    if not gst.gst_element_add_pad(bin_element, ghost):
+                        gobject.g_object_unref(ghost)
+                        raise RuntimeError(f"gst_element_add_pad rejected ghost for '{exit_name}'")
+                    created_ghosts.append(ghost)
+                finally:
+                    if exit_src_pad:
+                        gobject.g_object_unref(exit_src_pad)
+                    gobject.g_object_unref(exit_element)
+
+            if not gst.gst_bin_add(self.pipeline, bin_element):
+                raise RuntimeError("gst_bin_add rejected the branch bin")
+            added_to_pipeline = True
+
+            for index, ((mixer_name, mixer), ghost) in enumerate(zip(mixers, created_ghosts)):
+                mixer_sink_pad = self.runtime.request_mixer_sink_pad(mixer) or 0
+                if not mixer_sink_pad:
+                    raise RuntimeError(f"mixer '{mixer_name}' refused a request sink pad")
+                if not gst.gst_pad_set_active(mixer_sink_pad, 1):
+                    gst.gst_element_release_request_pad(mixer, mixer_sink_pad)
+                    gobject.g_object_unref(mixer_sink_pad)
+                    raise RuntimeError(f"gst_pad_set_active failed for mixer '{mixer_name}' sink pad")
+                pad_name = self.runtime.string_and_free(gst.gst_object_get_name(mixer_sink_pad))
+                link_result = gst.gst_pad_link(ghost, mixer_sink_pad)
+                if link_result != 0:
+                    src_caps = self.runtime.pad_caps_string(ghost)
+                    sink_caps = self.runtime.pad_caps_string(mixer_sink_pad)
+                    gst.gst_element_release_request_pad(mixer, mixer_sink_pad)
+                    gobject.g_object_unref(mixer_sink_pad)
+                    raise RuntimeError(
+                        f"gst_pad_link failed (code {link_result}) for mixer '{mixer_name}' pad '{pad_name}' "
+                        f"(src caps: {src_caps}; sink caps: {sink_caps})"
+                    )
+                link_records.append((mixer_name, mixer, mixer_sink_pad, ghost))
+
+            if not gst.gst_element_sync_state_with_parent(bin_element):
+                raise RuntimeError("branch failed to sync state with parent")
+
+            handle = uuid.uuid4().hex
+            first_mixer, first_mixer_element, first_mixer_sink, first_ghost = link_records[0]
+            branch = AttachedBranch(
+                handle=handle,
+                tap_name=first_mixer,
+                description=description,
+                bin_element=bin_element,
+                tee_element=first_mixer_element,
+                tee_src_pad=first_mixer_sink,
+                branch_sink_pad=first_ghost,
+                tee_links=list(link_records),
+                link_direction="branch_to_mixer",
+            )
+            with self._branch_lock:
+                self._branches[handle] = branch
+            return branch
+        except Exception:
+            for _mixer_name, mixer, mixer_sink_pad, _ghost in link_records:
+                if mixer_sink_pad:
+                    gst.gst_element_release_request_pad(mixer, mixer_sink_pad)
+                    gobject.g_object_unref(mixer_sink_pad)
+            if added_to_pipeline and bin_element:
+                gst.gst_bin_remove(self.pipeline, bin_element)
+            elif bin_element:
+                gobject.g_object_unref(bin_element)
+            for _mixer_name, mixer in mixers:
+                gobject.g_object_unref(mixer)
             raise
 
     def detach_branch(self, handle: str) -> bool:
@@ -385,18 +803,45 @@ class CtypesManagedPipeline:
     def _teardown_branch_locked(self, branch: AttachedBranch) -> None:
         gst = self.runtime.gst
         gobject = self.runtime.gobject
+        # Use the link records when available so multi-tap branches release every
+        # tee request pad. Older single-tap callers populate tee_links with one
+        # entry; the unified loop handles both.
+        links = branch.tee_links or [
+            (branch.tap_name, branch.tee_element, branch.tee_src_pad, branch.branch_sink_pad)
+        ]
         try:
-            gst.gst_pad_unlink(branch.tee_src_pad, branch.branch_sink_pad)
+            # Push EOS into every ghost sink pad before the NULL transition.
+            # set_state(NULL) blocks until the branch has fully stopped, so
+            # sending EOS first lets srtsink (and any other socket-bound sink)
+            # flush its buffers and close cleanly inside the same blocking call.
+            # Unlinking before NULL would strand the sink without an end-of-
+            # stream marker and can hang the transition. gst_pad_send_event takes
+            # ownership of the event, so we allocate one per pad.
+            for _tap, _tee, _tee_src, ghost_pad in links:
+                if ghost_pad:
+                    eos_event = gst.gst_event_new_eos()
+                    if eos_event:
+                        gst.gst_pad_send_event(ghost_pad, eos_event)
             gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
+            for _tap, _tee, tee_src, ghost_pad in links:
+                if tee_src and ghost_pad:
+                    if branch.link_direction == "branch_to_mixer":
+                        gst.gst_pad_unlink(ghost_pad, tee_src)
+                    else:
+                        gst.gst_pad_unlink(tee_src, ghost_pad)
             gst.gst_bin_remove(self.pipeline, branch.bin_element)
-            gst.gst_element_release_request_pad(branch.tee_element, branch.tee_src_pad)
+            for _tap, tee, tee_src, _ghost in links:
+                if tee_src:
+                    gst.gst_element_release_request_pad(tee, tee_src)
         finally:
-            if branch.tee_src_pad:
-                gobject.g_object_unref(branch.tee_src_pad)
-            if branch.branch_sink_pad:
-                gobject.g_object_unref(branch.branch_sink_pad)
-            if branch.tee_element:
-                gobject.g_object_unref(branch.tee_element)
+            for _tap, tee, tee_src, ghost_pad in links:
+                if tee_src:
+                    gobject.g_object_unref(tee_src)
+                # Ghost pads were added to the branch bin, so the bin owns their
+                # lifetime. We keep borrowed pointers only long enough to unlink
+                # before removing the bin.
+                if tee:
+                    gobject.g_object_unref(tee)
 
     def _poll(self) -> None:
         while not self._stopped:
@@ -433,76 +878,101 @@ class CtypesManagedPipeline:
             self.runtime.gst.gst_mini_object_unref(message)
 
     def _poll_srt_stats(self) -> None:
-        if not self.srt_element:
-            return
-        stats = ctypes.c_void_p()
-        self.runtime.gobject.g_object_get(self.srt_element, b"stats", ctypes.byref(stats), None)
-        if not stats.value:
-            return
-        text = self.runtime.string_and_free(self.runtime.gst.gst_structure_to_string(stats))
-        if not text:
+        if not self.srt_endpoints:
             return
         now = time.time()
-        if self._last_stats_tail_at is None or now - self._last_stats_tail_at >= 1.0:
-            self.output_tail.append(f"srtstats: {text}")
+        emit_tail = self._last_stats_tail_at is None or now - self._last_stats_tail_at >= 1.0
+        for transport_id, element_ptr in self.srt_endpoints:
+            if not element_ptr:
+                continue
+            stats = ctypes.c_void_p()
+            self.runtime.gobject.g_object_get(element_ptr, b"stats", ctypes.byref(stats), None)
+            if not stats.value:
+                continue
+            text = self.runtime.string_and_free(self.runtime.gst.gst_structure_to_string(stats))
+            if not text:
+                continue
+            if emit_tail:
+                self.output_tail.append(f"srtstats[{transport_id}]: {text}")
+            fields = _parse_stats(text)
+            # Bitrate from byte-counter deltas — see notes on the single-pipeline
+            # case before; here we keep a counter per transport_id so multi-leg
+            # bundles compute deltas independently for each srtsink.
+            bytes_total = _first_int(
+                fields,
+                "bytes-received-total", "bytes-sent-total",
+                "pkti-recv-bytes", "pkti-send-bytes",
+            )
+            bitrate_kbps: float | None = None
+            previous_bytes = self._last_bytes.get(transport_id)
+            previous_at = self._last_stats_at.get(transport_id)
+            if bytes_total is not None and previous_bytes is not None and previous_at is not None:
+                elapsed = max(now - previous_at, 0.001)
+                bitrate_kbps = max((bytes_total - previous_bytes) * 8 / elapsed / 1000, 0)
+            if bitrate_kbps is None:
+                send_rate = _mbps_to_kbps(_first_float(fields, "send-rate-mbps"))
+                recv_rate = _mbps_to_kbps(_first_float(fields, "receive-rate-mbps", "recv-rate-mbps"))
+                bitrate_kbps = recv_rate if (recv_rate and recv_rate > 0) else send_rate
+            if bytes_total is not None:
+                self._last_bytes[transport_id] = bytes_total
+                self._last_stats_at[transport_id] = now
+            packets_sent = _first_int(fields, "packets-sent", "packets-received")
+            packets_lost = _first_int(
+                fields,
+                "packets-sent-lost", "packets-received-lost",
+                "pkti-send-loss", "pkti-recv-loss",
+                "packets-lost", "pkt-snd-loss-total", "pkt-rcv-loss-total",
+            )
+            self.telemetry.observe_srt_transport(
+                transport_id,
+                bitrate_kbps=bitrate_kbps,
+                send_bitrate_kbps=bitrate_kbps,
+                rtt_ms=_first_float(fields, "pkti-link-rtt-ms", "ms-rtt", "rtt-ms", "rtt"),
+                rtt_variance_ms=_first_float(fields, "pkti-link-jitter-ms", "rtt-variance-ms"),
+                packets_lost=packets_lost,
+                packet_loss_percent=_loss_percent(packets_lost, packets_sent),
+                packets_retransmitted=_first_int(fields, "packets-retransmitted", "packets-received-retransmitted", "pkti-send-retrans", "pkti-recv-retrans", "pkt-retrans-total"),
+                raw_stats=text,
+            )
+        if emit_tail:
             self._last_stats_tail_at = now
-        fields = _parse_stats(text)
-        # Compute bitrate from byte-counter deltas so the value is instantaneous.
-        # SRT's own send-rate-mbps / receive-rate-mbps are trailing averages maintained
-        # inside libsrt since stat reset, so they slowly ramp up over the first minute
-        # of a fresh stream — fine for an averaged headline value, wrong for a
-        # 1Hz sparkline. Fall back to the SRT-reported rate only if no byte counter
-        # is exposed yet (e.g. first poll after start).
-        bytes_total = _first_int(
-            fields,
-            "bytes-received-total", "bytes-sent-total",
-            "pkti-recv-bytes", "pkti-send-bytes",
-        )
-        bitrate_kbps: float | None = None
-        if bytes_total is not None and self._last_bytes is not None and self._last_stats_at is not None:
-            elapsed = max(now - self._last_stats_at, 0.001)
-            bitrate_kbps = max((bytes_total - self._last_bytes) * 8 / elapsed / 1000, 0)
-        if bitrate_kbps is None:
-            send_rate = _mbps_to_kbps(_first_float(fields, "send-rate-mbps"))
-            recv_rate = _mbps_to_kbps(_first_float(fields, "receive-rate-mbps", "recv-rate-mbps"))
-            bitrate_kbps = recv_rate if (recv_rate and recv_rate > 0) else send_rate
-        if bytes_total is not None:
-            self._last_bytes = bytes_total
-            self._last_stats_at = now
-        packets_sent = _first_int(fields, "packets-sent", "packets-received")
-        packets_lost = _first_int(
-            fields,
-            "packets-sent-lost", "packets-received-lost",
-            "pkti-send-loss", "pkti-recv-loss",
-            "packets-lost", "pkt-snd-loss-total", "pkt-rcv-loss-total",
-        )
-        self.telemetry.observe_srt_transport(
-            self.transport_id,
-            bitrate_kbps=bitrate_kbps,
-            send_bitrate_kbps=bitrate_kbps,
-            rtt_ms=_first_float(fields, "pkti-link-rtt-ms", "ms-rtt", "rtt-ms", "rtt"),
-            rtt_variance_ms=_first_float(fields, "pkti-link-jitter-ms", "rtt-variance-ms"),
-            packets_lost=packets_lost,
-            packet_loss_percent=_loss_percent(packets_lost, packets_sent),
-            packets_retransmitted=_first_int(fields, "packets-retransmitted", "packets-received-retransmitted", "pkti-send-retrans", "pkti-recv-retrans", "pkt-retrans-total"),
-            raw_stats=text,
-        )
 
     def _observe_level(self, source_name: str | None, text: str) -> None:
         if not source_name or not source_name.startswith(("dbmeter_out_", "dbmeter_in_")):
             return
-        channel_text = source_name.rsplit("_", 1)[-1]
-        if not channel_text.isdigit():
-            return
         match = _LEVEL_MESSAGE_RE.search(text)
         if match is None:
             return
-        observer = self.telemetry.observe_input_meter if source_name.startswith("dbmeter_in_") else self.telemetry.observe_output_meter
-        observer(
-            int(channel_text),
-            peak_dbfs=_first_level_value(match.group("peak")),
-            rms_dbfs=_first_level_value(match.group("rms")),
-        )
+        peak = _first_level_value(match.group("peak"))
+        rms = _first_level_value(match.group("rms"))
+
+        # Prefer the explicit lookup populated at bundle construction. Falls back
+        # to legacy "trailing-integer is the channel" parsing for pipelines that
+        # don't supply one (RX, single-transport TX, diagnostic monitors).
+        lookup_hit = self.meter_lookup.get(source_name)
+        if lookup_hit is not None:
+            transport_id, direction, channel = lookup_hit
+            if direction == "in":
+                self.telemetry.observe_input_meter(channel, peak_dbfs=peak, rms_dbfs=rms, transport_id=transport_id)
+            else:
+                self.telemetry.observe_output_meter(channel, peak_dbfs=peak, rms_dbfs=rms, transport_id=transport_id)
+            return
+
+        channel_text = source_name.rsplit("_", 1)[-1]
+        if not channel_text.isdigit():
+            return
+        # No transport attribution available — for single-transport pipelines we
+        # still know who owns the pipeline, so attribute the meter to the first
+        # (and only) transport id when present.
+        fallback_transport = self.srt_endpoints[0][0] if self.srt_endpoints else None
+        if source_name.startswith("dbmeter_in_"):
+            self.telemetry.observe_input_meter(
+                int(channel_text), peak_dbfs=peak, rms_dbfs=rms, transport_id=fallback_transport
+            )
+        else:
+            self.telemetry.observe_output_meter(
+                int(channel_text), peak_dbfs=peak, rms_dbfs=rms, transport_id=fallback_transport
+            )
 
     def _observe_clock(self, source_name: str | None, text: str) -> None:
         if text.startswith("GstMessageNewClock"):

@@ -67,7 +67,30 @@ class MediaController:
     _tone_pipeline: ManagedPipeline | None = None
     _monitor_pipeline: ManagedPipeline | None = None
     _program_pipeline: ManagedPipeline | None = None
+    # ``_srt_transport_pipelines`` is the API-facing lookup keyed by transport id.
+    # RX transports map to their own per-transport pipeline. TX transports all map
+    # to the same shared ``_tx_bundle`` pipeline (multiple keys → same object) so
+    # ASIO/DVS is opened exactly once. ``_tx_bundle_transport_ids`` tracks which
+    # transports are currently members of the bundle so we know when to rebuild
+    # vs stop it. See docs/single-pipeline-tx-plan.md.
     _srt_transport_pipelines: dict[str, Any] = field(default_factory=dict)
+    _tx_bundle: Any | None = None
+    _tx_bundle_transport_ids: set[str] = field(default_factory=set)
+    # Transport-id -> branch handle for TX legs attached to the always-on spine.
+    # When this map is non-empty the spine TX path is in use; the legacy
+    # _tx_bundle path stays around for tests and for any caller that explicitly
+    # chooses the bundle. The spine path is preferred when audio.interface_driver
+    # is supported (it avoids the rebuild-glitch problem entirely).
+    _spine_tx_branches: dict[str, str] = field(default_factory=dict)
+    _spine_rx_branches: dict[str, str] = field(default_factory=dict)
+    # Most recent EndpointConfig observed during a TX start. ``stop_srt_transport``
+    # uses it to rebuild the bundle without re-plumbing config through callers.
+    _latest_tx_config: EndpointConfig | None = None
+    # The always-on full-duplex spine that owns DVS. Built lazily on the first
+    # spine/TX/RX start in the new dynamic-pipeline architecture; TX and RX legs
+    # will attach to its per-channel tee and audiomixer elements without ever
+    # restarting the spine itself. See plan_spine() in media_graph.py.
+    _spine_pipeline: Any | None = None
     _gst_runtime: CtypesGst | None = None
 
     def __post_init__(self) -> None:
@@ -209,6 +232,22 @@ class MediaController:
         self.stop_program()
         self.stop_monitor()
         self.stop_tone()
+        # Detach any spine TX branches before tearing the spine down, so each
+        # leg's srtsink sees its EOS and closes its socket cleanly.
+        for transport_id in list(self._spine_tx_branches):
+            self.stop_srt_transport(transport_id)
+        for transport_id in list(self._spine_rx_branches):
+            self.stop_srt_transport(transport_id)
+        self.stop_spine()
+        # Drop the bundle in one shot rather than thrashing through rebuilds as
+        # each TX leg is removed individually.
+        if self._tx_bundle is not None:
+            self._stop_pipeline(self._tx_bundle)
+            self._tx_bundle = None
+            for member_id in list(self._tx_bundle_transport_ids):
+                self._srt_transport_pipelines.pop(member_id, None)
+                self.telemetry.mark_srt_transport(member_id, False)
+            self._tx_bundle_transport_ids = set()
         for transport_id in list(self._srt_transport_pipelines):
             self.stop_srt_transport(transport_id)
 
@@ -229,20 +268,98 @@ class MediaController:
         port = transport.port or config.network.srt_port
         latency_ms = transport.latency_ms or config.program.srt_latency_ms
         self._validate_srt_endpoint(mode=transport.mode.value, host=transport.host)
-        graph_plan = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable).plan_srt_transport(
-            config,
-            transport_id,
-            raise_on_error=True,
-        )
-        pipeline = self._spawn_managed_gst_pipeline(
-            name=f"srt_transport_{transport_id}_{transport.direction.value}",
-            graph=graph_plan["gstreamer"]["graph"],
-            srt_element_name=graph_plan["gstreamer"]["srt_element_name"],
-            transport_id=transport_id,
-        )
-        kind = "receiver" if transport.direction == SrtTransportDirection.rx else "sender"
 
-        self._srt_transport_pipelines[transport_id] = pipeline
+        builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
+        graph_plan = builder.plan_srt_transport(config, transport_id, raise_on_error=True)
+        kind = "receiver" if transport.direction == SrtTransportDirection.rx else "sender"
+        runtime_note: str
+
+        spine_tx_eligible = (
+            transport.direction == SrtTransportDirection.tx
+            and self._tx_leg_eligible_for_spine(config, transport)
+        )
+        spine_rx_eligible = (
+            transport.direction == SrtTransportDirection.rx
+            and self._rx_leg_eligible_for_spine(config, transport)
+        )
+        if spine_tx_eligible:
+            # Spine TX path: build the per-transport branch and attach it to the
+            # always-on spine. The spine owns DVS, so attaching/detaching a TX
+            # leg never restarts capture and never glitches other legs. The
+            # spine is started lazily on first TX so existing flows still work
+            # when only RX is in use. Non-dante-input legs (e.g. diagnostic
+            # tone TX) fall through to the legacy bundle path below.
+            if self._spine_pipeline is None:
+                # Capture-only spine: full-duplex (capture + asiosink playback) is
+                # broken; the playback chain stalls the entire pipeline when added,
+                # taking TX down with it. Until the playback side is fixed in its
+                # own branch, TX path runs against capture-only spine.
+                self.start_tx_capture_spine(config)
+            spine = self._spine_pipeline
+            assert spine is not None
+            builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
+            leg_plan = builder.plan_tx_leg_branch(config, transport_id, raise_on_error=True)
+            branch = spine.attach_branch_multi(
+                tap_names=leg_plan["tap_names"],
+                entry_element_names=leg_plan["entry_element_names"],
+                description=leg_plan["branch_description"],
+            )
+            self._spine_tx_branches[transport_id] = branch.handle
+            # Telemetry attribution: register this transport's SRT element so
+            # the poll loop can read srtsink stats per leg out of the spine.
+            self._register_spine_srt_endpoint(transport_id, leg_plan["srt_element_name"])
+            for endpoint in leg_plan["meter_endpoints"]:
+                spine.meter_lookup[endpoint["element_name"]] = (
+                    endpoint["transport_id"], endpoint["direction"], endpoint["channel"],
+                )
+            pipeline = spine
+            self._srt_transport_pipelines[transport_id] = pipeline
+            runtime_note = (
+                "TX leg attached to the always-on spine; no DVS reopen, no glitch on other legs"
+            )
+        elif spine_rx_eligible:
+            if self._spine_pipeline is None:
+                self.start_spine(config)
+            spine = self._spine_pipeline
+            assert spine is not None
+            leg_plan = builder.plan_rx_leg_branch(config, transport_id, raise_on_error=True)
+            meter_lookup = {
+                endpoint["element_name"]: (
+                    endpoint["transport_id"], endpoint["direction"], endpoint["channel"],
+                )
+                for endpoint in leg_plan["meter_endpoints"]
+            }
+            pipeline = self._spawn_managed_tx_bundle(
+                name=f"srt_transport_{transport_id}_rx_spine_output",
+                graph=leg_plan["branch_description"],
+                srt_endpoints=[(transport_id, leg_plan["srt_element_name"])],
+                meter_lookup=meter_lookup,
+            )
+            self._srt_transport_pipelines[transport_id] = pipeline
+            runtime_note = (
+                "RX leg decodes into the always-on spine output bus; DVS stays open in the spine"
+            )
+        elif transport.direction == SrtTransportDirection.tx:
+            # Legacy bundle path: kept for non-dante TX legs (tones/silence in
+            # diagnostics) and for environments where audio isn't configured.
+            new_members = self._tx_bundle_transport_ids | {transport_id}
+            pipeline = self._restart_tx_bundle(config, new_members)
+            for member_id in new_members:
+                self._srt_transport_pipelines[member_id] = pipeline
+            self._tx_bundle_transport_ids = new_members
+            runtime_note = (
+                "TX graph runs inside the legacy endpoint bundle (non-dante sources); the spine path was skipped"
+            )
+        else:
+            pipeline = self._spawn_managed_gst_pipeline(
+                name=f"srt_transport_{transport_id}_{transport.direction.value}",
+                graph=graph_plan["gstreamer"]["graph"],
+                srt_element_name=graph_plan["gstreamer"]["srt_element_name"],
+                transport_id=transport_id,
+            )
+            self._srt_transport_pipelines[transport_id] = pipeline
+            runtime_note = "RX graph planned from SRT ingress with a named monitor tap"
+
         self.telemetry.mark_srt_transport(transport_id, True)
         return {
             "id": transport.id,
@@ -254,18 +371,136 @@ class MediaController:
             "latency_ms": latency_ms,
             "encode_group_ids": transport.encode_group_ids,
             "kind": kind,
-            "runtime_note": (
-                "RX graph planned from SRT ingress with a named monitor tap" if kind == "receiver"
-                else "TX graph planned from configured sources, encode groups, and SRT transport"
-            ),
+            "runtime_note": runtime_note,
             "graph_plan": graph_plan,
             "process": pipeline.describe(),
         }
 
     def stop_srt_transport(self, transport_id: str) -> None:
+        # Spine TX path: detach the branch from the running spine without
+        # touching DVS or any other TX leg.
+        if transport_id in self._spine_tx_branches:
+            handle = self._spine_tx_branches.pop(transport_id)
+            spine = self._spine_pipeline
+            if spine is not None:
+                try:
+                    spine.detach_branch(handle)
+                except Exception:
+                    # If detach fails the leg is already gone; the user-visible
+                    # state should still settle to "stopped" so we don't leave a
+                    # zombie transport id around.
+                    pass
+                self._unregister_spine_srt_endpoint(transport_id)
+            self._srt_transport_pipelines.pop(transport_id, None)
+            self.telemetry.mark_srt_transport(transport_id, False)
+            return
+
+        if transport_id in self._spine_rx_branches:
+            handle = self._spine_rx_branches.pop(transport_id)
+            spine = self._spine_pipeline
+            if spine is not None:
+                try:
+                    spine.detach_branch(handle)
+                except Exception:
+                    pass
+                self._unregister_spine_srt_endpoint(transport_id)
+            self._srt_transport_pipelines.pop(transport_id, None)
+            self.telemetry.mark_srt_transport(transport_id, False)
+            return
+
+        if transport_id in self._tx_bundle_transport_ids:
+            # Drop this leg from the bundle. If others remain, rebuild without it;
+            # otherwise tear the bundle down.
+            remaining = self._tx_bundle_transport_ids - {transport_id}
+            self._srt_transport_pipelines.pop(transport_id, None)
+            if remaining and self._latest_tx_config is not None:
+                pipeline = self._restart_tx_bundle(self._latest_tx_config, remaining)
+                for member_id in remaining:
+                    self._srt_transport_pipelines[member_id] = pipeline
+                self._tx_bundle_transport_ids = remaining
+            else:
+                self._stop_pipeline(self._tx_bundle)
+                self._tx_bundle = None
+                self._tx_bundle_transport_ids = set()
+            self.telemetry.mark_srt_transport(transport_id, False)
+            return
+
         pipeline = self._srt_transport_pipelines.pop(transport_id, None)
         self._stop_pipeline(pipeline)
         self.telemetry.mark_srt_transport(transport_id, False)
+
+    def _restart_tx_bundle(self, config: EndpointConfig, member_ids: set[str]) -> Any:
+        """Stop the current TX bundle (if any) and start a fresh one with ``member_ids``.
+
+        ``member_ids`` is the full desired membership after the operation.
+        """
+        builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
+        # Plan a bundle filtered to the requested members.
+        filtered_config = self._config_with_tx_members(config, member_ids)
+        plan = builder.plan_endpoint_tx_bundle(filtered_config)
+        gstreamer = plan["gstreamer"]
+        if not plan["valid"] or gstreamer is None or not gstreamer.get("argv"):
+            raise RuntimeError(
+                "TX bundle plan is empty or invalid: " + "; ".join(error.get("message", "") for error in plan["errors"])
+            )
+
+        if self._tx_bundle is not None:
+            self._stop_pipeline(self._tx_bundle)
+            self._tx_bundle = None
+
+        srt_endpoints = [
+            (endpoint["transport_id"], endpoint["element_name"])
+            for endpoint in gstreamer["srt_endpoints"]
+        ]
+        meter_lookup = {
+            endpoint["element_name"]: (
+                endpoint["transport_id"],
+                endpoint["direction"],
+                endpoint["channel"],
+            )
+            for endpoint in gstreamer.get("meter_endpoints", [])
+        }
+        pipeline = self._spawn_managed_tx_bundle(
+            name=f"tx_bundle_{'_'.join(sorted(member_ids))}",
+            graph=gstreamer["graph"],
+            srt_endpoints=srt_endpoints,
+            meter_lookup=meter_lookup,
+        )
+        self._tx_bundle = pipeline
+        self._latest_tx_config = config
+        return pipeline
+
+    def _spawn_managed_tx_bundle(
+        self,
+        *,
+        name: str,
+        graph: str,
+        srt_endpoints: list[tuple[str, str]],
+        meter_lookup: dict[str, tuple[str, str, int]] | None = None,
+    ) -> Any:
+        """Wrapper around CtypesManagedPipeline.start_bundle for monkeypatching in tests."""
+        if self._gst_runtime is None:
+            self._gst_runtime = CtypesGst.load(self.gst_launch_executable)
+        return CtypesManagedPipeline.start_bundle(
+            name=name,
+            graph=graph,
+            srt_endpoints=srt_endpoints,
+            telemetry=self.telemetry,
+            runtime=self._gst_runtime,
+            meter_lookup=meter_lookup,
+        )
+
+    @staticmethod
+    def _config_with_tx_members(config: EndpointConfig, member_ids: set[str]) -> EndpointConfig:
+        """Return an EndpointConfig view whose srt_transports keep only TX legs in ``member_ids``.
+
+        RX transports pass through unchanged so existing validators still see them.
+        """
+        kept = [
+            transport for transport in config.srt_transports
+            if transport.direction != SrtTransportDirection.tx or transport.id in member_ids
+        ]
+        return config.model_copy(update={"srt_transports": kept})
 
     # --- monitor branch attachment ---
 
@@ -333,18 +568,197 @@ class MediaController:
         self.telemetry.mark_webrtc_stream(stream_id, False)
 
     def list_pipelines(self, *, include_output_tail: bool = True) -> list[dict[str, Any]]:
+        # De-duplicate by object identity so a shared TX bundle (with multiple
+        # transport ids pointing at the same pipeline) only appears once.
+        seen: set[int] = set()
         pipelines: list[Any] = []
-        if self._program_pipeline is not None:
-            pipelines.append(self._program_pipeline)
-        if self._tone_pipeline is not None:
-            pipelines.append(self._tone_pipeline)
-        if self._monitor_pipeline is not None:
-            pipelines.append(self._monitor_pipeline)
-        pipelines.extend(self._srt_transport_pipelines.values())
+
+        def add(candidate: Any | None) -> None:
+            if candidate is None or id(candidate) in seen:
+                return
+            seen.add(id(candidate))
+            pipelines.append(candidate)
+
+        add(self._spine_pipeline)
+        add(self._program_pipeline)
+        add(self._tone_pipeline)
+        add(self._monitor_pipeline)
+        add(self._tx_bundle)
+        for pipeline in self._srt_transport_pipelines.values():
+            add(pipeline)
         return [pipeline.describe(include_output_tail=include_output_tail) for pipeline in pipelines]
 
     def discover_audio_interfaces(self) -> list[dict[str, Any]]:
         return discover_audio_interfaces(self.gst_launch_executable)
+
+    # --- spine (always-on full-duplex DVS pipeline) ---
+
+    def start_spine(self, config: EndpointConfig) -> dict[str, Any]:
+        """Start the always-on full-duplex spine. Idempotent: a second call
+        returns the running pipeline's description without rebuilding.
+
+        The spine opens DVS once (capture + playback) and exposes per-channel
+        tee/audiomixer attach points for TX/RX legs. In this first commit it is
+        a standalone diagnostic so we can verify the full-duplex DVS open
+        before wiring it into TX/RX flows.
+        """
+        if self._spine_pipeline is not None:
+            return {
+                "running": True,
+                "already_running": True,
+                "process": self._spine_pipeline.describe(),
+            }
+
+        plan = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable).plan_spine(config)
+        if not plan["valid"] or plan["gstreamer"] is None:
+            raise RuntimeError(
+                "spine plan is invalid: " + "; ".join(error.get("message", "") for error in plan["errors"])
+            )
+
+        pipeline = self._spawn_managed_spine_pipeline(
+            name="spine_full_duplex",
+            graph=plan["gstreamer"]["graph"],
+        )
+        self._spine_pipeline = pipeline
+        return {
+            "running": True,
+            "already_running": False,
+            "channel_count": plan["channel_count"],
+            "capture_tee_names": plan["capture_tee_names"],
+            "playback_mixer_names": plan["playback_mixer_names"],
+            "asiosrc_element_name": plan["gstreamer"]["asiosrc_element_name"],
+            "asiosink_element_name": plan["gstreamer"]["asiosink_element_name"],
+            "process": pipeline.describe(),
+        }
+
+    def stop_spine(self) -> None:
+        if self._spine_pipeline is None:
+            return
+        self._stop_pipeline(self._spine_pipeline)
+        self._spine_pipeline = None
+
+    def describe_spine(self) -> dict[str, Any]:
+        if self._spine_pipeline is None:
+            return {"running": False}
+        return {"running": True, "process": self._spine_pipeline.describe()}
+
+    def _tx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
+        """Spine TX is used when every source for the leg is a dante_input AND
+        the audio interface driver is one the spine can open (i.e. real
+        capture). Non-dante sources (tones, silence) and unconfigured audio
+        interfaces stay on the legacy bundle path.
+        """
+        from app.core.config import SourceKind
+
+        if config.audio.interface_driver not in {"asio", "wasapi", "coreaudio", "alsa"}:
+            return False
+        if not config.audio.interface_name:
+            return False
+        source_by_id = {s.id: s for s in config.sources if s.enabled}
+        group_by_id = {g.id: g for g in config.encode_groups if g.enabled}
+        for group_id in transport.encode_group_ids:
+            group = group_by_id.get(group_id)
+            if group is None:
+                return False
+            for channel in group.channels:
+                source = source_by_id.get(channel.source_id or "")
+                if source is None or source.kind != SourceKind.dante_input:
+                    return False
+        return True
+
+    def _rx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
+        """RX spine legs require a configured playback device and an encode
+        group whose decoded channels fit the DVS output channel count."""
+        # Disabled: spine RX legs feed interaudiosink into the spine playback
+        # chain (audiomixer → interleave → asiosink). That playback chain stalls
+        # the whole pipeline; until it's fixed we route RX through the legacy
+        # standalone leg path (srtsrc → opusdec → fakesink), matching the prior
+        # working state where SRT RX terminated at fakesink.
+        return False
+        if config.audio.interface_driver not in {"asio", "wasapi", "coreaudio", "alsa"}:
+            return False
+        if not config.audio.interface_name:
+            return False
+        group_by_id = {g.id: g for g in config.encode_groups if g.enabled}
+        for group_id in transport.encode_group_ids:
+            group = group_by_id.get(group_id)
+            if group is None:
+                return False
+            if group.channel_count > config.audio.channel_count:
+                return False
+        return bool(transport.encode_group_ids)
+
+    def _register_spine_srt_endpoint(self, transport_id: str, element_name: str) -> None:
+        """Attach a TX leg's srtsink to the spine's srt_endpoints list so the
+        runtime poll loop can read srtsink.stats and attribute them to this
+        transport. The element pointer is resolved by name on the live pipeline.
+        """
+        spine = self._spine_pipeline
+        if spine is None or self._gst_runtime is None:
+            return
+        element_ptr = self._gst_runtime.gst.gst_bin_get_by_name(
+            spine.pipeline, element_name.encode("utf-8"),
+        )
+        if not element_ptr:
+            return
+        spine.srt_endpoints.append((transport_id, element_ptr))
+
+    def _unregister_spine_srt_endpoint(self, transport_id: str) -> None:
+        spine = self._spine_pipeline
+        if spine is None or self._gst_runtime is None:
+            return
+        remaining: list[tuple[str, int]] = []
+        for tid, element_ptr in spine.srt_endpoints:
+            if tid == transport_id and element_ptr:
+                self._gst_runtime.gobject.g_object_unref(element_ptr)
+                continue
+            remaining.append((tid, element_ptr))
+        spine.srt_endpoints = remaining
+
+    def _spawn_managed_spine_pipeline(self, *, name: str, graph: str) -> Any:
+        """Like _spawn_managed_gst_pipeline but with no srt endpoint registration.
+
+        The spine has no srtsink/srtsrc; it owns DVS only. Bus polling still
+        runs so we get level messages and pipeline error visibility.
+        """
+        if self._gst_runtime is None:
+            self._gst_runtime = CtypesGst.load(self.gst_launch_executable)
+        return CtypesManagedPipeline.start_bundle(
+            name=name,
+            graph=graph,
+            srt_endpoints=[],
+            telemetry=self.telemetry,
+            runtime=self._gst_runtime,
+        )
+
+    def start_tx_capture_spine(self, config: EndpointConfig) -> dict[str, Any]:
+        """Start the capture-only spine used for dynamic TX leg attachment."""
+        if self._spine_pipeline is not None:
+            return {
+                "running": True,
+                "already_running": True,
+                "process": self._spine_pipeline.describe(),
+            }
+
+        plan = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable).plan_tx_capture_spine(config)
+        if not plan["valid"] or plan["gstreamer"] is None:
+            raise RuntimeError(
+                "TX capture spine plan is invalid: " + "; ".join(error.get("message", "") for error in plan["errors"])
+            )
+
+        pipeline = self._spawn_managed_spine_pipeline(
+            name="tx_capture_spine",
+            graph=plan["gstreamer"]["graph"],
+        )
+        self._spine_pipeline = pipeline
+        return {
+            "running": True,
+            "already_running": False,
+            "channel_count": plan["channel_count"],
+            "capture_tee_names": plan["capture_tee_names"],
+            "asiosrc_element_name": plan["gstreamer"]["asiosrc_element_name"],
+            "process": pipeline.describe(),
+        }
 
     # --- tone generator ---
 

@@ -90,8 +90,17 @@ class TelemetryService:
     webrtc_streams: dict[str, WebRtcStreamState] = field(default_factory=dict)
     srt_observations: dict[str, SrtTransportObservation] = field(default_factory=dict)
     webrtc_observations: dict[str, WebRtcStreamObservation] = field(default_factory=dict)
+    # Legacy flat-by-channel meter storage. Last-write-wins across transports —
+    # fine for single-TX deployments, ambiguous for the TX bundle. Kept so the
+    # existing /api/status meters payload doesn't break old UI clients.
     input_meters: dict[int, AudioMeterObservation] = field(default_factory=dict)
     output_meters: dict[int, AudioMeterObservation] = field(default_factory=dict)
+    # Per-transport meter storage. Keyed transport_id -> channel -> observation.
+    # The TX bundle attributes each per-channel level message to its transport
+    # via the element-name lookup in CtypesManagedPipeline, then this is the
+    # canonical place to look for "what is TX-A channel 1 doing right now."
+    input_meters_by_transport: dict[str, dict[int, AudioMeterObservation]] = field(default_factory=dict)
+    output_meters_by_transport: dict[str, dict[int, AudioMeterObservation]] = field(default_factory=dict)
     clock_observation: ClockObservation | None = None
     observation_ttl_seconds: float = 3.0
 
@@ -101,6 +110,8 @@ class TelemetryService:
         state.started_at = time.time() if running else None
         if not running:
             self.srt_observations.pop(transport_id, None)
+            self.input_meters_by_transport.pop(transport_id, None)
+            self.output_meters_by_transport.pop(transport_id, None)
         self.program_running = any(item.state == "running" for item in self.srt_transports.values())
 
     def mark_webrtc_stream(self, stream_id: str, running: bool) -> None:
@@ -119,11 +130,31 @@ class TelemetryService:
         current = self.webrtc_observations.get(stream_id, WebRtcStreamObservation())
         self.webrtc_observations[stream_id] = self._replace_observation(current, values)
 
-    def observe_input_meter(self, channel: int, *, peak_dbfs: float | None, rms_dbfs: float | None) -> None:
-        self.input_meters[channel] = AudioMeterObservation(peak_dbfs=peak_dbfs, rms_dbfs=rms_dbfs)
+    def observe_input_meter(
+        self,
+        channel: int,
+        *,
+        peak_dbfs: float | None,
+        rms_dbfs: float | None,
+        transport_id: str | None = None,
+    ) -> None:
+        observation = AudioMeterObservation(peak_dbfs=peak_dbfs, rms_dbfs=rms_dbfs)
+        self.input_meters[channel] = observation
+        if transport_id is not None:
+            self.input_meters_by_transport.setdefault(transport_id, {})[channel] = observation
 
-    def observe_output_meter(self, channel: int, *, peak_dbfs: float | None, rms_dbfs: float | None) -> None:
-        self.output_meters[channel] = AudioMeterObservation(peak_dbfs=peak_dbfs, rms_dbfs=rms_dbfs)
+    def observe_output_meter(
+        self,
+        channel: int,
+        *,
+        peak_dbfs: float | None,
+        rms_dbfs: float | None,
+        transport_id: str | None = None,
+    ) -> None:
+        observation = AudioMeterObservation(peak_dbfs=peak_dbfs, rms_dbfs=rms_dbfs)
+        self.output_meters[channel] = observation
+        if transport_id is not None:
+            self.output_meters_by_transport.setdefault(transport_id, {})[channel] = observation
 
     def observe_clock(self, **values: Any) -> None:
         current = self.clock_observation or ClockObservation()
@@ -240,6 +271,7 @@ class TelemetryService:
                 "wan_tx_kbps": None,
             },
             "meters": self._meter_snapshot(channel_count),
+            "meters_by_transport": self._meter_snapshot_by_transport(),
             "diagnostics": {
                 "tone_running": self.diagnostics.tone_running,
                 "tone_channel": self.diagnostics.tone_channel if self.diagnostics.tone_running else None,
@@ -317,6 +349,31 @@ class TelemetryService:
                 "rms_dbfs": output_meter.rms_dbfs if output_meter else None,
             })
         return {"inputs": inputs, "outputs": outputs}
+
+    def _meter_snapshot_by_transport(self) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        """Per-transport meters, only including transport ids that have a recent
+        observation. Each channel list is sorted by channel index."""
+        result: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+        def rows(channels: dict[int, AudioMeterObservation]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "channel": channel,
+                    "peak_dbfs": observation.peak_dbfs,
+                    "rms_dbfs": observation.rms_dbfs,
+                }
+                for channel, observation in sorted(channels.items())
+                if self._is_recent(observation)
+            ]
+
+        transport_ids = set(self.input_meters_by_transport) | set(self.output_meters_by_transport)
+        for transport_id in transport_ids:
+            input_rows = rows(self.input_meters_by_transport.get(transport_id, {}))
+            output_rows = rows(self.output_meters_by_transport.get(transport_id, {}))
+            if not input_rows and not output_rows:
+                continue
+            result[transport_id] = {"inputs": input_rows, "outputs": output_rows}
+        return result
 
     def _srt_summary(self) -> dict[str, Any]:
         observations = [item for item in self.srt_observations.values() if self._is_recent(item)]
