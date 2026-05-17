@@ -172,6 +172,13 @@ class MediaGraphBuilder:
                     )
                     continue
                 if transport.direction == SrtTransportDirection.tx:
+                    if source.kind == SourceKind.dante_output:
+                        errors.append(self._error(
+                            transport.id, group.id, "wrong_source_direction",
+                            f"TX channels cannot use dante_output source '{source.id}'; pick a dante_input (capture) source instead",
+                            channel.index, source_id=source.id,
+                        ))
+                        continue
                     if source.kind == SourceKind.dante_input:
                         if not source.dante_channel:
                             errors.append(self._error(
@@ -208,6 +215,32 @@ class MediaGraphBuilder:
                                 source_id=source.id,
                             )
                         )
+                else:  # rx
+                    if source.kind == SourceKind.dante_input:
+                        errors.append(self._error(
+                            transport.id, group.id, "wrong_source_direction",
+                            f"RX channels cannot route to dante_input source '{source.id}'; pick a dante_output (playback) destination instead",
+                            channel.index, source_id=source.id,
+                        ))
+                    elif source.kind == SourceKind.dante_output:
+                        if not source.dante_channel:
+                            errors.append(self._error(
+                                transport.id, group.id, "dante_source_missing_channel",
+                                f"dante_output source '{source.id}' has no dante_channel set",
+                                channel.index, source_id=source.id,
+                            ))
+                        elif source.dante_channel > config.audio.channel_count:
+                            errors.append(self._error(
+                                transport.id, group.id, "dante_channel_out_of_range",
+                                f"dante_channel {source.dante_channel} exceeds interface channel_count {config.audio.channel_count}",
+                                channel.index, source_id=source.id,
+                            ))
+                    elif source.kind != SourceKind.silence:
+                        errors.append(self._error(
+                            transport.id, group.id, "unsupported_source_kind",
+                            f"RX channel source '{source.id}' kind '{source.kind.value}' is not supported as a playback destination",
+                            channel.index, source_id=source.id,
+                        ))
         return errors
 
     def _build_tx_argv(

@@ -508,7 +508,6 @@ def create_api_router(
                 "channel_count": channel_count,
             }
         })
-        store.sync_dante_input_sources(channel_count)
         events.append("info", "system", f"audio interface set to '{name}' ({channel_count} ch)")
         return saved.audio.model_dump(mode="json", exclude_none=True)
 
@@ -519,7 +518,7 @@ def create_api_router(
         from /api/interfaces/audio — this endpoint is the *registered* set."""
         in_use: dict[str, dict[str, Any]] = {}
         for source in store.config.sources:
-            if source.kind != "dante_input":
+            if source.kind not in ("dante_input", "dante_output"):
                 continue
             name = source.interface_name
             if not name:
@@ -529,9 +528,15 @@ def create_api_router(
                 "driver": source.interface_driver or "unknown",
                 "device_id": source.interface_device_id,
                 "source_count": 0,
+                "input_count": 0,
+                "output_count": 0,
                 "max_channel": 0,
             })
             entry["source_count"] += 1
+            if source.kind == "dante_input":
+                entry["input_count"] += 1
+            else:
+                entry["output_count"] += 1
             entry["max_channel"] = max(entry["max_channel"], source.dante_channel or 0)
         return {"devices": list(in_use.values())}
 

@@ -65,6 +65,7 @@ class StreamDirection(str, Enum):
 
 class SourceKind(str, Enum):
     dante_input = "dante_input"
+    dante_output = "dante_output"
     tone = "tone"
     silence = "silence"
     webrtc_stream = "webrtc_stream"
@@ -75,9 +76,9 @@ class SourceConfig(BaseModel):
     name: str
     kind: SourceKind = SourceKind.dante_input
     dante_channel: int | None = Field(default=None, ge=1, le=64)
-    # Per-source capture device. Required for dante_input sources so the
-    # pipeline can open one capture node per distinct device. Sources from
-    # different devices coexist in the same TX encode group.
+    # Per-source audio device. dante_input describes a capture channel (TX);
+    # dante_output describes a playback channel (RX). Both carry interface
+    # metadata + the device-side channel number in dante_channel.
     interface_name: str | None = None
     interface_driver: Literal["wasapi", "coreaudio", "alsa", "asio", "unknown"] | None = None
     interface_device_id: str | None = None

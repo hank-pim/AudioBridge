@@ -426,7 +426,7 @@ function SettingsView({ onBack }) {
 
   const removeAudioDevice = async (name) => {
     if (!name) return;
-    if (!window.confirm(`Remove device "${name}" and all its dante_input sources?`)) return;
+    if (!window.confirm(`Remove device "${name}" and all its capture + playback sources?`)) return;
     setAudioStatus("saving"); setAudioError("");
     try {
       const r = await fetch(`/api/devices/audio/${encodeURIComponent(name)}`, { method: "DELETE" });
@@ -661,7 +661,7 @@ function SettingsView({ onBack }) {
             </CfgField>
           </CfgSection>
 
-          <CfgSection label="Capture devices" hint="dante_input sources route through these. Each registered device opens one OS audio capture in the TX pipeline.">
+          <CfgSection label="Audio devices" hint="Each registered device exposes capture channels (TX sources) and playback channels (RX destinations).">
             <CaptureDevicesPanel
               available={audioInterfaces}
               status={audioStatus}
@@ -854,10 +854,13 @@ function CaptureDevicesPanel({ available, status, error, onAdd, onRemove, onRefr
   const registered = useMemo(() => {
     const map = new Map();
     (cfg.sources || []).forEach(s => {
-      if (s.kind !== "dante_input" || !s.interface_name) return;
+      if (!s.interface_name) return;
+      if (s.kind !== "dante_input" && s.kind !== "dante_output") return;
       const key = s.interface_name;
-      const entry = map.get(key) || { name: key, driver: s.interface_driver || "unknown", device_id: s.interface_device_id || null, source_count: 0, max_channel: 0 };
+      const entry = map.get(key) || { name: key, driver: s.interface_driver || "unknown", device_id: s.interface_device_id || null, source_count: 0, input_count: 0, output_count: 0, max_channel: 0 };
       entry.source_count++;
+      if (s.kind === "dante_input") entry.input_count++;
+      else entry.output_count++;
       entry.max_channel = Math.max(entry.max_channel, s.dante_channel || 0);
       map.set(key, entry);
     });
@@ -880,7 +883,7 @@ function CaptureDevicesPanel({ available, status, error, onAdd, onRemove, onRefr
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {registered.length === 0 && (
         <div className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-warn)", padding: "4px 0" }}>
-          no capture devices registered — dante_input sources will fail validation
+          no audio devices registered — TX capture and RX playback will fail validation
         </div>
       )}
       {registered.length > 0 && (
@@ -893,7 +896,7 @@ function CaptureDevicesPanel({ available, status, error, onAdd, onRemove, onRefr
             }}>
               <span className="ab-mono" style={{ fontSize: 11.5, color: "var(--ab-fg)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={d.name}>{d.name}</span>
               <Chip tone="muted">{d.driver}</Chip>
-              <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-3)" }}>{d.source_count} src · max ch {d.max_channel}</span>
+              <span className="ab-mono" style={{ fontSize: 10.5, color: "var(--ab-fg-3)" }}>{d.input_count} in · {d.output_count} out · max ch {d.max_channel}</span>
               <button className="ab-btn" data-variant="ghost" disabled={status === "saving"} onClick={() => onRemove(d.name)} style={{ height: 20, fontSize: 11, color: "var(--ab-err)" }}>remove</button>
             </div>
           ))}
@@ -1370,6 +1373,16 @@ function defaultOpus(transport) {
 
 const SILENCE_DEFAULT_SOURCE_ID = "silence-default";
 
+// Pick a sensible default destination for an RX channel slot: the first
+// registered dante_output whose dante_channel matches the slot. Returns ""
+// if no audio device is registered yet — the validator will surface that as
+// a missing-source error, prompting the operator to register a device.
+function defaultRxSourceId(slotIndex, sources) {
+  const list = sources || (window.AB && window.AB.config && window.AB.config.sources) || [];
+  const match = list.find(s => s.kind === "dante_output" && s.dante_channel === slotIndex);
+  return match ? match.id : "";
+}
+
 function ChannelStrip({ streamId, transportRunning, group, sources, metersByTransport, meterDirection, page = 0, perPage = 4 }) {
   const [pending, setPending] = useState({}); // index -> { source_id?, label? }
   const [savingIdx, setSavingIdx] = useState(null);
@@ -1385,33 +1398,40 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
     return map;
   }, [group]);
 
-  // Group sources by capture device so the dropdown reads "Device → Ch N",
-  // grouped under <optgroup> labels. Non-dante sources (silence/tone) fall
-  // into a "Generators" group.
+  // TX strips pick from capture (dante_input) sources; RX strips pick from
+  // playback (dante_output) destinations. Filtering by direction prevents
+  // operators from routing an output channel onto the TX side and vice versa.
+  const isRx = meterDirection === "in";
+  const danteKind = isRx ? "dante_output" : "dante_input";
   const sourceGroups = useMemo(() => {
     const groups = new Map();
     const generators = [];
     sources.forEach(s => {
-      if (s.id === SILENCE_DEFAULT_SOURCE_ID) { generators.unshift([s.id, "Silence"]); return; }
-      if (s.kind === "dante_input") {
+      if (s.id === SILENCE_DEFAULT_SOURCE_ID) {
+        // RX strips must pick an explicit dante_output destination — no "default"
+        // option, since the old fallback (slot-index → DVS Out N) was opaque.
+        if (isRx) return;
+        generators.unshift([s.id, "Silence"]);
+        return;
+      }
+      if (s.kind === danteKind) {
         const deviceLabel = s.interface_name || "(no device)";
         const label = s.dante_channel ? `Ch ${String(s.dante_channel).padStart(2, "0")}${s.name && !s.name.startsWith(s.interface_name || "") ? " · " + s.name : ""}` : (s.name || s.id);
         if (!groups.has(deviceLabel)) groups.set(deviceLabel, []);
         groups.get(deviceLabel).push([s.id, label]);
-      } else {
+      } else if (!isRx && s.kind !== "dante_input" && s.kind !== "dante_output") {
         generators.push([s.id, s.name || s.id]);
       }
     });
-    // Stable: silence/tone group first, then devices alphabetically.
     const out = [];
-    if (generators.length) out.push(["Generators", generators]);
+    if (generators.length) out.push([isRx ? "Routing" : "Generators", generators]);
     for (const name of Array.from(groups.keys()).sort()) out.push([name, groups.get(name)]);
     return out;
-  }, [sources]);
+  }, [sources, danteKind, isRx]);
 
   const sourceMeterChannel = useCallback((sourceId) => {
     const src = sources.find(s => s.id === sourceId);
-    if (!src || src.kind !== "dante_input") return null;
+    if (!src || (src.kind !== "dante_input" && src.kind !== "dante_output")) return null;
     return src.dante_channel || null;
   }, [sources]);
 
@@ -1420,10 +1440,15 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
     setError("");
     try {
       const merged = (group.channels || []).map(ch => ch.index === idx ? { ...ch, ...patch } : ch);
-      // Backfill silence-default for any unassigned slot up to channel_count.
+      // Backfill any unassigned slot up to channel_count. TX defaults to
+      // silence so an unrouted channel is audibly quiet; RX defaults to its
+      // matching dante_output so the destination is always explicit.
       const present = new Set(merged.map(c => c.index));
       for (let i = 1; i <= (group.channel_count || merged.length); i++) {
-        if (!present.has(i)) merged.push({ index: i, source_id: SILENCE_DEFAULT_SOURCE_ID, label: `Ch ${String(i).padStart(2, "0")}`, gain_db: 0 });
+        if (!present.has(i)) {
+          const sid = isRx ? defaultRxSourceId(i, sources) : SILENCE_DEFAULT_SOURCE_ID;
+          merged.push({ index: i, source_id: sid, label: `Ch ${String(i).padStart(2, "0")}`, gain_db: 0 });
+        }
       }
       const body = {
         id: group.id,
@@ -1486,7 +1511,6 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
     }
   };
 
-  const isRx = meterDirection === "in";
   // Sparse {channel, peak_dbfs, rms_dbfs} rows keyed by channel number.
   const meterRowsByChannel = useCallback((transportKey, side) => {
     const map = new Map();
@@ -1504,7 +1528,8 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
   const end = Math.min(channelCount, start + perPage);
   const rows = [];
   for (let i = start + 1; i <= end; i++) {
-    const ch = channelByIndex.get(i) || { index: i, source_id: SILENCE_DEFAULT_SOURCE_ID, label: `Ch ${String(i).padStart(2, "0")}` };
+    const defaultSid = isRx ? defaultRxSourceId(i, sources) : SILENCE_DEFAULT_SOURCE_ID;
+    const ch = channelByIndex.get(i) || { index: i, source_id: defaultSid, label: `Ch ${String(i).padStart(2, "0")}` };
     const effectiveSource = (pending[i] && pending[i].source_id) || ch.source_id;
     const isMuted = !isRx && effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
     const meterCh = sourceMeterChannel(effectiveSource);
@@ -1536,7 +1561,7 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
           style={{ ...cfgInputStyle, height: 20, fontSize: 11 }}
         >
           {sourceGroups.map(([groupLabel, opts]) => (
-            <optgroup key={groupLabel} label={isRx ? groupLabel.replace("Input", "Output") : groupLabel}>
+            <optgroup key={groupLabel} label={groupLabel}>
               {opts.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
             </optgroup>
           ))}
@@ -1629,12 +1654,12 @@ function AddStreamPanel({ onClose }) {
       if (kind === "srt_transport") {
         const encodeGroupIds = [];
         const n = clampInt(channelCount, 1, 255);
-        // Both TX and RX get a channel group — RX uses it as a channel-count
-        // carrier (channels are silence-filled and unused on the decode path
-        // until backend exposes Dante output routing).
+        // TX channels default to silence (audibly quiet until routed); RX
+        // channels default to their matching dante_output so the playback
+        // destination is always explicit.
         const channels = Array.from({ length: n }, (_, i) => ({
           index: i + 1,
-          source_id: SILENCE_DEFAULT_SOURCE_ID,
+          source_id: direction === "rx" ? defaultRxSourceId(i + 1) : SILENCE_DEFAULT_SOURCE_ID,
           label: `Ch ${String(i + 1).padStart(2, "0")}`,
           gain_db: 0.0,
         }));
@@ -1936,7 +1961,7 @@ function StreamDrawer({ ch, onClose }) {
     for (let i = 1; i <= newCount; i++) {
       channels.push(existing.get(i) || {
         index: i,
-        source_id: SILENCE_DEFAULT_SOURCE_ID,
+        source_id: isTx ? SILENCE_DEFAULT_SOURCE_ID : defaultRxSourceId(i),
         label: `Ch ${String(i).padStart(2, "0")}`,
         gain_db: 0,
       });
