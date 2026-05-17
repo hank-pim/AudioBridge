@@ -907,8 +907,9 @@ class CtypesManagedPipeline:
             # Bitrate from byte-counter deltas — see notes on the single-pipeline
             # case before; here we keep a counter per transport_id so multi-leg
             # bundles compute deltas independently for each srtsink.
-            bytes_total = _first_int(
+            bytes_total = _largest_int(
                 fields,
+                "bytes-received", "bytes-sent",
                 "bytes-received-total", "bytes-sent-total",
                 "pkti-recv-bytes", "pkti-send-bytes",
             )
@@ -1010,6 +1011,25 @@ def _first_float(fields: dict[str, str], *names: str) -> float | None:
 def _first_int(fields: dict[str, str], *names: str) -> int | None:
     value = _first_float(fields, *names)
     return int(value) if value is not None else None
+
+
+def _largest_int(fields: dict[str, str], *names: str) -> int | None:
+    best: int | None = None
+    for name in names:
+        raw = fields.get(name.lower())
+        if raw is None:
+            continue
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(float(part))
+            except ValueError:
+                continue
+            if best is None or value > best:
+                best = value
+    return best
 
 
 def _mbps_to_kbps(value: float | None) -> float | None:
