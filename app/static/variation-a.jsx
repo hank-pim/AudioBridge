@@ -44,8 +44,7 @@ function VariationA() {
     return rows;
   }, [tab, query, CHANNELS]);
 
-  const inputMeters = (status.meters && status.meters.inputs) || [];
-  const outputMeters = (status.meters && status.meters.outputs) || [];
+  const metersByTransport = status.meters_by_transport || {};
   const sources = cfg.sources || [];
 
   return (
@@ -78,8 +77,7 @@ function VariationA() {
                 onToggleDrawer={() => toggleDrawer(c.id)}
                 onCloseDrawer={() => closeDrawer(c.id)}
                 sources={sources}
-                inputMeters={inputMeters}
-                outputMeters={outputMeters}
+                metersByTransport={metersByTransport}
               />
             ))}
           </div>
@@ -178,7 +176,7 @@ function EventsRail({ open, onToggle }) {
 
 
 // ── Stream card (the grid tile) ────────────────────────────────────────────
-function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, inputMeters, outputMeters }) {
+function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, metersByTransport }) {
   const cfgRoot = window.AB.config || {};
   const isSrt = ch.entity_kind === "srt_transport";
   const transportCfg = isSrt ? (cfgRoot.srt_transports || []).find(t => t.id === ch.runtime_id) : null;
@@ -200,8 +198,7 @@ function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, in
           transportRunning={ch.state !== "idle"}
           group={groupCfg}
           sources={sources}
-          inputMeters={inputMeters}
-          outputMeters={outputMeters}
+          metersByTransport={metersByTransport}
           meterDirection={ch.direction}
           page={page}
           perPage={perPage}
@@ -1373,7 +1370,7 @@ function defaultOpus(transport) {
 
 const SILENCE_DEFAULT_SOURCE_ID = "silence-default";
 
-function ChannelStrip({ streamId, transportRunning, group, sources, inputMeters, outputMeters, meterDirection, page = 0, perPage = 4 }) {
+function ChannelStrip({ streamId, transportRunning, group, sources, metersByTransport, meterDirection, page = 0, perPage = 4 }) {
   const [pending, setPending] = useState({}); // index -> { source_id?, label? }
   const [savingIdx, setSavingIdx] = useState(null);
   const [error, setError] = useState("");
@@ -1490,6 +1487,18 @@ function ChannelStrip({ streamId, transportRunning, group, sources, inputMeters,
   };
 
   const isRx = meterDirection === "in";
+  // Sparse {channel, peak_dbfs, rms_dbfs} rows keyed by channel number.
+  const meterRowsByChannel = useCallback((transportKey, side) => {
+    const map = new Map();
+    const t = (metersByTransport && metersByTransport[transportKey]) || null;
+    const rows = (t && t[side]) || [];
+    rows.forEach(r => { if (r && r.channel != null) map.set(r.channel, r); });
+    return map;
+  }, [metersByTransport]);
+  // RX: post-decode level for this transport (last readable point before Dante out).
+  const rxMeterByCh = useMemo(() => meterRowsByChannel(streamId, "inputs"), [meterRowsByChannel, streamId]);
+  // TX: pre-encode spine capture meter, keyed by Dante input channel.
+  const spineMeterByCh = useMemo(() => meterRowsByChannel("spine", "inputs"), [meterRowsByChannel]);
   const channelCount = group.channel_count || 0;
   const start = page * perPage;
   const end = Math.min(channelCount, start + perPage);
@@ -1499,9 +1508,11 @@ function ChannelStrip({ streamId, transportRunning, group, sources, inputMeters,
     const effectiveSource = (pending[i] && pending[i].source_id) || ch.source_id;
     const isMuted = !isRx && effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
     const meterCh = sourceMeterChannel(effectiveSource);
+    // TX: pre-encode spine capture meter for the routed Dante input channel.
+    // RX: post-decode per-transport meter for this group channel index.
     const meter = isRx
-      ? ((inputMeters || [])[i - 1] || {})
-      : ((outputMeters || [])[i - 1] || {});
+      ? (rxMeterByCh.get(i) || {})
+      : (meterCh ? (spineMeterByCh.get(meterCh) || {}) : {});
     rows.push(
       <div key={`${streamId}-ch-${i}`}
            style={{ display: "grid", gridTemplateColumns: "38px 110px 140px 1fr 44px 22px 22px",
