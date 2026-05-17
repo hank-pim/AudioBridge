@@ -319,60 +319,71 @@ def test_program_start_requires_host_for_caller_mode(monkeypatch) -> None:
 
 
 def test_srt_transport_lifecycle_updates_only_selected_transport(monkeypatch) -> None:
-    spawned: list[tuple[str, str, str]] = []
+    attach_calls: list[dict[str, Any]] = []
 
-    class FakeManagedPipeline:
-        def __init__(self, name: str, graph: str, srt_element_name: str) -> None:
-            self.name = name
-            self.graph = graph
-            self.srt_element_name = srt_element_name
-            self.stopped = False
+    class FakeSpine:
+        meter_lookup: dict[str, tuple[str, str, int]] = {}
 
         def describe(self, *, include_output_tail: bool = True):
             return {
-                "name": self.name,
+                "name": "spine_full_duplex",
                 "pid": None,
-                "argv": ["managed-gstreamer", self.graph],
-                "running": not self.stopped,
+                "running": True,
                 "returncode": None,
                 "engine": "ctypes-gstreamer",
             }
 
+        def attach_branch_outputs_multi(self, mixer_names, exit_element_names, description):
+            attach_calls.append({
+                "mixer_names": list(mixer_names),
+                "exit_element_names": list(exit_element_names),
+                "description": description,
+            })
+            class _B:
+                pass
+            b = _B()
+            b.handle = f"h{len(attach_calls)}"
+            return b
+
+        def detach_branch(self, handle: str) -> bool:
+            return True
+
         def stop(self) -> None:
-            self.stopped = True
+            pass
 
-    def fake_spawn_managed(self, *, name, graph, srt_element_name, transport_id):
-        spawned.append((graph, srt_element_name, transport_id))
-        return FakeManagedPipeline(name, graph, srt_element_name)
+    fake_spine = FakeSpine()
 
-    monkeypatch.setattr(media_module.MediaController, "_spawn_managed_gst_pipeline", fake_spawn_managed)
+    def fake_start_spine(self, config):  # noqa: ANN001
+        self._spine_pipeline = fake_spine
+        return {"running": True, "already_running": False, "channel_count": 16}
+
+    monkeypatch.setattr(media_module.MediaController, "start_spine", fake_start_spine)
 
     with TestClient(create_app()) as client:
-        first_transport = {
-            "id": "tx-a",
-            "name": "Transport A",
-            "direction": "rx",
-            "mode": "listener",
-            "port": 9100,
-        }
-        second_transport = {
-            "id": "tx-b",
-            "name": "Transport B",
-            "direction": "rx",
-            "mode": "listener",
-            "port": 9200,
-        }
-
-        assert client.post("/api/srt-transports", json=first_transport).status_code == 200
-        assert client.post("/api/srt-transports", json=second_transport).status_code == 200
+        assert client.put("/api/config", json={
+            "audio": {
+                "interface_name": "DVS",
+                "interface_driver": "asio",
+                "interface_device_id": "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+                "channel_count": 16,
+            },
+            "sources": [{"id": "silence", "name": "S", "kind": "silence"}],
+            "encode_groups": [
+                {"id": "rx-g", "name": "RX", "channel_count": 1, "channels": [{"index": 1, "source_id": "silence"}]},
+            ],
+            "srt_transports": [
+                {"id": "tx-a", "name": "Transport A", "direction": "rx", "mode": "listener", "port": 9100, "encode_group_ids": ["rx-g"]},
+                {"id": "tx-b", "name": "Transport B", "direction": "rx", "mode": "listener", "port": 9200, "encode_group_ids": ["rx-g"]},
+            ],
+        }).status_code == 200
 
         start_response = client.post("/api/srt-transports/tx-a/start", json={})
         assert start_response.status_code == 200
-        graph, srt_element_name, transport_id = spawned[0]
-        assert transport_id == "tx-a"
-        assert srt_element_name == "srtstats_rx_tx_a"
-        assert "uri=srt://:9100?mode=listener&latency=240" in graph
-        assert "tee name=monitor_tap_rx_tx_a allow-not-linked=true" in graph
+        assert len(attach_calls) == 1
+        assert attach_calls[0]["mixer_names"] == ["spine_out_mix_1"]
+        assert attach_calls[0]["exit_element_names"] == ["out_1"]
+        assert "uri=srt://:9100?mode=listener&latency=240" in attach_calls[0]["description"]
+        assert "tee name=monitor_tap_rx_tx_a allow-not-linked=true" in attach_calls[0]["description"]
 
         status = client.get("/api/status")
         assert status.status_code == 200
@@ -386,51 +397,59 @@ def test_srt_transport_lifecycle_updates_only_selected_transport(monkeypatch) ->
 
 
 def test_media_pipelines_endpoint_exposes_running_pipeline(monkeypatch) -> None:
-    spawned: list[tuple[str, str, str]] = []
-
-    class FakeManagedPipeline:
-        def __init__(self, name: str, graph: str, srt_element_name: str) -> None:
-            self.name = name
-            self.graph = graph
-            self.srt_element_name = srt_element_name
-            self.stopped = False
+    class FakeSpine:
+        meter_lookup: dict[str, tuple[str, str, int]] = {}
 
         def describe(self, *, include_output_tail: bool = True):
             return {
-                "name": self.name,
+                "name": "spine_full_duplex",
                 "pid": None,
-                "argv": ["managed-gstreamer", self.graph],
-                "running": not self.stopped,
+                "running": True,
                 "returncode": None,
                 "engine": "ctypes-gstreamer",
             }
 
+        def attach_branch_outputs_multi(self, mixer_names, exit_element_names, description):
+            class _B:
+                pass
+            b = _B()
+            b.handle = "h1"
+            return b
+
         def stop(self) -> None:
-            self.stopped = True
+            pass
 
-    def fake_spawn_managed(self, *, name, graph, srt_element_name, transport_id):
-        spawned.append((graph, srt_element_name, transport_id))
-        return FakeManagedPipeline(name, graph, srt_element_name)
+    fake_spine = FakeSpine()
 
-    monkeypatch.setattr(media_module.MediaController, "_spawn_managed_gst_pipeline", fake_spawn_managed)
+    def fake_start_spine(self, config):  # noqa: ANN001
+        self._spine_pipeline = fake_spine
+        return {"running": True, "already_running": False, "channel_count": 16}
+
+    monkeypatch.setattr(media_module.MediaController, "start_spine", fake_start_spine)
 
     with TestClient(create_app()) as client:
-        transport = {
-            "id": "tx-a",
-            "name": "Transport A",
-            "direction": "rx",
-            "mode": "listener",
-            "port": 9100,
-        }
-
-        assert client.post("/api/srt-transports", json=transport).status_code == 200
+        assert client.put("/api/config", json={
+            "audio": {
+                "interface_name": "DVS",
+                "interface_driver": "asio",
+                "interface_device_id": "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+                "channel_count": 16,
+            },
+            "sources": [{"id": "silence", "name": "S", "kind": "silence"}],
+            "encode_groups": [
+                {"id": "rx-g", "name": "RX", "channel_count": 1, "channels": [{"index": 1, "source_id": "silence"}]},
+            ],
+            "srt_transports": [
+                {"id": "tx-a", "name": "Transport A", "direction": "rx", "mode": "listener", "port": 9100, "encode_group_ids": ["rx-g"]},
+            ],
+        }).status_code == 200
         assert client.post("/api/srt-transports/tx-a/start", json={}).status_code == 200
 
         pipelines_response = client.get("/api/media/pipelines")
         assert pipelines_response.status_code == 200
         pipelines = pipelines_response.json()
         assert len(pipelines) == 1
-        assert pipelines[0]["name"] == "srt_transport_tx-a_rx"
+        assert pipelines[0]["name"] == "spine_full_duplex"
         assert pipelines[0]["running"] is True
         assert pipelines[0]["pid"] is None
         assert pipelines[0]["engine"] == "ctypes-gstreamer"
@@ -664,6 +683,23 @@ def test_media_graph_plan_exposes_rx_monitor_tap() -> None:
         response = client.put(
             "/api/config",
             json={
+                "audio": {
+                    "interface_name": "DVS",
+                    "interface_driver": "asio",
+                    "interface_device_id": "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+                    "channel_count": 16,
+                },
+                "sources": [
+                    {"id": "silence", "name": "S", "kind": "silence"},
+                ],
+                "encode_groups": [
+                    {
+                        "id": "rx-main",
+                        "name": "Main RX",
+                        "channel_count": 1,
+                        "channels": [{"index": 1, "source_id": "silence"}],
+                    },
+                ],
                 "srt_transports": [
                     {
                         "id": "srt-rx",
@@ -671,6 +707,7 @@ def test_media_graph_plan_exposes_rx_monitor_tap() -> None:
                         "direction": "rx",
                         "mode": "listener",
                         "port": 9200,
+                        "encode_group_ids": ["rx-main"],
                     }
                 ],
             },
@@ -692,10 +729,45 @@ def test_media_graph_plan_exposes_rx_monitor_tap() -> None:
                 "channel_index": 1,
             }
         ]
-        assert "name=srtstats_rx_srt_rx" in transport_plan["gstreamer"]["argv"]
-        assert "name=monitor_tap_rx_srt_rx" in transport_plan["gstreamer"]["argv"]
-        assert "name=dbmeter_in_srt_rx_1" in transport_plan["gstreamer"]["argv"]
-        assert "fakesink" in transport_plan["gstreamer"]["argv"]
+        graph = transport_plan["gstreamer"]["graph"]
+        assert "srtsrc name=srtstats_rx_srt_rx" in graph
+        assert "tee name=monitor_tap_rx_srt_rx" in graph
+        assert "level name=dbmeter_in_srt_rx_1" in graph
+        assert "queue name=out_1" in graph
+        assert transport_plan["gstreamer"]["argv"] == []
+        assert "fakesink" not in graph
+
+
+def test_media_graph_plan_rejects_rx_without_decode_output_group() -> None:
+    with TestClient(create_app()) as client:
+        response = client.put(
+            "/api/config",
+            json={
+                "audio": {
+                    "interface_name": "DVS",
+                    "interface_driver": "asio",
+                    "interface_device_id": "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+                    "channel_count": 16,
+                },
+                "srt_transports": [
+                    {
+                        "id": "srt-rx",
+                        "name": "Main RX",
+                        "direction": "rx",
+                        "mode": "listener",
+                        "port": 9200,
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+        plan = client.get("/api/media/graph-plan").json()
+
+        assert plan["valid"] is False
+        assert plan["srt_transports"][0]["gstreamer"]["graph"] is None
+        assert plan["srt_transports"][0]["gstreamer"]["argv"] == []
+        assert {error["code"] for error in plan["errors"]} == {"rx_transport_has_no_groups"}
 
 
 def test_media_graph_plan_reports_validation_errors() -> None:
@@ -1264,20 +1336,17 @@ def test_managed_gstreamer_meter_activity_marks_clock_running() -> None:
 
 
 def test_monitor_branch_attach_detach_round_trip(monkeypatch) -> None:
-    class FakeManagedPipeline:
-        def __init__(self, name: str, graph: str, srt_element_name: str) -> None:
-            self.name = name
-            self.graph = graph
-            self.srt_element_name = srt_element_name
+    class FakeSpine:
+        def __init__(self) -> None:
             self.stopped = False
             self._branches: dict[str, dict] = {}
             self._counter = 0
+            self.meter_lookup: dict[str, tuple[str, str, int]] = {}
 
         def describe(self, *, include_output_tail: bool = True):
             return {
-                "name": self.name,
+                "name": "spine_full_duplex",
                 "pid": None,
-                "argv": ["managed-gstreamer", self.graph],
                 "running": not self.stopped,
                 "returncode": None,
                 "engine": "ctypes-gstreamer",
@@ -1297,24 +1366,42 @@ def test_monitor_branch_attach_detach_round_trip(monkeypatch) -> None:
             b.handle = handle
             return b
 
+        def attach_branch_outputs_multi(self, mixer_names, exit_element_names, description):
+            class _B:
+                pass
+            b = _B()
+            b.handle = "rx-h1"
+            return b
+
         def detach_branch(self, handle: str) -> bool:
             return self._branches.pop(handle, None) is not None
 
         def list_branches(self):
             return list(self._branches.values())
 
-    def fake_spawn_managed(self, *, name, graph, srt_element_name, transport_id):
-        return FakeManagedPipeline(name, graph, srt_element_name)
+    fake_spine = FakeSpine()
 
-    monkeypatch.setattr(media_module.MediaController, "_spawn_managed_gst_pipeline", fake_spawn_managed)
+    def fake_start_spine(self, config):  # noqa: ANN001
+        self._spine_pipeline = fake_spine
+        return {"running": True, "already_running": False, "channel_count": 16}
+
+    monkeypatch.setattr(media_module.MediaController, "start_spine", fake_start_spine)
 
     with TestClient(create_app()) as client:
-        client.post("/api/srt-transports", json={
-            "id": "tx-mon",
-            "name": "Mon",
-            "direction": "rx",
-            "mode": "listener",
-            "port": 9300,
+        client.put("/api/config", json={
+            "audio": {
+                "interface_name": "DVS",
+                "interface_driver": "asio",
+                "interface_device_id": "B5DEF3F2-B191-4F8D-9A67-A77402A6D3D8",
+                "channel_count": 16,
+            },
+            "sources": [{"id": "silence", "name": "S", "kind": "silence"}],
+            "encode_groups": [
+                {"id": "rx-g", "name": "RX", "channel_count": 1, "channels": [{"index": 1, "source_id": "silence"}]},
+            ],
+            "srt_transports": [
+                {"id": "tx-mon", "name": "Mon", "direction": "rx", "mode": "listener", "port": 9300, "encode_group_ids": ["rx-g"]},
+            ],
         })
         assert client.post("/api/srt-transports/tx-mon/start", json={}).status_code == 200
 
@@ -1415,7 +1502,11 @@ def test_plan_spine_full_duplex_shape() -> None:
     # output attach points dynamically linkable after the spine is already PLAYING.
     assert "interleave name=spine_out_interleave" in graph
     for mixer in plan["playback_mixer_names"]:
-        assert f"audiomixer name={mixer} latency=20000000 ! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue ! spine_out_interleave" in graph
+        assert (
+            f"audiomixer name={mixer} latency=20000000 ! audioconvert ! "
+            "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 "
+            "! queue ! spine_out_interleave"
+        ) in graph
     # Default silence feeders keep each mixer producing buffers when no RX
     # leg is attached, so asiosink never starves.
     assert graph.count("audiotestsrc is-live=true wave=silence") == 4
@@ -1697,8 +1788,8 @@ def test_plan_rx_leg_branch_emits_mixer_outputs_and_no_fakesink() -> None:
     assert "deinterleave name=rx_split_rx_a" in desc
     assert "rx_split_rx_a.src_0 ! queue ! level name=dbmeter_in_rx_a_1" in desc
     assert "rx_split_rx_a.src_1 ! queue ! level name=dbmeter_in_rx_a_2" in desc
-    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_1" in desc
-    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_2" in desc
+    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 ! queue name=out_1" in desc
+    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 ! queue name=out_2" in desc
     assert "fakesink" not in desc
 
 

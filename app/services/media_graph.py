@@ -62,9 +62,10 @@ class MediaGraphBuilder:
         srt_element_name = self._srt_element_name(transport.id, transport.direction.value)
 
         if transport.direction == SrtTransportDirection.rx:
-            monitor_taps = [self._rx_monitor_tap(transport.id)]
-            argv = self._build_rx_argv(transport, uri, srt_element_name, monitor_taps[0]["id"])
-            graph = " ".join(argv[2:])
+            branch_plan = self.plan_rx_leg_branch(config, transport_id, raise_on_error=True)
+            monitor_taps = branch_plan["monitor_taps"]
+            argv = []
+            graph = branch_plan["branch_description"]
             sources: list[dict[str, Any]] = []
         else:
             argv = self._build_tx_argv(config, transport, selected_groups, uri)
@@ -100,6 +101,27 @@ class MediaGraphBuilder:
                     errors.append(self._error(
                         transport.id, group.id, "opus_multichannel_max_8",
                         f"encode group '{group.id}' has {group.channel_count} channels; native multichannel OPUS supports up to 8",
+                    ))
+
+        if transport.direction == SrtTransportDirection.rx:
+            if not transport.encode_group_ids:
+                errors.append(self._error(transport.id, None, "rx_transport_has_no_groups", "RX SRT transport has no decode/output group"))
+            if config.audio.interface_driver == "unknown" or not config.audio.interface_name:
+                errors.append(self._error(
+                    transport.id, None, "audio_interface_not_selected",
+                    "audio interface must be selected before starting RX playback",
+                ))
+            elif config.audio.interface_driver not in {"wasapi", "coreaudio", "alsa", "asio"}:
+                errors.append(self._error(
+                    transport.id, None, "unsupported_audio_driver",
+                    f"audio driver '{config.audio.interface_driver}' is not supported for RX playback",
+                ))
+            for g in transport.encode_group_ids:
+                group = group_by_id.get(g)
+                if group and group.channel_count > config.audio.channel_count:
+                    errors.append(self._error(
+                        transport.id, group.id, "rx_output_channel_out_of_range",
+                        f"encode group '{group.id}' has {group.channel_count} decoded channels but the interface has {config.audio.channel_count} outputs",
                     ))
 
         if transport.direction == SrtTransportDirection.tx and transport.mode.value in {"caller", "rendezvous"} and not transport.host:
@@ -1195,49 +1217,6 @@ class MediaGraphBuilder:
             return args
         # unknown shouldn't reach here — the validator rejects it.
         raise ValueError(f"unsupported audio driver for dante capture: '{driver}'")
-
-    def _build_rx_argv(
-        self,
-        transport: SrtTransportConfig,
-        uri: str,
-        srt_element_name: str,
-        tap_name: str,
-    ) -> list[str]:
-        return [
-            self.gst_launch_executable,
-            "-m",
-            "srtsrc",
-            f"name={srt_element_name}",
-            f"uri={uri}",
-            "!",
-            "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,encoding-params=(string)1,payload=96",
-            "!",
-            "rtpjitterbuffer",
-            "latency=40",
-            "!",
-            "rtpopusdepay",
-            "!",
-            "tee",
-            f"name={tap_name}",
-            "allow-not-linked=true",
-            f"{tap_name}.",
-            "!",
-            "queue",
-            "!",
-            "opusdec",
-            "!",
-            "level",
-            f"name={self._rx_meter_element_name(transport.id)}",
-            "message=true",
-            "interval=100000000",
-            "!",
-            "audioconvert",
-            "!",
-            "audioresample",
-            "!",
-            "fakesink",
-            "sync=false",
-        ]
 
     def _source_element(self, source: SourceConfig) -> str:
         if source.kind in {SourceKind.tone, SourceKind.silence}:

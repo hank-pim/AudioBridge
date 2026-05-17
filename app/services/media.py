@@ -350,14 +350,10 @@ class MediaController:
                 "TX graph runs inside the legacy endpoint bundle (non-dante sources); the spine path was skipped"
             )
         else:
-            pipeline = self._spawn_managed_gst_pipeline(
-                name=f"srt_transport_{transport_id}_{transport.direction.value}",
-                graph=graph_plan["gstreamer"]["graph"],
-                srt_element_name=graph_plan["gstreamer"]["srt_element_name"],
-                transport_id=transport_id,
+            raise RuntimeError(
+                "RX transports require the always-on spine playback path; select a supported audio interface "
+                "and configure one decode/output group before starting RX"
             )
-            self._srt_transport_pipelines[transport_id] = pipeline
-            runtime_note = "RX graph planned from SRT ingress with a named monitor tap"
 
         self.telemetry.mark_srt_transport(transport_id, True)
         return {
@@ -493,7 +489,8 @@ class MediaController:
     def _config_with_tx_members(config: EndpointConfig, member_ids: set[str]) -> EndpointConfig:
         """Return an EndpointConfig view whose srt_transports keep only TX legs in ``member_ids``.
 
-        RX transports pass through unchanged so existing validators still see them.
+        The TX bundle planner ignores RX transports, so they can remain present
+        in this filtered view without reintroducing a standalone RX path.
         """
         kept = [
             transport for transport in config.srt_transports
