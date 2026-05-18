@@ -97,10 +97,10 @@ class MediaGraphBuilder:
                 errors.append(self._error(transport.id, None, "tx_transport_has_no_groups", "TX SRT transport has no encode groups"))
             for g in transport.encode_group_ids:
                 group = group_by_id.get(g)
-                if group and group.channel_count > 8:
+                if group and group.channel_count > 32:
                     errors.append(self._error(
-                        transport.id, group.id, "opus_multichannel_max_8",
-                        f"encode group '{group.id}' has {group.channel_count} channels; native multichannel OPUS supports up to 8",
+                        transport.id, group.id, "opus_channels_exceeds_limit",
+                        f"encode group '{group.id}' has {group.channel_count} channels; discrete OPUS over SRT supports up to 32",
                     ))
 
         if transport.direction == SrtTransportDirection.rx:
@@ -273,23 +273,31 @@ class MediaGraphBuilder:
         interleave_name = self._interleave_element_name(group.id)
         srt_name = self._srt_element_name(transport.id, transport.direction.value)
 
-        # Sink chain: interleave -> caps -> opusenc -> rtpopuspay -> srtsink.
+        # Sink chain: interleave -> caps(no channel positions) -> audioconvert
+        # -> opusenc -> mpegtsmux -> srtsink. MPEG-TS carries Opus caps in
+        # repeated PMT/PAT tables, so RX can join a running SRT stream after the
+        # first encoded buffer. RTP's rtpopuspay still cannot carry family=255.
         argv.extend([
             "interleave",
             f"name={interleave_name}",
             "!",
-            f"audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask){self._channel_mask_hex(n)}",
+            f"audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask)0x0",
+            "!",
+            "audioconvert",
             "!",
             "opusenc",
             f"bitrate={group.opus.bitrate_kbps * 1000}",
             "!",
-            "rtpopuspay",
-            "pt=96",
+            "mpegtsmux",
+            "alignment=7",
+            "pat-interval=900",
+            "pmt-interval=900",
             "!",
             "srtsink",
             f"name={srt_name}",
             f"uri={uri}",
             "wait-for-connection=true",
+            "async=false",
         ])
 
         # Shared dante capture node, only emitted if any channel needs it.
@@ -339,7 +347,7 @@ class MediaGraphBuilder:
                     "!",
                     "audioconvert",
                     "!",
-                    f"audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){self._channel_mask_bit_hex(n, channel.index)}",
+                    "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0",
                     "!",
                     "level",
                     f"name={self._meter_element_name(group.id, channel.index)}",
@@ -365,7 +373,7 @@ class MediaGraphBuilder:
                     "!",
                     "audioresample",
                     "!",
-                    f"audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){self._channel_mask_bit_hex(n, channel.index)}",
+                    "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0",
                     "!",
                     "level",
                     f"name={self._meter_element_name(group.id, channel.index)}",
@@ -390,7 +398,7 @@ class MediaGraphBuilder:
     # why TX SRT transports cannot each run in their own subprocess. The bundle
     # planner emits ONE gst-launch argv per endpoint that opens the capture device
     # exactly once and fans out (via a single deinterleave) into a per-TX sink
-    # chain (interleave -> opusenc -> rtpopuspay -> srtsink). See
+    # chain (interleave -> opusenc -> mpegtsmux -> srtsink). See
     # docs/single-pipeline-tx-plan.md for background.
 
     _BUNDLE_DEINTERLEAVE_NAME = "dante_in_shared"
@@ -522,18 +530,23 @@ class MediaGraphBuilder:
                 "interleave",
                 f"name={interleave_name}",
                 "!",
-                f"audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask){self._channel_mask_hex(n)}",
+                f"audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask)0x0",
+                "!",
+                "audioconvert",
                 "!",
                 "opusenc",
                 f"bitrate={group.opus.bitrate_kbps * 1000}",
                 "!",
-                "rtpopuspay",
-                "pt=96",
+                "mpegtsmux",
+                "alignment=7",
+                "pat-interval=900",
+                "pmt-interval=900",
                 "!",
                 "srtsink",
                 f"name={srt_name}",
                 f"uri={uri}",
                 "wait-for-connection=true",
+                "async=false",
             ])
 
             for channel in sorted(group.channels, key=lambda item: item.index):
@@ -552,7 +565,7 @@ class MediaGraphBuilder:
                         "!",
                         "audioconvert",
                         "!",
-                        f"audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){self._channel_mask_bit_hex(n, channel.index)}",
+                        "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0",
                         "!",
                         "level",
                         f"name={meter_name}",
@@ -578,7 +591,7 @@ class MediaGraphBuilder:
                         "!",
                         "audioresample",
                         "!",
-                        f"audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){self._channel_mask_bit_hex(n, channel.index)}",
+                        "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0",
                         "!",
                         "level",
                         f"name={meter_name}",
@@ -628,8 +641,8 @@ class MediaGraphBuilder:
     # Shared tail after interleave:
     #
     #   interleave name=il_<transport>_<group>
-    #     -> caps(N-channel + standard mask)
-    #     -> opusenc bitrate=<group> -> rtpopuspay pt=96
+    #     -> caps(N-channel + no position mask)
+    #     -> audioconvert -> opusenc bitrate=<group> -> mpegtsmux
     #     -> srtsink name=srtstats_tx_<transport> uri=<...> wait-for-connection=true
     #
     # entry_element_names is parallel to tap_names: each entry name (``in_K``)
@@ -688,8 +701,6 @@ class MediaGraphBuilder:
             source = source_by_id[channel.source_id or ""]
             entry_name = f"in_{channel.index}"
             meter_name = self._bundle_meter_name(transport.id, group.id, channel.index)
-            channel_pos_mask = self._channel_mask_bit_hex(n, channel.index)
-
             if source.kind == SourceKind.dante_input:
                 tap_names.append(self.spine_capture_tee_name(source.dante_channel or 1))
             else:
@@ -732,7 +743,7 @@ class MediaGraphBuilder:
             parts.append(
                 f"queue name={entry_name} "
                 f"! audioconvert "
-                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask){channel_pos_mask} "
+                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0 "
                 f"! level name={meter_name} message=true interval=100000000 "
                 f"! {interleave_name}.sink_{channel.index - 1}"
             )
@@ -745,10 +756,11 @@ class MediaGraphBuilder:
         # drops buffers until the peer is up.
         parts.append(
             f"interleave name={interleave_name} "
-            f"! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask){self._channel_mask_hex(n)} "
+            f"! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask)0x0 "
+            f"! audioconvert "
             f"! opusenc bitrate={group.opus.bitrate_kbps * 1000} "
-            f"! rtpopuspay pt=96 "
-            f"! srtsink name={srt_name} uri={uri} wait-for-connection=false"
+            f"! mpegtsmux alignment=7 pat-interval=900 pmt-interval=900 "
+            f"! srtsink name={srt_name} uri={uri} wait-for-connection=false async=false"
         )
         description = " ".join(parts)
 
@@ -806,12 +818,10 @@ class MediaGraphBuilder:
 
         parts: list[str] = [
             f"srtsrc name={srt_name} uri={uri}",
-            "! application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,encoding-params=(string)1,payload=96",
-            "! rtpjitterbuffer latency=40",
-            "! rtpopusdepay",
+            "! tsdemux",
             f"! tee name={tap_name} allow-not-linked=true",
             f"{tap_name}. ! queue ! opusdec ! audioconvert ! audioresample",
-            f"! audio/x-raw,format=S16LE,rate=48000,channels={n},layout=interleaved,channel-mask=(bitmask)0x0",
+            f"! audio/x-raw,format=S16LE,rate=48000,channels={n},layout=interleaved",
             f"! deinterleave name={split_name}",
         ]
         mixer_names: list[str] = []
@@ -840,7 +850,6 @@ class MediaGraphBuilder:
                     "mixer_names": [], "exit_element_names": [],
                     "srt_element_name": None, "meter_endpoints": [],
                 }
-            mixer_names.append(self.spine_playback_mixer_name(output_channel_idx))
             interaudio_channel = self.spine_playback_interaudio_channel(output_channel_idx)
             interaudio_channels.append(interaudio_channel)
             exit_name = f"out_{output_channel_idx}"
@@ -857,8 +866,9 @@ class MediaGraphBuilder:
                 f"! queue "
                 f"! level name={meter_name} message=true interval=100000000 "
                 f"! audioconvert "
-                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 "
-                f"! queue name={exit_name}"
+                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
+                f"! queue name={exit_name} "
+                f"! interaudiosink channel={interaudio_channel} sync=false async=false"
             )
 
         return {
@@ -903,7 +913,7 @@ class MediaGraphBuilder:
     #   interleave name=spine_out_interleave
     #     -> audioconvert
     #     -> audio/x-raw,format=S16LE,rate=48000,channels=N,layout=interleaved,channel-mask=(bitmask)0x0
-    #     -> asiosink name=spine_asiosink
+    #     -> asiosink name=spine_asiosink provide-clock=false sync=false async=false
     #
     # channel-mask=0x0 (no positions) is used on the N-channel buses because
     # standard surround masks are not defined past 8 channels and asiosink maps
@@ -915,6 +925,7 @@ class MediaGraphBuilder:
     SPINE_ASIOSINK_NAME = "spine_asiosink"
     SPINE_CAPTURE_SPLIT_NAME = "spine_capture_split"
     SPINE_PLAYBACK_INTERLEAVE_NAME = "spine_out_interleave"
+    SPINE_PLAYBACK_LEVEL_NAME = "spine_out_level"
 
     def spine_capture_tee_name(self, channel_index: int) -> str:
         """Capture-side tee that TX legs attach to. ``channel_index`` is 1-based."""
@@ -935,6 +946,20 @@ class MediaGraphBuilder:
 
     def spine_playback_interaudio_channel(self, channel_index: int) -> str:
         return f"spine_out_{channel_index}"
+
+    def spine_rx_clock_buffer_name(self, channel_index: int) -> str:
+        """Per-channel post-bridge queue that holds decoded RX audio between
+        the interaudiosrc and the audiomixer. Its ``max-size-time`` is the
+        free-running clock-recovery jitter buffer; the queue's ``current-level-time``
+        is the observable for adaptive control loops.
+        """
+        return f"rx_clkbuf_{channel_index}"
+
+    def spine_silence_queue_name(self, channel_index: int) -> str:
+        return f"spine_silence_q_{channel_index}"
+
+    def spine_silence_valve_name(self, channel_index: int) -> str:
+        return f"spine_silence_valve_{channel_index}"
 
     def plan_spine(self, config: EndpointConfig) -> dict[str, Any]:
         audio = config.audio
@@ -1024,14 +1049,19 @@ class MediaGraphBuilder:
                 "async=false",
             ])
 
-        # Playback chain: per-channel adder fed by a default silence source,
-        # then interleave -> asiosink. latency=0 and min-upstream-latency=0 keep
-        # the old audiomixer version from inserting its default 10ms cushion;
-        # adder is intentionally simpler here because it supports live dynamic
-        # request-pad linking without returning EMPTY caps on newly requested pads.
+        # Playback chain: per-channel audiomixer fed by an always-on silence
+        # audiotestsrc plus the matching interaudiosrc (which receives decoded
+        # RX audio via the bin's interaudiosink). The silence feeder keeps every
+        # interleave sink pad producing buffers even when no RX leg is paired,
+        # so the asiosink-facing aggregator never starves.
         argv.extend([
             "interleave",
             f"name={self.SPINE_PLAYBACK_INTERLEAVE_NAME}",
+            "!",
+            "level",
+            f"name={self.SPINE_PLAYBACK_LEVEL_NAME}",
+            "message=true",
+            "interval=100000000",
             "!",
             "audioconvert",
             "!",
@@ -1044,9 +1074,8 @@ class MediaGraphBuilder:
         ])
 
         for channel in range(1, n + 1):
+            interaudio_channel = self.spine_playback_interaudio_channel(channel)
             mixer_name = self.spine_playback_mixer_name(channel)
-            # The silence feeder is the always-on default input; RX legs add
-            # additional sink pads on the same mixer at runtime.
             argv.extend([
                 "audiomixer",
                 f"name={mixer_name}",
@@ -1068,6 +1097,23 @@ class MediaGraphBuilder:
                 "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0",
                 "!",
                 f"{mixer_name}.",
+                "interaudiosrc",
+                f"channel={interaudio_channel}",
+                "do-timestamp=false",
+                "!",
+                "audioconvert",
+                "!",
+                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0",
+                "!",
+                "queue",
+                f"name={self.spine_rx_clock_buffer_name(channel)}",
+                # Default 60ms post-bridge clock-recovery buffer; per-RX-transport
+                # overrides update max-size-time at attach time via g_object_set.
+                "max-size-time=60000000",
+                "max-size-buffers=0",
+                "max-size-bytes=0",
+                "!",
+                f"{mixer_name}.",
             ])
 
         graph = self._argv_to_graph(argv)
@@ -1076,12 +1122,13 @@ class MediaGraphBuilder:
             "errors": [],
             "channel_count": n,
             "capture_tee_names": [self.spine_capture_tee_name(c) for c in range(1, n + 1)],
-            "playback_mixer_names": [self.spine_playback_mixer_name(c) for c in range(1, n + 1)],
+            "playback_mixer_names": [self.spine_playback_interaudio_channel(c) for c in range(1, n + 1)],
             "gstreamer": {
                 "argv": argv,
                 "graph": graph,
                 "asiosrc_element_name": self.SPINE_ASIOSRC_NAME,
                 "asiosink_element_name": self.SPINE_ASIOSINK_NAME,
+                "playback_level_element_name": self.SPINE_PLAYBACK_LEVEL_NAME,
             },
         }
 
@@ -1193,6 +1240,7 @@ class MediaGraphBuilder:
                 args.append(f'device-clsid="{{{device.strip("{}")}}}"')
             if asio_channels:
                 args.append(f"output-channels={','.join(str(channel) for channel in asio_channels)}")
+            args.extend(["provide-clock=false", "sync=false", "async=false"])
             return args
         raise ValueError(f"unsupported audio driver for dante playback: '{driver}'")
 
@@ -1280,42 +1328,6 @@ class MediaGraphBuilder:
         safe_group = "".join(char if char.isalnum() else "_" for char in group_id)
         return f"dante_in_{safe_group}"
 
-    @staticmethod
-    def _channel_mask_hex(channels: int) -> str:
-        # Standard speaker masks for 1..8 channels matching gstreamer/Vorbis-order
-        # surround layouts. opusenc uses these to set channel_mapping_family=1.
-        masks = {
-            1: 0x4,    # mono (front center)
-            2: 0x3,    # stereo (front L, R)
-            3: 0x7,    # 3.0 (front L, R, C)
-            4: 0x33,   # quad
-            5: 0x37,   # 5.0
-            6: 0x3F,   # 5.1
-            7: 0x70F,  # 6.1
-            8: 0x63F,  # 7.1
-        }
-        return f"0x{masks.get(channels, 0):x}"
-
-    @staticmethod
-    def _channel_mask_bit_hex(channels: int, channel_index: int) -> str:
-        # Per-mono-leg channel positions must add up to the interleaved output
-        # mask, otherwise opusenc produces unknown-position caps that rtpopuspay
-        # cannot negotiate.
-        bits = {
-            1: [0x4],
-            2: [0x1, 0x2],
-            3: [0x1, 0x2, 0x4],
-            4: [0x1, 0x2, 0x10, 0x20],
-            5: [0x1, 0x2, 0x4, 0x10, 0x20],
-            6: [0x1, 0x2, 0x4, 0x8, 0x10, 0x20],
-            7: [0x1, 0x2, 0x4, 0x8, 0x100, 0x200, 0x400],
-            8: [0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x200, 0x400],
-        }
-        selected = bits.get(channels, [])
-        if channel_index < 1 or channel_index > len(selected):
-            return "0x0"
-        return f"0x{selected[channel_index - 1]:x}"
-
     def _rx_meter_element_name(self, transport_id: str, channel_index: int = 1) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
         return f"dbmeter_in_{safe_transport}_{channel_index}"
@@ -1328,7 +1340,7 @@ class MediaGraphBuilder:
         return {
             "id": self._rx_monitor_tap_name(transport_id),
             "direction": "rx",
-            "stage": "post-depay-pre-decode",
+            "stage": "post-demux-pre-decode",
             "codec": "opus",
             "channel_index": 1,
         }
@@ -1340,7 +1352,7 @@ class MediaGraphBuilder:
                 taps.append({
                     "id": self._tx_monitor_tap_name(transport.id, group.id, channel.index),
                     "direction": transport.direction.value,
-                    "stage": "post-encode-pre-pay",
+                    "stage": "post-encode-pre-mux",
                     "codec": "opus",
                     "group_id": group.id,
                     "channel_index": channel.index,

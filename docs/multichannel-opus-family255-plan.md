@@ -1,14 +1,14 @@
-# Multichannel Opus via family=255 / Ogg over SRT — Implementation Plan
+# Multichannel Opus via family=255 / MPEG-TS over SRT — Implementation Plan
 
 ## Why
 
 The current code path (`opusenc → rtpopuspay`) forces `channel-mapping-family=1` for N>2 channels, which assumes a Vorbis/SMPTE surround layout. For encode groups of 6/7/8 channels, the LFE slot is heavily lowpassed (~120 Hz) by `opusenc` — corrupting one channel for users routing discrete mono feeds (mics, talkback buses, etc.). Production code has additionally never worked at N>2 due to three latent bugs (see "Production bugs found" below).
 
-`channel-mapping-family=255` is Opus's "discrete channels, no layout" mode — no LFE treatment, no surround assumptions, supports up to 255 channels. RTP's stock GStreamer payloader (`rtpopuspay`) rejects family=255 caps; Ogg/Opus does not. Since both ends of every transport (SRT today, WebRTC later) are owned by dantebridge itself, we are not bound by RFC 7587 / MULTIOPUS / browser interop constraints, so we can use Ogg/Opus framing freely.
+`channel-mapping-family=255` is Opus's "discrete channels, no layout" mode — no LFE treatment, no surround assumptions, supports up to 255 channels. RTP's stock GStreamer payloader (`rtpopuspay`) rejects family=255 caps; both Ogg/Opus and MPEG-TS/Opus can carry it. The production SRT path uses MPEG-TS because TS repeats stream metadata and allows receivers to join a running stream after startup; raw Ogg headers are one-shot and can be missed when `srtsink wait-for-connection=false` is used to keep the always-on DVS spine from stalling.
 
 Verified in loopback ([scripts/opus_8ch_loopback.ps1](../scripts/opus_8ch_loopback.ps1)): 8 discrete channels round-trip cleanly with no LFE corruption, latency parity with the RTP path.
 
-Verified on DVS hardware ([scripts/opus_2ch_dvs_loopback.ps1](../scripts/opus_2ch_dvs_loopback.ps1)): DVS input channels 1/2 round-trip through `asiosrc -> opusenc -> oggmux -> SRT localhost -> oggdemux -> opusdec -> asiosink` and are audible on DVS output channels 1/2 in one full-duplex GStreamer process.
+Verified on DVS hardware ([scripts/opus_2ch_dvs_loopback.ps1](../scripts/opus_2ch_dvs_loopback.ps1)): DVS input channels 1/2 round-trip through `asiosrc -> opusenc -> oggmux -> SRT localhost -> oggdemux -> opusdec -> asiosink` and are audible on DVS output channels 1/2 in one full-duplex GStreamer process. The app production path now uses `mpegtsmux/tsdemux` for late-join safety.
 
 ## Production bugs the current code has (all become moot under this plan)
 
@@ -29,7 +29,7 @@ interleave → caps(channels=N, mask=<surround-layout>) → opusenc → rtpopusp
 
 After:
 ```
-interleave → caps(channels=N, mask=0) → audioconvert → opusenc → oggmux(max-delay=20ms, max-page-delay=20ms) → srtsink
+interleave → caps(channels=N, mask=0) → audioconvert → opusenc → mpegtsmux(alignment=7, pat/pmt interval=900 ticks) → srtsink
 ```
 
 Per-channel source legs also use `channel-mask=(bitmask)0x0` instead of position bits.
@@ -43,13 +43,13 @@ srtsrc → application/x-rtp,encoding-name=OPUS,... → rtpjitterbuffer → rtpo
 
 After:
 ```
-srtsrc → oggdemux → opusdec → audio/x-raw,channels=N → deinterleave
+srtsrc → tsdemux → opusdec → audio/x-raw,channels=N → deinterleave
 ```
 
 **⚠️ CRITICAL RX CAPS CONSTRAINT**:
-Do **not** apply `channel-mask=(bitmask)0x0` to the RX legs downstream of `opusdec` or the shared RX spine. The `tx_ic` leg strips channel masks easily, but `opusdec` dynamically restores standard pseudo-stereo/surround multichannel layouts upon decode. Forcing `0x0` on the RX spine causes `audioconvert` to fail its format negotiation (`reason not-negotiated (-4)`), which bubbles upstream and causes `oggdemux` to throw a fatal `delayed linking failed` error. RX caps should tightly define `format`, `rate`, and `channels` and let GStreamer handle the spatial mask downstream naturally.
+Do **not** apply `channel-mask=(bitmask)0x0` to the RX legs downstream of `opusdec` or the shared RX spine. The `tx_ic` leg strips channel masks easily, but `opusdec` dynamically restores standard pseudo-stereo/surround multichannel layouts upon decode. Forcing `0x0` on the RX spine causes `audioconvert` to fail its format negotiation (`reason not-negotiated (-4)`), which bubbles upstream and causes the demuxer to throw a fatal delayed-linking error. RX caps should tightly define `format`, `rate`, and `channels` and let GStreamer handle the spatial mask downstream naturally.
 
-The `tee` for monitor taps moves to sit between `oggdemux` and `opusdec` (or stays where it is — same allow-not-linked semantics either way).
+The `tee` for monitor taps sits between `tsdemux` and `opusdec` (or stays where it is — same allow-not-linked semantics either way).
 
 ### DVS playback/output spine findings
 
@@ -94,16 +94,16 @@ ASIO endpoints effectively enforce single-client constraints. If a pipeline cras
 
 The two-Dante-LAN clock-bridging mechanism in [planv2.md:44-58](../planv2.md) is **downstream of the decoder and operates on PCM**. It is unaffected by the codec/framing choice. What matters for the clock-recovery path:
 
-| Requirement | RTP/Opus path | Ogg/Opus path |
+| Requirement | RTP/Opus path | MPEG-TS/Opus path |
 |---|---|---|
 | Regular PCM frame cadence from decoder | Yes (Opus 20 ms frames) | Yes (same Opus frames) |
 | Coherent buffer timestamps | Yes | Yes |
-| No mid-stream sample drops/dupes | Yes | Yes — oggdemux passes packets through |
+| No mid-stream sample drops/dupes | Yes | Yes — tsdemux passes packets through |
 | Network jitter absorption | SRT `latency_ms` + `rtpjitterbuffer` | SRT `latency_ms` only |
 
 The load-bearing jitter buffer in this app is **SRT's**, not the RTP one — confirmed by the existing config flow ([media_graph.py:801](../app/services/media_graph.py)). Dropping `rtpjitterbuffer` removes a second-order buffer; SRT's `latency_ms` continues to do the real work.
 
-**Latency**: verified equivalent in standalone loopback ([scripts/opus_latency_compare.ps1](../scripts/opus_latency_compare.ps1)) — Ogg path measured 89 ms avg vs RTP path 98 ms (delta dominated by `rtpjitterbuffer latency=20` overhead, both numbers swamped by GStreamer process startup).
+**Latency**: verified equivalent in standalone loopback ([scripts/opus_latency_compare.ps1](../scripts/opus_latency_compare.ps1)) — the Opus frame cadence is unchanged, and MPEG-TS adds only lightweight framing while preserving SRT as the load-bearing jitter buffer.
 
 ## Tests
 
@@ -116,7 +116,7 @@ Assertions matching the following strings need rewriting against the new pipelin
 - `opus_multichannel_max_8`
 
 Replacement assertions:
-- `oggmux max-delay=...`, `oggdemux`
+- `mpegtsmux alignment=7 pat-interval=900 pmt-interval=900`, `tsdemux`
 - Input caps with `channel-mask=(bitmask)0x0`
 - 8-channel happy-path test (was previously impossible)
 - 32-channel boundary test (validate cap)
@@ -152,6 +152,17 @@ Update [planv2.md:28](../planv2.md) to reflect:
 8. Revalidate the production dynamic playback spine against that static model. If mixer/adder fan-in is used, prove it drives DVS output, not just internal GStreamer meters.
 9. Smoke-test on actual Dante hardware (single endpoint, then full bridge between two Dante LANs).
 10. Update [planv2.md](../planv2.md) and any references in [docs/](.) that mention rtpopuspay/MULTIOPUS/family=1.
+
+## Clock-recovery wiring carried in alongside this work
+
+The multichannel-opus refactor lands at the same time as the spine's per-channel `rx_clkbuf_K` queue (post-bridge clock-recovery reservoir) and the per-transport `clock_recovery_mode` / `free_running_clock` override path. Both modes are exercised by the loopback and Dante smoke tests above. Status carried forward into this commit:
+
+- **Free-running mode**: fully wired. Per-RX-transport `jitter_buffer_ms` lands at `rx_clkbuf_K.max-size-time` via `CtypesManagedPipeline.set_queue_max_size_time` at attach time. Verified by `GET /api/diagnostics/rx-clock-buffers`.
+- **Adaptive mode**: schema present (`AdaptiveClockConfig` in `config.py`), pipeline scaffolding present (queue exists, fill is observable), but no rate-slewing element and no control loop yet. RX legs in adaptive mode currently behave as a fixed 60 ms free-run.
+- **Per-transport adaptive override**: not yet — `adaptive_clock` is program-only today. Add `adaptive_clock: AdaptiveClockConfig | None` to `SrtTransportConfig` and an `initial_buffer_ms` field to `AdaptiveClockConfig` so adaptive mode has an explicit, per-transport starting depth applied to `rx_clkbuf_K` at attach time (same code path as free-running).
+- **Rate-slewing**: deferred to its own workstream after the multichannel-opus commit. Inserts `audioresample` per channel (or one multichannel resampler post-interleave per the planv2 "Resampler structure" note), driven by a per-RX-leg control loop that watches `rx_clkbuf_K.current-level-time` and emits a ratio clamped to `±ratio_clamp_ppm`. Lock state pipes to existing `telemetry.observe_clock(lock_state=...)`.
+
+Tests added during multichannel-opus work should assert: (a) the queue is named `rx_clkbuf_K` and is present per output channel, (b) `max-size-time` matches the resolved per-transport override at attach time, and (c) `/api/diagnostics/rx-clock-buffers` reports the expected depths for a fixture with mixed free-running and adaptive RX transports.
 
 ## Out of scope (deferred)
 

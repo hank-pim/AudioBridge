@@ -25,7 +25,7 @@ A point-to-point bridge that extends a Dante audio network across the open inter
 
 ## Program path (SRT + OPUS)
 
-- Single OPUS multichannel encoder (`channel_mapping_family=1`) feeds one RTP/OPUS stream over SRT. All channels share encoder framing, which preserves inter-channel phase alignment — critical for stereo imaging and multi-mic capture. Per-channel taps live pre-encode (after `level`, before `interleave`) so monitoring and metering remain per-channel.
+- Single OPUS multichannel encoder feeds one MPEG-TS/Opus bytestream over SRT using channel mapping family 255 (discrete channels, no surround layout). All channels share encoder framing, which preserves inter-channel phase alignment — critical for stereo imaging and multi-mic capture. Per-channel taps live pre-encode (after `level`, before `interleave`) so monitoring and metering remain per-channel. MPEG-TS repeats stream metadata so receivers can join a running SRT stream, unlike raw Ogg/Opus headers that are only sent at stream start. This avoids family 1's LFE/surround assumptions, which would corrupt one slot in 6/7/8-channel groups carrying unrelated mono feeds. Trade-off: discrete mode gives up stereo intensity coupling efficiency for paired program audio, acceptable because the bridge primarily carries discrete Dante channels.
 - Configurable per stream: OPUS bitrate, frame size, complexity, in-band FEC on/off, expected packet-loss percentage.
 - SRT mode selectable: caller, listener, or rendezvous. Defaults presented based on which side has a public IP/open port.
 - Configurable SRT latency window (the dominant tuning knob); UI surfaces it on the main screen with a recommended starting value derived from measured RTT.
@@ -70,6 +70,27 @@ The receiver's Dante audio clock and the sender's Dante audio clock are independ
 - Adaptive for almost everyone. Audibly invisible. Compatible with continuous live downstream chains.
 - Free-running for workflows with explicit glitch-tolerant re-sync points.
 - Sample-accurate sync across the bridge is **not possible** on open-internet point-to-point; that requires a shared timing reference (PTP grandmaster, GPS-disciplined references, or equivalent), which by definition means both sites are on a single logical network and should route Dante natively over a layer-2 transport rather than encode/decode through this bridge.
+
+**Implementation status (as of multichannel-opus pre-commit):**
+
+- Spine playback chain instantiates one `queue name=rx_clkbuf_K` per output channel between `interaudiosrc` and `audiomixer.sink_K`. This is the post-bridge clock-recovery reservoir; its `max-size-time` is the configured jitter-buffer depth, and `current-level-time` is the observable for the adaptive loop. Default depth at spine build time: 60 ms.
+- Diagnostic surface: `GET /api/diagnostics/rx-clock-buffers` reports `max-size-time / current-level-time / current-level-buffers` per channel. Used to verify per-transport overrides land.
+- Free-running mode is wired end-to-end: `SrtTransportConfig.clock_recovery_mode = free_running` + `free_running_clock.jitter_buffer_ms` → resolved at RX attach in `media.py` → pushed onto the spine queue via `CtypesManagedPipeline.set_queue_max_size_time`. Per-transport override falls back to `program.clock_recovery_mode` / `program.free_running_clock` when unset.
+- Adaptive mode currently does **nothing** in the pipeline. `AdaptiveClockConfig` (convergence window, lock PPM threshold, lock hold, ratio clamp) is declared in `config.py` but not yet wired. RX legs in adaptive mode currently fall through to the default 60 ms queue depth — i.e. equivalent to a 60 ms free-run today.
+
+**Remaining work to honor the documented adaptive design:**
+
+1. **Per-transport adaptive surface.** Add `adaptive_clock: AdaptiveClockConfig | None` override to `SrtTransportConfig` (mirrors the existing per-transport `free_running_clock` field). Add an `initial_buffer_ms` field to `AdaptiveClockConfig` so adaptive mode has an explicit starting depth applied to `rx_clkbuf_K.max-size-time` at attach time, the same way free-running's `jitter_buffer_ms` is.
+2. **Rate-slewing element insertion.** Insert one `audioresample` per channel between `interaudiosrc` and the `rx_clkbuf_K` queue (or move the whole chain through a single multichannel resampler post-interleave, per the "Resampler structure" section above — TBD by the spine-shape work). The resample ratio is the control-loop output.
+3. **Adaptive control loop.** Periodic task (sub-second tick) per active RX leg:
+   - Read `rx_clkbuf_K.current-level-time` and tail of underrun events.
+   - Frequency-lock estimator: integrate fill drift over the configured `convergence_window_seconds` to derive ppm offset.
+   - Phase-trim PI: low-gain correction toward a target depth (typ. half `initial_buffer_ms`).
+   - Output ratio clamped to `±ratio_clamp_ppm`; written to the per-channel `audioresample` via `g_object_set` on a runtime-settable property (likely needs the `audioresample` ratio surfaced as a custom property or driven via `gst_segment` math — confirm during impl).
+   - Lock state emitted to telemetry (`telemetry.observe_clock(lock_state=...)`); UI's existing "locking → locked" indicator already consumes it.
+4. **Telemetry.** Expose per-RX-channel `buffer_fill_ms`, `estimated_ppm_offset`, and `slip_count` on the existing status snapshot. The diagnostic endpoint added in step 1 (`/api/diagnostics/rx-clock-buffers`) becomes the per-channel-fill source; the ppm/slip data is loop-side bookkeeping.
+
+**Test plan (low-vs-high-latency sweep):** today, switch the transport to `free_running` and sweep `jitter_buffer_ms`. End-to-end wiring is validated. Once step 1 lands, the same sweep works under `adaptive` mode via `initial_buffer_ms`.
 
 ## Talkback path (WebRTC + OPUS)
 

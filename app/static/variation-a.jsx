@@ -2098,7 +2098,7 @@ function StreamDrawer({ ch, onClose }) {
               <Field label="Channels" w={90}>
                 <input type="number" min={1} max={255} value={channelCount}
                        onChange={e => setChannelCount(e.target.value)}
-                       title="OPUS supports up to 255 channels (multistream). TX currently encodes up to 8 channels natively; >8 requires multistream encoding in the gstreamer pipeline — not yet wired, will fail to start."
+                       title="Discrete Ogg/Opus over SRT currently supports up to 32 channels per encode group."
                        className="ab-mono" style={{ ...cfgInputStyle, height: 22 }} />
               </Field>
             )}

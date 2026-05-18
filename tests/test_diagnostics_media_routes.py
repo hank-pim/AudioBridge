@@ -380,7 +380,7 @@ def test_srt_transport_lifecycle_updates_only_selected_transport(monkeypatch) ->
         start_response = client.post("/api/srt-transports/tx-a/start", json={})
         assert start_response.status_code == 200
         assert len(attach_calls) == 1
-        assert attach_calls[0]["mixer_names"] == ["spine_out_mix_1"]
+        assert attach_calls[0]["mixer_names"] == []
         assert attach_calls[0]["exit_element_names"] == ["out_1"]
         assert "uri=srt://:9100?mode=listener&latency=240" in attach_calls[0]["description"]
         assert "tee name=monitor_tap_rx_tx_a allow-not-linked=true" in attach_calls[0]["description"]
@@ -655,13 +655,14 @@ def test_media_graph_plan_exposes_tx_graph_from_configured_tone_sources() -> Non
         assert transport_plan["sources"] == [
             {"group_id": "enc-main", "channel_index": 1, "source_id": "tone-l", "kind": "tone", "name": "Tone L"},
         ]
-        assert "rtpopuspay" in transport_plan["gstreamer"]["graph"]
+        assert "mpegtsmux alignment=7 pat-interval=900 pmt-interval=900" in transport_plan["gstreamer"]["graph"]
+        assert "rtpopuspay" not in transport_plan["gstreamer"]["graph"]
         assert "srtsink" in transport_plan["gstreamer"]["graph"]
         assert transport_plan["gstreamer"]["monitor_taps"] == [
             {
                 "id": "monitor_tap_tx_srt_main_enc_main_1",
                 "direction": "tx",
-                "stage": "post-encode-pre-pay",
+                "stage": "post-encode-pre-mux",
                 "codec": "opus",
                 "group_id": "enc-main",
                 "channel_index": 1,
@@ -670,10 +671,11 @@ def test_media_graph_plan_exposes_tx_graph_from_configured_tone_sources() -> Non
         ]
         assert "level" in transport_plan["gstreamer"]["argv"]
         assert "name=dbmeter_out_enc_main_1" in transport_plan["gstreamer"]["argv"]
-        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1,channel-mask=(bitmask)0x4" in transport_plan["gstreamer"]["argv"]
-        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x4" in transport_plan["gstreamer"]["argv"]
+        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1,channel-mask=(bitmask)0x0" in transport_plan["gstreamer"]["argv"]
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0" in transport_plan["gstreamer"]["argv"]
         assert "name=monitor_tap_tx_srt_main_enc_main_1" in transport_plan["gstreamer"]["argv"]
         assert "wait-for-connection=true" in transport_plan["gstreamer"]["argv"]
+        assert "async=false" in transport_plan["gstreamer"]["argv"]
         assert "freq=440.0" in transport_plan["gstreamer"]["argv"]
         assert "uri=srt://:9100?mode=listener&latency=240" in transport_plan["gstreamer"]["argv"]
 
@@ -724,13 +726,16 @@ def test_media_graph_plan_exposes_rx_monitor_tap() -> None:
             {
                 "id": "monitor_tap_rx_srt_rx",
                 "direction": "rx",
-                "stage": "post-depay-pre-decode",
+                "stage": "post-demux-pre-decode",
                 "codec": "opus",
                 "channel_index": 1,
             }
         ]
         graph = transport_plan["gstreamer"]["graph"]
         assert "srtsrc name=srtstats_rx_srt_rx" in graph
+        assert "tsdemux" in graph
+        assert "rtpopusdepay" not in graph
+        assert "rtpjitterbuffer" not in graph
         assert "tee name=monitor_tap_rx_srt_rx" in graph
         assert "level name=dbmeter_in_srt_rx_1" in graph
         assert "queue name=out_1" in graph
@@ -837,6 +842,74 @@ def test_media_graph_plan_reports_validation_errors() -> None:
         }.issubset(codes)
 
 
+def test_media_graph_plan_accepts_32_channel_opus_group() -> None:
+    with TestClient(create_app()) as client:
+        channels = [{"index": index, "source_id": f"tone-{index}"} for index in range(1, 33)]
+        response = client.put(
+            "/api/config",
+            json={
+                "sources": [
+                    {"id": f"tone-{index}", "name": f"Tone {index}", "kind": "tone", "tone_frequency_hz": 400 + index}
+                    for index in range(1, 33)
+                ],
+                "encode_groups": [
+                    {"id": "enc-32", "name": "32ch", "channel_count": 32, "channels": channels},
+                ],
+                "srt_transports": [
+                    {
+                        "id": "tx-32",
+                        "name": "TX 32",
+                        "direction": "tx",
+                        "mode": "listener",
+                        "port": 9100,
+                        "encode_group_ids": ["enc-32"],
+                    },
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+        plan = client.get("/api/media/graph-plan").json()
+
+        assert plan["valid"] is True, plan["errors"]
+        graph = plan["srt_transports"][0]["gstreamer"]["graph"]
+        assert "channels=32,channel-mask=(bitmask)0x0" in graph
+        assert "mpegtsmux alignment=7 pat-interval=900 pmt-interval=900" in graph
+
+
+def test_media_graph_plan_rejects_33_channel_opus_group() -> None:
+    with TestClient(create_app()) as client:
+        channels = [{"index": index, "source_id": f"tone-{index}"} for index in range(1, 34)]
+        response = client.put(
+            "/api/config",
+            json={
+                "sources": [
+                    {"id": f"tone-{index}", "name": f"Tone {index}", "kind": "tone", "tone_frequency_hz": 400 + index}
+                    for index in range(1, 34)
+                ],
+                "encode_groups": [
+                    {"id": "enc-33", "name": "33ch", "channel_count": 33, "channels": channels},
+                ],
+                "srt_transports": [
+                    {
+                        "id": "tx-33",
+                        "name": "TX 33",
+                        "direction": "tx",
+                        "mode": "listener",
+                        "port": 9100,
+                        "encode_group_ids": ["enc-33"],
+                    },
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+        plan = client.get("/api/media/graph-plan").json()
+
+        assert plan["valid"] is False
+        assert any(error["code"] == "opus_channels_exceeds_limit" for error in plan["errors"])
+
+
 def test_tx_dante_capture_uses_shared_deinterleave_per_os() -> None:
     """A TX group with dante_input channels must emit one shared capture node
     (per the configured driver) followed by deinterleave; per-channel branches
@@ -895,10 +968,8 @@ def test_tx_dante_capture_uses_shared_deinterleave_per_os() -> None:
         assert "dante_in_enc_mix.src_4 !" in graph
         # The silence channel still uses audiotestsrc.
         assert "audiotestsrc is-live=true wave=silence" in graph
-        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=3,channel-mask=(bitmask)0x7" in graph
-        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x1" in graph
-        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x2" in graph
-        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x4" in graph
+        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=3,channel-mask=(bitmask)0x0" in graph
+        assert graph.count("audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0") == 3
         # Each channel terminates at the matching interleave sink pad.
         assert "il_enc_mix.sink_0" in graph
         assert "il_enc_mix.sink_1" in graph
@@ -1215,17 +1286,19 @@ def test_tx_srt_transport_start_uses_graph_plan(monkeypatch) -> None:
         bundle_name, graph, srt_endpoints = spawned[0]
         assert bundle_name == "tx_bundle_tx-main"
         assert srt_endpoints == [("tx-main", "srtstats_tx_tx_main")]
-        assert "rtpopuspay" in graph
+        assert "mpegtsmux alignment=7 pat-interval=900 pmt-interval=900" in graph
+        assert "rtpopuspay" not in graph
         assert "srtsink" in graph
         assert "audiotestsrc" in graph
         assert "level" in graph
         # Bundle names embed the transport id so two TX legs sharing an encode
         # group won't collide on element names.
         assert "name=dbmeter_out_tx_main_enc_main_1" in graph
-        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1,channel-mask=(bitmask)0x4" in graph
-        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x4" in graph
+        assert "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1,channel-mask=(bitmask)0x0" in graph
+        assert "audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0" in graph
         assert "tee name=monitor_tap_tx_tx_main_enc_main_1 allow-not-linked=true" in graph
         assert "wait-for-connection=true" in graph
+        assert "async=false" in graph
         assert "freq=440.0" in graph
         assert "uri=srt://:9100?mode=listener&latency=240" in graph
 
@@ -1273,6 +1346,33 @@ def test_bundled_pipeline_attributes_meters_per_transport() -> None:
     remaining = telemetry._meter_snapshot_by_transport()
     assert "tx-a" not in remaining
     assert "tx-b" in remaining
+
+
+def test_spine_output_level_message_updates_global_output_meters() -> None:
+    from app.services.gst_runtime import CtypesManagedPipeline
+
+    telemetry = media_module.TelemetryService()
+    pipeline = CtypesManagedPipeline(
+        name="spine",
+        graph="",
+        telemetry=telemetry,
+        runtime=None,  # type: ignore[arg-type]
+        pipeline=0,
+        srt_endpoints=[],
+        bus=None,
+    )
+
+    pipeline._observe_level(
+        "spine_out_level",
+        "level, rms=(GValueArray)< -12.5, -24.25 >, peak=(GValueArray)< -3.0, -6.5 >;",
+    )
+
+    status = telemetry.snapshot(media_module.EndpointConfig.model_validate({"audio": {"channel_count": 2}}))
+    assert status["meters"]["outputs"] == [
+        {"channel": 1, "peak_dbfs": -3.0, "rms_dbfs": -12.5},
+        {"channel": 2, "peak_dbfs": -6.5, "rms_dbfs": -24.25},
+    ]
+    assert status["meters_by_transport"]["spine"]["outputs"] == status["meters"]["outputs"]
 
 
 def test_media_controller_parses_gstreamer_level_messages() -> None:
@@ -1473,7 +1573,7 @@ def test_plan_spine_full_duplex_shape() -> None:
         "spine_in_tee_1", "spine_in_tee_2", "spine_in_tee_3", "spine_in_tee_4",
     ]
     assert plan["playback_mixer_names"] == [
-        "spine_out_mix_1", "spine_out_mix_2", "spine_out_mix_3", "spine_out_mix_4",
+        "spine_out_1", "spine_out_2", "spine_out_3", "spine_out_4",
     ]
 
     graph = plan["gstreamer"]["graph"]
@@ -1483,10 +1583,15 @@ def test_plan_spine_full_duplex_shape() -> None:
     assert graph.count("name=spine_asiosink") == 1
     assert plan["gstreamer"]["asiosrc_element_name"] == "spine_asiosrc"
     assert plan["gstreamer"]["asiosink_element_name"] == "spine_asiosink"
+    assert plan["gstreamer"]["playback_level_element_name"] == "spine_out_level"
     # ASIO channel selection covers 0..N-1 explicitly so deinterleave ordering
     # matches Dante channel numbers.
     assert "input-channels=0,1,2,3" in graph
     assert "output-channels=0,1,2,3" in graph
+    assert "level name=spine_out_level message=true interval=100000000" in graph
+    assert "provide-clock=false" in graph
+    assert "sync=false" in graph
+    assert "async=false" in graph
     assert "audio/x-raw,format=S16LE,rate=48000,channels=4,layout=interleaved,channel-mask=(bitmask)0x0" in graph
     # Single shared deinterleave -> N tees with a per-channel input level meter
     # between the queue and tee. The level meters double as Dante-input metering
@@ -1498,18 +1603,16 @@ def test_plan_spine_full_duplex_shape() -> None:
         assert f"level name=dbmeter_in_spine_{channel} message=true interval=100000000" in graph
         assert f"spine_in_tee_{channel}. ! queue ! fakesink sync=false async=false" in graph
     assert graph.count("fakesink sync=false async=false") == 4
-    # One interleave on the playback side, fed by N adders. adder keeps the
-    # output attach points dynamically linkable after the spine is already PLAYING.
+    # One interleave on the playback side, fed by N interaudiosrc elements.
+    # RX branches write to matching interaudiosink channels.
     assert "interleave name=spine_out_interleave" in graph
-    for mixer in plan["playback_mixer_names"]:
+    for channel in plan["playback_mixer_names"]:
         assert (
-            f"audiomixer name={mixer} latency=20000000 ! audioconvert ! "
-            "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 "
-            "! queue ! spine_out_interleave"
+            f"interaudiosrc channel={channel} do-timestamp=true buffer-time=20000000 "
+            "latency-time=20000000 period-time=10000000 ! audioconvert ! "
+            "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
+            "! spine_out_interleave"
         ) in graph
-    # Default silence feeders keep each mixer producing buffers when no RX
-    # leg is attached, so asiosink never starves.
-    assert graph.count("audiotestsrc is-live=true wave=silence") == 4
 
 
 def test_plan_spine_rejects_unset_audio_interface() -> None:
@@ -1780,7 +1883,7 @@ def test_plan_rx_leg_branch_emits_mixer_outputs_and_no_fakesink() -> None:
 
     plan = MediaGraphBuilder().plan_rx_leg_branch(cfg, "rx-a")
     assert plan["valid"] is True, plan["errors"]
-    assert plan["mixer_names"] == ["spine_out_mix_1", "spine_out_mix_2"]
+    assert plan["mixer_names"] == []
     assert plan["exit_element_names"] == ["out_1", "out_2"]
     assert plan["srt_element_name"] == "srtstats_rx_rx_a"
     desc = plan["branch_description"]
@@ -1788,8 +1891,8 @@ def test_plan_rx_leg_branch_emits_mixer_outputs_and_no_fakesink() -> None:
     assert "deinterleave name=rx_split_rx_a" in desc
     assert "rx_split_rx_a.src_0 ! queue ! level name=dbmeter_in_rx_a_1" in desc
     assert "rx_split_rx_a.src_1 ! queue ! level name=dbmeter_in_rx_a_2" in desc
-    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 ! queue name=out_1" in desc
-    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0 ! queue name=out_2" in desc
+    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_1 ! interaudiosink channel=spine_out_1 sync=false async=false" in desc
+    assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_2 ! interaudiosink channel=spine_out_2 sync=false async=false" in desc
     assert "fakesink" not in desc
 
 

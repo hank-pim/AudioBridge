@@ -138,6 +138,11 @@ class SrtTransportDirection(str, Enum):
     rx = "rx"
 
 
+class FreeRunningClockConfig(BaseModel):
+    jitter_buffer_ms: int = Field(default=500, ge=20, le=5000)
+    underrun_policy: Literal["silence", "repeat_last_sample"] = "silence"
+
+
 class SrtTransportConfig(BaseModel):
     id: str
     name: str
@@ -151,6 +156,9 @@ class SrtTransportConfig(BaseModel):
     passphrase: SecretStr | None = None
     encode_group_ids: list[str] = Field(default_factory=list)
     enabled: bool = True
+    # Per-transport overrides for clock recovery. None inherits from program.
+    clock_recovery_mode: ClockRecoveryMode | None = None
+    free_running_clock: FreeRunningClockConfig | None = None
 
 
 class StreamConfig(BaseModel):
@@ -203,11 +211,6 @@ class AdaptiveClockConfig(BaseModel):
     lock_ppm_threshold: float = Field(default=1.0, ge=0.1, le=10)
     lock_hold_seconds: int = Field(default=30, ge=5, le=120)
     ratio_clamp_ppm: float = Field(default=50.0, ge=1, le=200)
-
-
-class FreeRunningClockConfig(BaseModel):
-    jitter_buffer_ms: int = Field(default=500, ge=20, le=5000)
-    underrun_policy: Literal["silence", "repeat_last_sample"] = "silence"
 
 
 class ProgramConfig(BaseModel):

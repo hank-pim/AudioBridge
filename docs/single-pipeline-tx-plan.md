@@ -19,7 +19,7 @@ asiosrc (single, shared)
 dante_in_shared.src_N -> queue -> level (per-channel meter) -> tee -> branch into each TX leg
 
 per TX transport:
-  branches -> interleave -> caps -> opusenc -> rtpopuspay -> srtsink (per-transport URI)
+  branches -> interleave -> caps(channel-mask=0x0) -> audioconvert -> opusenc -> mpegtsmux -> srtsink (per-transport URI)
 ```
 
 `_build_tx_argv` already constructs this exact shape for a single transport with multiple channels. The change is to lift the construction one level up: build per-endpoint instead of per-transport, and let the shared deinterleave feed every transport's per-channel branches.

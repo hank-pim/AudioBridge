@@ -32,7 +32,7 @@ JACK physical capture ports
   -> TX GStreamer workers
   -> OPUS/RTP/SRT
 
-SRT/RTP/OPUS
+SRT/MPEG-TS/OPUS
   -> RX GStreamer workers
   -> JACK physical playback ports
 ```
@@ -281,7 +281,7 @@ jackaudiosrc connect=0 client-name=db_tx_pgm_main
   -> audioresample
   -> audio/x-raw,rate=48000
   -> opusenc
-  -> rtpopuspay
+  -> mpegtsmux
   -> srtsink
 ```
 
@@ -303,8 +303,7 @@ RX GStreamer graph shape:
 
 ```text
 srtsrc
-  -> rtpjitterbuffer
-  -> rtpopusdepay
+  -> tsdemux
   -> opusdec
   -> audioconvert
   -> audioresample

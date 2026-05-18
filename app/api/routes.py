@@ -706,6 +706,15 @@ def create_api_router(
     def spine_status() -> dict[str, Any]:
         return media.describe_spine()
 
+    @router.get("/diagnostics/rx-clock-buffers")
+    def rx_clock_buffers() -> dict[str, Any]:
+        """Reports the live ``max-size-time`` / ``current-level-time`` of each
+        per-channel spine clock-recovery queue (``rx_clkbuf_K``). Useful for
+        verifying that per-RX-transport free-running buffer settings were
+        actually applied at attach time.
+        """
+        return media.describe_rx_clock_buffers()
+
     @router.post("/diagnostics/tone")
     def tone_start(body: dict[str, Any]) -> dict[str, Any]:
         freq = float(body.get("frequency_hz", 1000))

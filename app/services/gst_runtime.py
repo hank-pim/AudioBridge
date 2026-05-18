@@ -124,6 +124,11 @@ class CtypesGst:
         self.glib.g_free.restype = None
         self.gobject.g_object_get.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p]
         self.gobject.g_object_get.restype = None
+        # g_object_set is variadic; for the single-property (boolean) case used
+        # by the silence-valve swap, declaring it as (object, prop, gboolean, NULL)
+        # is portable across MSVC/MinGW on Windows where ctypes variadic calls
+        # respect the declared arg types.
+        self.gobject.g_object_set.restype = None
         self.gobject.g_object_unref.argtypes = [ctypes.c_void_p]
         self.gobject.g_object_unref.restype = None
         self.gst.gst_parse_bin_from_description.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
@@ -140,6 +145,8 @@ class CtypesGst:
         self.gst.gst_element_sync_state_with_parent.restype = ctypes.c_int
         self.gst.gst_pad_link.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.gst.gst_pad_link.restype = ctypes.c_int
+        self.gst.gst_pad_link_full.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        self.gst.gst_pad_link_full.restype = ctypes.c_int
         self.gst.gst_pad_get_peer.argtypes = [ctypes.c_void_p]
         self.gst.gst_pad_get_peer.restype = ctypes.c_void_p
         self.gst.gst_pad_set_active.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -209,11 +216,32 @@ class CtypesGst:
     def request_tee_src_pad(self, tee: int) -> int | None:
         return self.request_pad(tee, b"src_%u")
 
+    def set_boolean_property(self, element: int, prop_name: bytes, value: bool) -> None:
+        """Set a single boolean property on a GObject via g_object_set."""
+        self.gobject.g_object_set(
+            ctypes.c_void_p(element),
+            ctypes.c_char_p(prop_name),
+            ctypes.c_int(1 if value else 0),
+            ctypes.c_void_p(0),
+        )
+
+    def set_uint64_property(self, element: int, prop_name: bytes, value: int) -> None:
+        """Set a single uint64 property (e.g. GstClockTime) via g_object_set."""
+        self.gobject.g_object_set(
+            ctypes.c_void_p(element),
+            ctypes.c_char_p(prop_name),
+            ctypes.c_uint64(value),
+            ctypes.c_void_p(0),
+        )
+
+    def request_interleave_sink_pad(self, mixer: int) -> int | None:
+        return self.request_pad(mixer, b"sink_%u")
+
     def request_mixer_sink_pad(self, mixer: int) -> int | None:
         return self.request_pad(
             mixer,
             b"sink_%u",
-            None,
+            b"audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
         )
 
     def bind_appsink(self) -> None:
@@ -322,6 +350,11 @@ class CtypesManagedPipeline:
     _thread: threading.Thread | None = None
     _branches: dict[str, AttachedBranch] = field(default_factory=dict)
     _branch_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Per-branch swap state for RX legs that swapped silence feeders out of the
+    # spine_out_interleave request pads. Keyed by AttachedBranch.handle.
+    # Each entry is a list of (q_name, q_elem, q_src_pad, interleave_pad,
+    # ghost, v_name, v_elem) tuples — one per channel the branch occupies.
+    _silence_swap_state: dict[str, list[tuple[str, int, int, int, int, str, int]]] = field(default_factory=dict)
 
     @property
     def transport_id(self) -> str | None:
@@ -560,6 +593,7 @@ class CtypesManagedPipeline:
 
         bin_element = 0
         added_to_pipeline = False
+        synced_to_parent = False
         created_ghosts: list[int] = []
         link_records: list[tuple[str, int, int, int]] = []
         try:
@@ -659,7 +693,7 @@ class CtypesManagedPipeline:
         exit_element_names: list[str],
         description: str,
     ) -> AttachedBranch:
-        """Attach a bin's N source pads to N spine audiomixers."""
+        """Attach a bin's N source pads to N spine playback fan-in elements."""
         if self._stopped:
             raise RuntimeError("pipeline is stopped")
         if len(mixer_names) != len(exit_element_names):
@@ -732,6 +766,10 @@ class CtypesManagedPipeline:
                 raise RuntimeError("gst_bin_add rejected the branch bin")
             added_to_pipeline = True
 
+            if not gst.gst_element_sync_state_with_parent(bin_element):
+                raise RuntimeError("branch failed to sync state with parent")
+            synced_to_parent = True
+
             for index, ((mixer_name, mixer), ghost) in enumerate(zip(mixers, created_ghosts)):
                 mixer_sink_pad = self.runtime.request_mixer_sink_pad(mixer) or 0
                 if not mixer_sink_pad:
@@ -741,7 +779,11 @@ class CtypesManagedPipeline:
                     gobject.g_object_unref(mixer_sink_pad)
                     raise RuntimeError(f"gst_pad_set_active failed for mixer '{mixer_name}' sink pad")
                 pad_name = self.runtime.string_and_free(gst.gst_object_get_name(mixer_sink_pad))
-                link_result = gst.gst_pad_link(ghost, mixer_sink_pad)
+                # Newly requested playback fan-in pads can report EMPTY caps
+                # until linked, even though the branch ghost pad and fan-in pad
+                # templates are compatible. Link first and let the running
+                # pipeline negotiate actual caps afterward.
+                link_result = gst.gst_pad_link_full(ghost, mixer_sink_pad, 0)
                 if link_result != 0:
                     src_caps = self.runtime.pad_caps_string(ghost)
                     sink_caps = self.runtime.pad_caps_string(mixer_sink_pad)
@@ -752,9 +794,6 @@ class CtypesManagedPipeline:
                         f"(src caps: {src_caps}; sink caps: {sink_caps})"
                     )
                 link_records.append((mixer_name, mixer, mixer_sink_pad, ghost))
-
-            if not gst.gst_element_sync_state_with_parent(bin_element):
-                raise RuntimeError("branch failed to sync state with parent")
 
             handle = uuid.uuid4().hex
             first_mixer, first_mixer_element, first_mixer_sink, first_ghost = link_records[0]
@@ -778,11 +817,259 @@ class CtypesManagedPipeline:
                     gst.gst_element_release_request_pad(mixer, mixer_sink_pad)
                     gobject.g_object_unref(mixer_sink_pad)
             if added_to_pipeline and bin_element:
+                if synced_to_parent:
+                    gst.gst_element_set_state(bin_element, GST_STATE_NULL)
                 gst.gst_bin_remove(self.pipeline, bin_element)
             elif bin_element:
                 gobject.g_object_unref(bin_element)
             for _mixer_name, mixer in mixers:
                 gobject.g_object_unref(mixer)
+            raise
+
+    def attach_branch_swap_silence(
+        self,
+        *,
+        silence_queue_names: list[str],
+        silence_valve_names: list[str],
+        exit_element_names: list[str],
+        description: str,
+    ) -> AttachedBranch:
+        """Attach an RX branch by swapping silence feeders out of spine_out_interleave.
+
+        For each channel K:
+          1. Set the spine's ``silence_valve_K.drop=true`` so the audiotestsrc
+             upstream keeps producing into the void instead of hitting a
+             NOT_LINKED src pad when we unlink the queue.
+          2. Find the queue's static src pad and its peer (the request pad on
+             ``spine_out_interleave``). Unlink them; KEEP the interleave
+             request pad alive (do not release it).
+          3. Link the RX bin's ghost src pad for channel K into that same
+             interleave request pad.
+
+        Detach reverses it: unlink ghost->interleave, re-link silence_q->interleave,
+        valve.drop=false, then remove the bin.
+        """
+        if self._stopped:
+            raise RuntimeError("pipeline is stopped")
+        if not (len(silence_queue_names) == len(silence_valve_names) == len(exit_element_names)):
+            raise ValueError(
+                "silence_queue_names, silence_valve_names, and exit_element_names must be parallel lists"
+            )
+        if not silence_queue_names:
+            raise ValueError("attach_branch_swap_silence requires at least one channel")
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+
+        silence_queues: list[tuple[str, int]] = []
+        silence_valves: list[tuple[str, int]] = []
+        try:
+            for q_name in silence_queue_names:
+                el = gst.gst_bin_get_by_name(self.pipeline, q_name.encode("utf-8"))
+                if not el:
+                    raise RuntimeError(f"silence queue '{q_name}' not found in pipeline '{self.name}'")
+                silence_queues.append((q_name, el))
+            for v_name in silence_valve_names:
+                el = gst.gst_bin_get_by_name(self.pipeline, v_name.encode("utf-8"))
+                if not el:
+                    raise RuntimeError(f"silence valve '{v_name}' not found in pipeline '{self.name}'")
+                silence_valves.append((v_name, el))
+        except Exception:
+            for _n, p in silence_queues + silence_valves:
+                gobject.g_object_unref(p)
+            raise
+
+        bin_element = 0
+        added_to_pipeline = False
+        synced_to_parent = False
+        created_ghosts: list[int] = []
+        # Records what we have to undo on failure or detach:
+        # (q_name, q_elem, q_src_pad, interleave_pad, ghost, v_name, v_elem)
+        swap_records: list[tuple[str, int, int, int, int, str, int]] = []
+        try:
+            error = ctypes.c_void_p()
+            bin_element = gst.gst_parse_bin_from_description(
+                description.encode("utf-8"), 0, ctypes.byref(error)
+            )
+            if not bin_element:
+                raise RuntimeError(f"failed to parse branch description: {description!r}")
+
+            # Promote each named exit queue's static src pad to a ghost src on the bin.
+            for index, exit_name in enumerate(exit_element_names):
+                exit_element = gst.gst_bin_get_by_name(bin_element, exit_name.encode("utf-8"))
+                if not exit_element:
+                    raise RuntimeError(f"branch description has no exit element named '{exit_name}'")
+                exit_src_pad = 0
+                try:
+                    exit_src_pad = gst.gst_element_get_static_pad(exit_element, b"src")
+                    if not exit_src_pad:
+                        raise RuntimeError(f"exit element '{exit_name}' has no static src pad")
+                    ghost_name = f"src_{index}".encode("ascii")
+                    template = (
+                        gst.gst_pad_get_pad_template(exit_src_pad)
+                        if hasattr(gst, "gst_pad_get_pad_template")
+                        else 0
+                    )
+                    new_from_template = getattr(gst, "gst_ghost_pad_new_from_template", None)
+                    ghost = (
+                        new_from_template(ghost_name, exit_src_pad, template)
+                        if new_from_template and template
+                        else gst.gst_ghost_pad_new(ghost_name, exit_src_pad)
+                    )
+                    if not ghost:
+                        raise RuntimeError(f"gst_ghost_pad_new failed for '{exit_name}'")
+                    if not gst.gst_pad_set_active(ghost, 1):
+                        gobject.g_object_unref(ghost)
+                        raise RuntimeError(f"gst_pad_set_active failed for ghost '{exit_name}'")
+                    if not gst.gst_element_add_pad(bin_element, ghost):
+                        gobject.g_object_unref(ghost)
+                        raise RuntimeError(f"gst_element_add_pad rejected ghost for '{exit_name}'")
+                    created_ghosts.append(ghost)
+                finally:
+                    if exit_src_pad:
+                        gobject.g_object_unref(exit_src_pad)
+                    gobject.g_object_unref(exit_element)
+
+            if not gst.gst_bin_add(self.pipeline, bin_element):
+                raise RuntimeError("gst_bin_add rejected the branch bin")
+            added_to_pipeline = True
+
+            if not gst.gst_element_sync_state_with_parent(bin_element):
+                raise RuntimeError("branch failed to sync state with parent")
+            synced_to_parent = True
+
+            # For each channel: drop silence at the valve, unlink silence queue
+            # from interleave pad, link RX ghost into the same interleave pad.
+            for index, ((q_name, q_elem), (v_name, v_elem), ghost) in enumerate(
+                zip(silence_queues, silence_valves, created_ghosts)
+            ):
+                # 1. Drop silence at the valve. From this point until detach,
+                #    audiotestsrc pushes into a happy valve that throws away
+                #    every buffer. The valve's src pad is unlinked but valve
+                #    never calls gst_pad_push when drop=true, so no NOT_LINKED.
+                self.runtime.set_boolean_property(v_elem, b"drop", True)
+
+                # 2. Find the silence queue's src pad and its peer (the
+                #    interleave request pad). Unlink them.
+                q_src_pad = gst.gst_element_get_static_pad(q_elem, b"src")
+                if not q_src_pad:
+                    raise RuntimeError(f"silence queue '{q_name}' has no static src pad")
+                interleave_pad = gst.gst_pad_get_peer(q_src_pad)
+                if not interleave_pad:
+                    gobject.g_object_unref(q_src_pad)
+                    raise RuntimeError(f"silence queue '{q_name}' src has no peer pad")
+                if not gst.gst_pad_unlink(q_src_pad, interleave_pad):
+                    src_caps = self.runtime.pad_caps_string(q_src_pad)
+                    sink_caps = self.runtime.pad_caps_string(interleave_pad)
+                    gobject.g_object_unref(q_src_pad)
+                    gobject.g_object_unref(interleave_pad)
+                    raise RuntimeError(
+                        f"gst_pad_unlink failed for silence queue '{q_name}' "
+                        f"(src: {src_caps}; sink: {sink_caps})"
+                    )
+
+                # 3. Link the RX ghost src pad into the freed interleave request pad.
+                link_result = gst.gst_pad_link_full(ghost, interleave_pad, 0)
+                if link_result != 0:
+                    src_caps = self.runtime.pad_caps_string(ghost)
+                    sink_caps = self.runtime.pad_caps_string(interleave_pad)
+                    # Re-link silence so the spine playback chain survives this failure.
+                    gst.gst_pad_link_full(q_src_pad, interleave_pad, 0)
+                    self.runtime.set_boolean_property(v_elem, b"drop", False)
+                    gobject.g_object_unref(q_src_pad)
+                    gobject.g_object_unref(interleave_pad)
+                    raise RuntimeError(
+                        f"gst_pad_link failed (code {link_result}) for channel ghost '{exit_element_names[index]}' "
+                        f"-> interleave pad (src: {src_caps}; sink: {sink_caps})"
+                    )
+
+                swap_records.append((q_name, q_elem, q_src_pad, interleave_pad, ghost, v_name, v_elem))
+
+            handle = uuid.uuid4().hex
+            first = swap_records[0]
+            branch = AttachedBranch(
+                handle=handle,
+                tap_name=first[0],
+                description=description,
+                bin_element=bin_element,
+                tee_element=first[1],
+                tee_src_pad=first[3],  # interleave request pad
+                branch_sink_pad=first[4],  # ghost src
+                tee_links=[(r[0], r[1], r[3], r[4]) for r in swap_records],
+                link_direction="swap_silence",
+            )
+            # Stash the full swap_records on the branch via a side dict; we need
+            # the valve element and silence src pad for detach. Use the handle
+            # as the key in a per-pipeline map.
+            self._silence_swap_state[handle] = swap_records
+            with self._branch_lock:
+                self._branches[handle] = branch
+            return branch
+        except Exception:
+            # Unwind: restore silence links for any channels we already swapped,
+            # then NULL the bin and remove from pipeline.
+            for q_name, q_elem, q_src_pad, interleave_pad, ghost, v_name, v_elem in swap_records:
+                # Try to unlink ghost->interleave and re-link silence_q->interleave.
+                gst.gst_pad_unlink(ghost, interleave_pad)
+                gst.gst_pad_link_full(q_src_pad, interleave_pad, 0)
+                self.runtime.set_boolean_property(v_elem, b"drop", False)
+                gobject.g_object_unref(q_src_pad)
+                gobject.g_object_unref(interleave_pad)
+            if added_to_pipeline and bin_element:
+                if synced_to_parent:
+                    gst.gst_element_set_state(bin_element, GST_STATE_NULL)
+                gst.gst_bin_remove(self.pipeline, bin_element)
+            elif bin_element:
+                gobject.g_object_unref(bin_element)
+            for _n, p in silence_queues + silence_valves:
+                gobject.g_object_unref(p)
+            raise
+
+    def attach_branch_unlinked(self, description: str) -> AttachedBranch:
+        """Attach a self-contained bin that communicates via in-process elements.
+
+        RX playback branches use interaudiosink elements, so they do not need
+        ghost pads linked to the spine. The bin still needs lifetime management
+        so stop/detach can set it to NULL and remove it from the running spine.
+        """
+        if self._stopped:
+            raise RuntimeError("pipeline is stopped")
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+        bin_element = 0
+        added_to_pipeline = False
+        try:
+            error = ctypes.c_void_p()
+            bin_element = gst.gst_parse_bin_from_description(
+                description.encode("utf-8"), 0, ctypes.byref(error)
+            )
+            if not bin_element:
+                raise RuntimeError(f"failed to parse branch description: {description!r}")
+            if not gst.gst_bin_add(self.pipeline, bin_element):
+                raise RuntimeError("gst_bin_add rejected the branch bin")
+            added_to_pipeline = True
+            if not gst.gst_element_sync_state_with_parent(bin_element):
+                raise RuntimeError("branch failed to sync state with parent")
+            handle = uuid.uuid4().hex
+            branch = AttachedBranch(
+                handle=handle,
+                tap_name="",
+                description=description,
+                bin_element=bin_element,
+                tee_element=0,
+                tee_src_pad=0,
+                branch_sink_pad=0,
+                tee_links=[],
+                link_direction="none",
+            )
+            with self._branch_lock:
+                self._branches[handle] = branch
+            return branch
+        except Exception:
+            if added_to_pipeline and bin_element:
+                gst.gst_element_set_state(bin_element, GST_STATE_NULL)
+                gst.gst_bin_remove(self.pipeline, bin_element)
+            elif bin_element:
+                gobject.g_object_unref(bin_element)
             raise
 
     def detach_branch(self, handle: str) -> bool:
@@ -800,9 +1087,79 @@ class CtypesManagedPipeline:
                 for branch in self._branches.values()
             ]
 
+    def set_queue_max_size_time(self, queue_name: str, nanoseconds: int) -> bool:
+        """Set ``max-size-time`` on a named queue element in the pipeline.
+
+        Returns True if the queue was found and the property was applied.
+        Used for runtime tuning of per-RX clock-recovery buffer depth.
+        """
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+        element = gst.gst_bin_get_by_name(self.pipeline, queue_name.encode("utf-8"))
+        if not element:
+            return False
+        try:
+            self.runtime.set_uint64_property(element, b"max-size-time", int(nanoseconds))
+            return True
+        finally:
+            gobject.g_object_unref(element)
+
+    def get_queue_levels(self, queue_name: str) -> dict[str, int] | None:
+        """Read ``max-size-time``, ``current-level-time``, and ``current-level-buffers``
+        from a named queue. Returns None if the queue isn't present.
+        """
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+        element = gst.gst_bin_get_by_name(self.pipeline, queue_name.encode("utf-8"))
+        if not element:
+            return None
+        try:
+            result: dict[str, int] = {}
+            for prop, ctype in (
+                (b"max-size-time", ctypes.c_uint64),
+                (b"current-level-time", ctypes.c_uint64),
+                (b"current-level-buffers", ctypes.c_uint32),
+            ):
+                value = ctype(0)
+                gobject.g_object_get(
+                    ctypes.c_void_p(element),
+                    ctypes.c_char_p(prop),
+                    ctypes.byref(value),
+                    ctypes.c_void_p(0),
+                )
+                result[prop.decode()] = int(value.value)
+            return result
+        finally:
+            gobject.g_object_unref(element)
+
     def _teardown_branch_locked(self, branch: AttachedBranch) -> None:
         gst = self.runtime.gst
         gobject = self.runtime.gobject
+        if branch.link_direction == "none":
+            gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
+            gst.gst_bin_remove(self.pipeline, branch.bin_element)
+            self._drain_bus()
+            return
+        if branch.link_direction == "swap_silence":
+            swap_records = self._silence_swap_state.pop(branch.handle, [])
+            # Reverse the swap for each channel: unlink ghost->interleave, re-link
+            # silence_q->interleave, then open the valve so silence resumes
+            # feeding the spine. Do this BEFORE setting the RX bin to NULL so the
+            # interleave pad always has an upstream producer.
+            for q_name, q_elem, q_src_pad, interleave_pad, ghost, v_name, v_elem in swap_records:
+                gst.gst_pad_unlink(ghost, interleave_pad)
+                link_result = gst.gst_pad_link_full(q_src_pad, interleave_pad, 0)
+                if link_result == 0:
+                    self.runtime.set_boolean_property(v_elem, b"drop", False)
+                # Release our pad references obtained at attach time.
+                gobject.g_object_unref(q_src_pad)
+                gobject.g_object_unref(interleave_pad)
+                gobject.g_object_unref(q_elem)
+                gobject.g_object_unref(v_elem)
+            gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
+            gst.gst_bin_remove(self.pipeline, branch.bin_element)
+            self._drain_bus()
+            return
         # Use the link records when available so multi-tap branches release every
         # tee request pad. Older single-tap callers populate tee_links with one
         # entry; the unified loop handles both.
@@ -948,10 +1305,21 @@ class CtypesManagedPipeline:
             self._last_stats_tail_at = now
 
     def _observe_level(self, source_name: str | None, text: str) -> None:
-        if not source_name or not source_name.startswith(("dbmeter_out_", "dbmeter_in_")):
+        if not source_name:
             return
         match = _LEVEL_MESSAGE_RE.search(text)
         if match is None:
+            return
+        if source_name == "spine_out_level":
+            peaks = _level_values(match.group("peak"))
+            rms_values = _level_values(match.group("rms"))
+            for index, peak in enumerate(peaks, start=1):
+                rms = rms_values[index - 1] if index <= len(rms_values) else None
+                self.telemetry.observe_output_meter(
+                    index, peak_dbfs=peak, rms_dbfs=rms, transport_id="spine"
+                )
+            return
+        if not source_name.startswith(("dbmeter_out_", "dbmeter_in_")):
             return
         peak = _first_level_value(match.group("peak"))
         rms = _first_level_value(match.group("rms"))
@@ -1046,11 +1414,20 @@ def _loss_percent(lost: int | None, sent: int | None) -> float | None:
 
 
 def _first_level_value(raw_values: str) -> float | None:
-    values = [part.strip() for part in raw_values.split(",") if part.strip()]
+    values = _level_values(raw_values)
     if not values:
         return None
-    try:
-        value = float(values[0])
-    except ValueError:
-        return None
-    return round(value, 3)
+    return values[0]
+
+
+def _level_values(raw_values: str) -> list[float]:
+    values: list[float] = []
+    for part in raw_values.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(round(float(part), 3))
+        except ValueError:
+            continue
+    return values

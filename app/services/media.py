@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.config import EndpointConfig, SrtTransportConfig, SrtTransportDirection, WebRtcStreamConfig
+from app.core.config import ClockRecoveryMode, EndpointConfig, SrtTransportConfig, SrtTransportDirection, WebRtcStreamConfig
 from app.services.audio_devices import discover_audio_interfaces
 from app.services.gst_runtime import CtypesGst, CtypesManagedPipeline
 from app.services.media_graph import MediaGraphBuilder
@@ -88,10 +88,11 @@ class MediaController:
     _latest_tx_config: EndpointConfig | None = None
     # The always-on full-duplex spine that owns DVS. Built lazily on the first
     # spine/TX/RX start in the new dynamic-pipeline architecture; TX and RX legs
-    # will attach to its per-channel tee and audiomixer elements without ever
+    # will attach to its per-channel tee and playback fan-in elements without ever
     # restarting the spine itself. See plan_spine() in media_graph.py.
     _spine_pipeline: Any | None = None
     _gst_runtime: CtypesGst | None = None
+    _spine_lock: threading.RLock = field(default_factory=threading.RLock)
 
     def __post_init__(self) -> None:
         self.gst_launch_executable = self._resolve_gst_launch_executable(self.gst_launch_executable)
@@ -321,11 +322,7 @@ class MediaController:
             builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
             leg_plan = builder.plan_rx_leg_branch(config, transport_id, raise_on_error=True)
             
-            branch = spine.attach_branch_outputs_multi(
-                mixer_names=leg_plan["mixer_names"],
-                exit_element_names=leg_plan["exit_element_names"],
-                description=leg_plan["branch_description"],
-            )
+            branch = spine.attach_branch_unlinked(description=leg_plan["branch_description"])
             self._spine_rx_branches[transport_id] = branch.handle
 
             self._register_spine_srt_endpoint(transport_id, leg_plan["srt_element_name"])
@@ -333,10 +330,23 @@ class MediaController:
                 spine.meter_lookup[endpoint["element_name"]] = (
                     endpoint["transport_id"], endpoint["direction"], endpoint["channel"],
                 )
+            # Apply effective clock-recovery buffer depth to the per-channel
+            # spine queues this RX leg writes into. Per-transport override
+            # falls back to program-level config when unset. Free-running mode
+            # pins max-size-time to the configured jitter_buffer_ms; adaptive
+            # mode leaves the default in place (control loop will tune it).
+            effective_mode = transport.clock_recovery_mode or config.program.clock_recovery_mode
+            effective_free = transport.free_running_clock or config.program.free_running_clock
+            if effective_mode == ClockRecoveryMode.free_running:
+                depth_ns = effective_free.jitter_buffer_ms * 1_000_000
+                for ch_name in leg_plan.get("interaudio_channels", []):
+                    if ch_name.startswith("spine_out_"):
+                        k = ch_name.removeprefix("spine_out_")
+                        spine.set_queue_max_size_time(f"rx_clkbuf_{k}", depth_ns)
             pipeline = spine
             self._srt_transport_pipelines[transport_id] = pipeline
             runtime_note = (
-                "RX leg decodes into the always-on spine output bus directly via audiomixer; DVS stays open in the spine"
+                "RX leg decodes into the always-on spine output bus; DVS stays open in the spine"
             )
         elif transport.direction == SrtTransportDirection.tx:
             # Legacy bundle path: kept for non-dante TX legs (tones/silence in
@@ -594,50 +604,71 @@ class MediaController:
         returns the running pipeline's description without rebuilding.
 
         The spine opens DVS once (capture + playback) and exposes per-channel
-        tee/audiomixer attach points for TX/RX legs. In this first commit it is
+        tee/playback fan-in attach points for TX/RX legs. In this first commit it is
         a standalone diagnostic so we can verify the full-duplex DVS open
         before wiring it into TX/RX flows.
         """
-        if self._spine_pipeline is not None:
+        with self._spine_lock:
+            if self._spine_pipeline is not None:
+                return {
+                    "running": True,
+                    "already_running": True,
+                    "process": self._spine_pipeline.describe(),
+                }
+
+            plan = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable).plan_spine(config)
+            if not plan["valid"] or plan["gstreamer"] is None:
+                raise RuntimeError(
+                    "spine plan is invalid: " + "; ".join(error.get("message", "") for error in plan["errors"])
+                )
+
+            pipeline = self._spawn_managed_spine_pipeline(
+                name="spine_full_duplex",
+                graph=plan["gstreamer"]["graph"],
+                channel_count=plan["channel_count"],
+            )
+            self._spine_pipeline = pipeline
             return {
                 "running": True,
-                "already_running": True,
-                "process": self._spine_pipeline.describe(),
+                "already_running": False,
+                "channel_count": plan["channel_count"],
+                "capture_tee_names": plan["capture_tee_names"],
+                "playback_mixer_names": plan["playback_mixer_names"],
+                "asiosrc_element_name": plan["gstreamer"]["asiosrc_element_name"],
+                "asiosink_element_name": plan["gstreamer"]["asiosink_element_name"],
+                "process": pipeline.describe(),
             }
 
-        plan = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable).plan_spine(config)
-        if not plan["valid"] or plan["gstreamer"] is None:
-            raise RuntimeError(
-                "spine plan is invalid: " + "; ".join(error.get("message", "") for error in plan["errors"])
-            )
-
-        pipeline = self._spawn_managed_spine_pipeline(
-            name="spine_full_duplex",
-            graph=plan["gstreamer"]["graph"],
-            channel_count=plan["channel_count"],
-        )
-        self._spine_pipeline = pipeline
-        return {
-            "running": True,
-            "already_running": False,
-            "channel_count": plan["channel_count"],
-            "capture_tee_names": plan["capture_tee_names"],
-            "playback_mixer_names": plan["playback_mixer_names"],
-            "asiosrc_element_name": plan["gstreamer"]["asiosrc_element_name"],
-            "asiosink_element_name": plan["gstreamer"]["asiosink_element_name"],
-            "process": pipeline.describe(),
-        }
-
     def stop_spine(self) -> None:
-        if self._spine_pipeline is None:
-            return
-        self._stop_pipeline(self._spine_pipeline)
-        self._spine_pipeline = None
+        with self._spine_lock:
+            if self._spine_pipeline is None:
+                return
+            self._stop_pipeline(self._spine_pipeline)
+            self._spine_pipeline = None
 
     def describe_spine(self) -> dict[str, Any]:
         if self._spine_pipeline is None:
             return {"running": False}
         return {"running": True, "process": self._spine_pipeline.describe()}
+
+    def describe_rx_clock_buffers(self) -> dict[str, Any]:
+        """Snapshot ``max-size-time`` / ``current-level-time`` per spine
+        ``rx_clkbuf_K`` queue. Read-only diagnostic surface for verifying
+        free-running buffer overrides took effect.
+        """
+        spine = self._spine_pipeline
+        if spine is None:
+            return {"running": False, "queues": []}
+        from app.services.media_graph import MediaGraphBuilder
+        builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
+        queues: list[dict[str, Any]] = []
+        for channel in range(1, 65):
+            name = builder.spine_rx_clock_buffer_name(channel)
+            levels = spine.get_queue_levels(name)
+            if levels is None:
+                continue
+            queues.append({"channel": channel, "queue": name, **levels})
+        return {"running": True, "queues": queues}
 
     def _tx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
         """Spine TX is used when every source for the leg is a dante_input AND
@@ -926,7 +957,10 @@ class MediaController:
             "opusenc",
             f"bitrate={bitrate_bps}",
             "!",
-            "oggmux",
+            "mpegtsmux",
+            "alignment=7",
+            "pat-interval=900",
+            "pmt-interval=900",
             "!",
             "srtsink",
             f"uri={uri}",
@@ -949,7 +983,7 @@ class MediaController:
             "!",
             "queue",
             "!",
-            "oggdemux",
+            "tsdemux",
             "!",
             "opusdec",
             "!",

@@ -22,6 +22,10 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["tests/archive"]
+markers = [
+  "requires_gstreamer: requires a local GStreamer gst-launch-1.0 installation",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
