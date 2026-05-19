@@ -287,6 +287,7 @@ class MediaGraphBuilder:
             "!",
             "opusenc",
             f"bitrate={group.opus.bitrate_kbps * 1000}",
+            *self._tx_encoded_monitor_tee_argv(transport, group),
             "!",
             "mpegtsmux",
             "alignment=7",
@@ -335,7 +336,6 @@ class MediaGraphBuilder:
         # Per-channel branches into interleave.sink_K.
         for channel in sorted_channels:
             source = source_by_id[channel.source_id or ""]
-            tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
             sink_pad = f"{interleave_name}.sink_{channel.index - 1}"
 
             if source.kind == SourceKind.dante_input:
@@ -353,13 +353,6 @@ class MediaGraphBuilder:
                     f"name={self._meter_element_name(group.id, channel.index)}",
                     "message=true",
                     "interval=100000000",
-                    "!",
-                    "tee",
-                    f"name={tap_name}",
-                    "allow-not-linked=true",
-                    f"{tap_name}.",
-                    "!",
-                    "queue",
                     "!",
                     sink_pad,
                 ])
@@ -379,13 +372,6 @@ class MediaGraphBuilder:
                     f"name={self._meter_element_name(group.id, channel.index)}",
                     "message=true",
                     "interval=100000000",
-                    "!",
-                    "tee",
-                    f"name={tap_name}",
-                    "allow-not-linked=true",
-                    f"{tap_name}.",
-                    "!",
-                    "queue",
                     "!",
                     sink_pad,
                 ])
@@ -536,6 +522,7 @@ class MediaGraphBuilder:
                 "!",
                 "opusenc",
                 f"bitrate={group.opus.bitrate_kbps * 1000}",
+                *self._tx_encoded_monitor_tee_argv(transport, group),
                 "!",
                 "mpegtsmux",
                 "alignment=7",
@@ -553,7 +540,6 @@ class MediaGraphBuilder:
                 source = source_by_id.get(channel.source_id or "")
                 if source is None:
                     continue
-                tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
                 meter_name = self._bundle_meter_name(transport.id, group.id, channel.index)
                 sink_pad = f"{interleave_name}.sink_{channel.index - 1}"
 
@@ -571,13 +557,6 @@ class MediaGraphBuilder:
                         f"name={meter_name}",
                         "message=true",
                         "interval=100000000",
-                        "!",
-                        "tee",
-                        f"name={tap_name}",
-                        "allow-not-linked=true",
-                        f"{tap_name}.",
-                        "!",
-                        "queue",
                         "!",
                         sink_pad,
                     ])
@@ -597,13 +576,6 @@ class MediaGraphBuilder:
                         f"name={meter_name}",
                         "message=true",
                         "interval=100000000",
-                        "!",
-                        "tee",
-                        f"name={tap_name}",
-                        "allow-not-linked=true",
-                        f"{tap_name}.",
-                        "!",
-                        "queue",
                         "!",
                         sink_pad,
                     ])
@@ -759,6 +731,7 @@ class MediaGraphBuilder:
             f"! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask)0x0 "
             f"! audioconvert "
             f"! opusenc bitrate={group.opus.bitrate_kbps * 1000} "
+            f"{self._tx_encoded_monitor_tee_graph(transport, group)} "
             f"! mpegtsmux alignment=7 pat-interval=900 pmt-interval=900 "
             f"! srtsink name={srt_name} uri={uri} wait-for-connection=false async=false"
         )
@@ -779,6 +752,32 @@ class MediaGraphBuilder:
         # Reuse the same naming as the legacy bundle so telemetry/meter parsing
         # stays consistent.
         return self._bundle_interleave_name(transport_id, group_id)
+
+    def _tx_encoded_monitor_tee_argv(
+        self,
+        transport: SrtTransportConfig,
+        group: EncodeGroupConfig,
+    ) -> list[str]:
+        argv: list[str] = []
+        for channel in sorted(group.channels, key=lambda item: item.index):
+            tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
+            argv.extend([
+                "!",
+                "tee",
+                f"name={tap_name}",
+                "allow-not-linked=true",
+                f"{tap_name}.",
+                "!",
+                "queue",
+            ])
+        return argv
+
+    def _tx_encoded_monitor_tee_graph(
+        self,
+        transport: SrtTransportConfig,
+        group: EncodeGroupConfig,
+    ) -> str:
+        return " ".join(self._tx_encoded_monitor_tee_argv(transport, group))
 
     def plan_rx_leg_branch(
         self,
@@ -861,10 +860,13 @@ class MediaGraphBuilder:
                 "direction": "in",
                 "element_name": meter_name,
             })
+            monitor_tap_name = self._rx_monitor_tap_name(transport.id, channel.index)
             parts.append(
                 f"{split_name}.src_{channel.index - 1} "
                 f"! queue "
                 f"! level name={meter_name} message=true interval=100000000 "
+                f"! tee name={monitor_tap_name} allow-not-linked=true "
+                f"! queue "
                 f"! audioconvert "
                 f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
                 f"! queue name={exit_name} "
@@ -880,7 +882,7 @@ class MediaGraphBuilder:
             "exit_element_names": exit_element_names,
             "srt_element_name": srt_name,
             "meter_endpoints": meter_endpoints,
-            "monitor_taps": [self._rx_monitor_tap(transport.id)],
+            "monitor_taps": self._rx_monitor_taps(transport.id, n),
             "interaudio_channels": interaudio_channels,
         }
 
@@ -1336,13 +1338,26 @@ class MediaGraphBuilder:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
         return f"srtstats_{direction}_{safe_transport}"
 
-    def _rx_monitor_tap(self, transport_id: str) -> dict[str, Any]:
+    def _rx_monitor_taps(self, transport_id: str, channel_count: int = 1) -> list[dict[str, Any]]:
+        return [
+            self._rx_monitor_tap(transport_id, channel_index, channel_count)
+            for channel_index in range(1, channel_count + 1)
+        ]
+
+    def _rx_monitor_tap(
+        self,
+        transport_id: str,
+        channel_index: int = 1,
+        channel_count: int = 1,
+    ) -> dict[str, Any]:
+        tap_name = self._rx_monitor_tap_name(transport_id, channel_index)
         return {
-            "id": self._rx_monitor_tap_name(transport_id),
+            "id": tap_name,
             "direction": "rx",
-            "stage": "post-demux-pre-decode",
-            "codec": "opus",
-            "channel_index": 1,
+            "stage": "post-decode-pre-output",
+            "codec": "raw",
+            "channel_index": channel_index,
+            "channel_count": channel_count,
         }
 
     def _tx_monitor_taps(self, transport: SrtTransportConfig, groups: list[EncodeGroupConfig]) -> list[dict[str, Any]]:
@@ -1356,13 +1371,15 @@ class MediaGraphBuilder:
                     "codec": "opus",
                     "group_id": group.id,
                     "channel_index": channel.index,
+                    "channel_count": group.channel_count,
                     "source_id": channel.source_id,
                 })
         return taps
 
-    def _rx_monitor_tap_name(self, transport_id: str) -> str:
+    def _rx_monitor_tap_name(self, transport_id: str, channel_index: int | None = None) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
-        return f"monitor_tap_rx_{safe_transport}"
+        suffix = "" if channel_index is None else f"_{channel_index}"
+        return f"monitor_tap_rx_{safe_transport}{suffix}"
 
     def _tx_monitor_tap_name(self, transport_id: str, group_id: str, channel_index: int) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)

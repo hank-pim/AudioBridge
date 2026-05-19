@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -532,12 +533,19 @@ class MediaController:
         taps = plan["gstreamer"]["monitor_taps"]
         tap = next((t for t in taps if t["id"] == tap_id), None)
         if tap is None:
+            legacy_tap = re.fullmatch(r"(?P<group_id>.+)-ch-(?P<channel_index>\d+)", tap_id)
+            if legacy_tap:
+                tap = next((
+                    t for t in taps
+                    if t.get("group_id") == legacy_tap.group("group_id")
+                    and int(t.get("channel_index") or 0) == int(legacy_tap.group("channel_index"))
+                ), None)
+        if tap is None:
             raise ValueError(
                 f"tap '{tap_id}' is not exposed by transport '{transport_id}'; available: {[t['id'] for t in taps]}"
             )
-
-        description = self._build_monitor_branch_description(audible=audible)
-        branch = pipeline.attach_branch(tap_name=tap_id, description=description)
+        description = self._build_monitor_branch_description(audible=audible, tap=tap)
+        branch = pipeline.attach_branch(tap_name=tap.get("element_id", tap["id"]), description=description)
         return {
             "handle": branch.handle,
             "transport_id": transport_id,
@@ -558,11 +566,34 @@ class MediaController:
             return []
         return pipeline.list_branches()
 
-    def _build_monitor_branch_description(self, *, audible: bool) -> str:
+    def _build_monitor_branch_description(self, *, audible: bool, tap: dict[str, Any] | None = None) -> str:
         if not audible:
             return "queue ! fakesink sync=false async=false"
         sink = " ".join(self._build_audio_output_sink())
-        return f"queue ! opusdec ! audioconvert ! audioresample ! {sink} sync=false"
+        if (tap or {}).get("codec") == "raw":
+            return (
+                "queue ! audioconvert ! audioresample ! "
+                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! "
+                f"{sink} sync=false async=false"
+            )
+        channel_count = max(1, int((tap or {}).get("channel_count") or 1))
+        channel_index = max(1, int((tap or {}).get("channel_index") or 1))
+        if channel_count <= 1:
+            return (
+                "queue ! opusdec ! audioconvert ! audioresample ! "
+                "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! "
+                f"{sink} sync=false async=false"
+            )
+        split_name = f"monitor_split_{uuid.uuid4().hex}"
+        src_pad = min(channel_index, channel_count) - 1
+        return (
+            "queue ! opusdec ! audioconvert ! audioresample ! "
+            f"audio/x-raw,format=S16LE,rate=48000,channels={channel_count},layout=interleaved ! "
+            f"deinterleave name={split_name} "
+            f"{split_name}.src_{src_pad} ! queue ! audioconvert ! audioresample ! "
+            "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! "
+            f"{sink} sync=false async=false"
+        )
 
     def start_webrtc_stream(self, config: EndpointConfig, stream_id: str) -> dict[str, Any]:
         stream = self._get_webrtc_stream(config, stream_id)

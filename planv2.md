@@ -92,6 +92,41 @@ The receiver's Dante audio clock and the sender's Dante audio clock are independ
 
 **Test plan (low-vs-high-latency sweep):** today, switch the transport to `free_running` and sweep `jitter_buffer_ms`. End-to-end wiring is validated. Once step 1 lands, the same sweep works under `adaptive` mode via `initial_buffer_ms`.
 
+**Clock-related telemetry surface (lands with queue-fill work, regardless of mode):**
+
+Per output channel (driven off the existing `rx_clkbuf_K` queues):
+
+- `buffer_fill_ms` — `current-level-time / 1e6`. Sparkline source.
+- `buffer_max_ms` — `max-size-time / 1e6`. Sparkline Y-scale and warning threshold reference.
+- `overrun_count` — count of `overrun` GstSignal emissions on `rx_clkbuf_K`. Reset on RX-leg start. The single number that says "free-run buffer is too tight" before the operator hears a click.
+- `underrun_count` — count of `underrun` GstSignal emissions on `rx_clkbuf_K`. Symmetric to overrun.
+- `recent_slips` — bounded ring (last ~50) of `(timestamp, kind: overrun|underrun)`. Drives a "recent slips" panel; lets an operator answer "what happened at HH:MM?" without scraping logs.
+
+Per RX leg (derived in `telemetry.py` from the above + decoder hooks):
+
+- `estimated_drift_ppm` — rolling integration of fill-level slope (e.g. last 60 s), converted to ppm. Sign indicates direction (positive = remote faster than local). Useful even in free-run as an operator forecast ("+4 ppm sustained → next overrun in ~70 min at current buffer").
+- `opus_plc_count` — opusdec PLC event count. Distinct from queue under/overruns: PLC = "we missed an Opus frame upstream"; queue slip = "the buffer policy gave up." Both can happen independently and operators benefit from seeing the distinction.
+
+Adaptive-mode-only (lands with the rate-slewing element + control loop):
+
+- `lock_state` — `unlocked | converging | locked`. Already plumbed through `telemetry.observe_clock(lock_state=...)`; just needs the loop to drive it.
+- `applied_ratio_ppm` — current resample ratio in ppm. Confirms the loop is acting and quantifies how much rate offset it's compensating for.
+
+System-wide (single value on `/api/status`):
+
+- `asiosrc_measured_rate_hz` — samples-delivered / wall-elapsed over a rolling window. Nominally 48000.000. Deviations flag local PTP / DVS clock health independent of any RX leg.
+
+Explicitly skipped (record so we don't relitigate):
+
+- PTP step-correction detection. Dante PTP slews; step corrections are exceptional. Defer until evidence demands it.
+- End-to-end one-way latency. Requires a shared timing reference between sites; we don't have one. Don't expose a number that silently drifts with the clocks.
+
+UI shape: per RX leg, a buffer sparkline next to the existing SRT stats (rtt / loss / bitrate), with a drift-ppm badge and overrun/underrun counters underneath. Sparkline color thresholds drive the operator's visual scan:
+
+- Green: fill near 0, no recent slips.
+- Yellow: sustained fill above ~50% of `buffer_max_ms` (drifting), or `estimated_drift_ppm` magnitude > 10.
+- Red: fill above ~90% of `buffer_max_ms`, or any slip in the last sample window.
+
 ## Talkback path (WebRTC + OPUS)
 
 - Bidirectional, peer-to-peer, one OPUS stream per direction.

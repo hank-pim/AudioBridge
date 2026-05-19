@@ -666,6 +666,7 @@ def test_media_graph_plan_exposes_tx_graph_from_configured_tone_sources() -> Non
                 "codec": "opus",
                 "group_id": "enc-main",
                 "channel_index": 1,
+                "channel_count": 1,
                 "source_id": "tone-l",
             },
         ]
@@ -724,11 +725,12 @@ def test_media_graph_plan_exposes_rx_monitor_tap() -> None:
         assert transport_plan["transport"]["id"] == "srt-rx"
         assert transport_plan["gstreamer"]["monitor_taps"] == [
             {
-                "id": "monitor_tap_rx_srt_rx",
+                "id": "monitor_tap_rx_srt_rx_1",
                 "direction": "rx",
-                "stage": "post-demux-pre-decode",
-                "codec": "opus",
+                "stage": "post-decode-pre-output",
+                "codec": "raw",
                 "channel_index": 1,
+                "channel_count": 1,
             }
         ]
         graph = transport_plan["gstreamer"]["graph"]
@@ -737,6 +739,7 @@ def test_media_graph_plan_exposes_rx_monitor_tap() -> None:
         assert "rtpopusdepay" not in graph
         assert "rtpjitterbuffer" not in graph
         assert "tee name=monitor_tap_rx_srt_rx" in graph
+        assert "tee name=monitor_tap_rx_srt_rx_1 allow-not-linked=true" in graph
         assert "level name=dbmeter_in_srt_rx_1" in graph
         assert "queue name=out_1" in graph
         assert transport_plan["gstreamer"]["argv"] == []
@@ -1893,6 +1896,24 @@ def test_plan_rx_leg_branch_emits_mixer_outputs_and_no_fakesink() -> None:
     assert "rx_split_rx_a.src_1 ! queue ! level name=dbmeter_in_rx_a_2" in desc
     assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_1 ! interaudiosink channel=spine_out_1 sync=false async=false" in desc
     assert "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! queue name=out_2 ! interaudiosink channel=spine_out_2 sync=false async=false" in desc
+    assert plan["monitor_taps"] == [
+        {
+            "id": "monitor_tap_rx_rx_a_1",
+            "direction": "rx",
+            "stage": "post-decode-pre-output",
+            "codec": "raw",
+            "channel_index": 1,
+            "channel_count": 2,
+        },
+        {
+            "id": "monitor_tap_rx_rx_a_2",
+            "direction": "rx",
+            "stage": "post-decode-pre-output",
+            "codec": "raw",
+            "channel_index": 2,
+            "channel_count": 2,
+        },
+    ]
     assert "fakesink" not in desc
 
 

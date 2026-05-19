@@ -105,6 +105,7 @@ class WebRtcMonitorService:
             tap_id = taps[0]["id"]
         elif not any(tap["id"] == tap_id for tap in taps):
             raise ValueError(f"tap '{tap_id}' is not exposed by transport '{transport_id}'")
+        tap = next(tap for tap in taps if tap["id"] == tap_id)
 
         runtime = self._media._gst_runtime
         if runtime is None:
@@ -115,13 +116,12 @@ class WebRtcMonitorService:
 
         session_id = uuid.uuid4().hex
         appsink_name = f"monitor_appsink_{session_id}"
-        description = (
-            "queue max-size-buffers=50 leaky=downstream ! "
-            "opusdec ! audioconvert ! audioresample ! "
-            "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! "
-            f"appsink name={appsink_name} sync=false max-buffers=20 drop=true"
+        description = self._build_appsink_branch_description(
+            tap=tap,
+            appsink_name=appsink_name,
+            split_suffix=session_id,
         )
-        branch = pipeline.attach_branch(tap_name=tap_id, description=description)
+        branch = pipeline.attach_branch(tap_name=tap.get("element_id", tap["id"]), description=description)
         appsink_ptr = runtime.gst.gst_bin_get_by_name(pipeline.pipeline, appsink_name.encode("utf-8"))
         if not appsink_ptr:
             pipeline.detach_branch(branch.handle)
@@ -214,6 +214,42 @@ class WebRtcMonitorService:
                 }
                 for s in self._sessions.values()
             ]
+
+    def _build_appsink_branch_description(
+        self,
+        *,
+        tap: dict[str, Any],
+        appsink_name: str,
+        split_suffix: str,
+    ) -> str:
+        channel_count = max(1, int(tap.get("channel_count") or 1))
+        channel_index = max(1, int(tap.get("channel_index") or 1))
+        tail = (
+            "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! "
+            f"appsink name={appsink_name} sync=false max-buffers=20 drop=true"
+        )
+        if tap.get("codec") == "raw":
+            return (
+                "queue max-size-buffers=50 leaky=downstream ! "
+                "audioconvert ! audioresample ! "
+                f"{tail}"
+            )
+        if channel_count <= 1:
+            return (
+                "queue max-size-buffers=50 leaky=downstream ! "
+                "opusdec ! audioconvert ! audioresample ! "
+                f"{tail}"
+            )
+        split_name = f"monitor_split_{split_suffix}"
+        src_pad = min(channel_index, channel_count) - 1
+        return (
+            "queue max-size-buffers=50 leaky=downstream ! "
+            "opusdec ! audioconvert ! audioresample ! "
+            f"audio/x-raw,format=S16LE,rate=48000,channels={channel_count},layout=interleaved ! "
+            f"deinterleave name={split_name} "
+            f"{split_name}.src_{src_pad} ! queue ! audioconvert ! audioresample ! "
+            f"{tail}"
+        )
 
     async def shutdown(self) -> None:
         for session_id in list(self._sessions):

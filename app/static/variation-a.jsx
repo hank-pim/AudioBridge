@@ -1391,6 +1391,23 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
   // We swap source_id to silence and remember the prior value so the source
   // can be restored when the user un-mutes within this session.
   const [muteMemo, setMuteMemo] = useState({}); // index -> { prevSource }
+  const [monitorSessions, setMonitorSessions] = useState({}); // index -> { sessionId, pc, audio }
+  const monitorSessionsRef = useRef({});
+
+  useEffect(() => {
+    monitorSessionsRef.current = monitorSessions;
+  }, [monitorSessions]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(monitorSessionsRef.current).forEach(session => {
+        if (!session) return;
+        try { fetch(`/api/monitor-sessions/${session.sessionId}`, { method: "DELETE" }).catch(() => {}); } catch {}
+        try { session.pc.close(); } catch {}
+        if (session.audio && session.audio.parentNode) session.audio.parentNode.removeChild(session.audio);
+      });
+    };
+  }, []);
 
   const channelByIndex = useMemo(() => {
     const map = new Map();
@@ -1495,11 +1512,73 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
     }
   };
 
-  const startMonitor = async (idx, sourceId) => {
-    // Per-channel monitor uses the existing monitor-branch API. The transport must be running.
-    if (!transportRunning) return;
-    const tapId = `${group.id}-ch-${idx}`;
+  const stopBrowserMonitor = async (idx) => {
+    const session = monitorSessions[idx];
+    if (!session) return;
+    try { await fetch(`/api/monitor-sessions/${session.sessionId}`, { method: "DELETE" }); } catch {}
+    try { session.pc.close(); } catch {}
+    if (session.audio && session.audio.parentNode) session.audio.parentNode.removeChild(session.audio);
+    setMonitorSessions(sessions => {
+      const next = { ...sessions };
+      delete next[idx];
+      return next;
+    });
+  };
+
+  const startBrowserMonitor = async (idx, tapId) => {
+    if (monitorSessions[idx]) {
+      await stopBrowserMonitor(idx);
+      return;
+    }
+    const pc = new RTCPeerConnection();
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    const audio = document.createElement("audio");
+    audio.autoplay = true;
+    audio.style.display = "none";
+    document.body.appendChild(audio);
+    pc.ontrack = (event) => { audio.srcObject = event.streams[0]; };
     try {
+      const create = await fetch("/api/monitor-sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transport_id: streamId, tap_id: tapId }),
+      });
+      if (!create.ok) throw new Error(await create.text());
+      const offer = await create.json();
+      await pc.setRemoteDescription({ sdp: offer.sdp, type: offer.type });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (pc.iceGatheringState === "complete") resolve();
+        });
+      });
+      const ans = await fetch(`/api/monitor-sessions/${offer.session_id}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      });
+      if (!ans.ok) throw new Error(await ans.text());
+      setMonitorSessions(sessions => ({ ...sessions, [idx]: { sessionId: offer.session_id, pc, audio } }));
+    } catch (e) {
+      try { pc.close(); } catch {}
+      if (audio.parentNode) audio.parentNode.removeChild(audio);
+      throw e;
+    }
+  };
+
+  const startMonitor = async (idx, sourceId) => {
+    if (!transportRunning) return;
+    const safeId = (value) => String(value || "").replace(/[^0-9A-Za-z]/g, "_");
+    const tapId = isRx
+      ? `monitor_tap_rx_${safeId(streamId)}_${idx}`
+      : `monitor_tap_tx_${safeId(streamId)}_${safeId(group.id)}_${idx}`;
+    try {
+      if (isRx) {
+        await startBrowserMonitor(idx, tapId);
+        return;
+      }
       const res = await fetch(`/api/srt-transports/${encodeURIComponent(streamId)}/monitor-branches`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1581,10 +1660,10 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
           </svg>
         </IconBtn>
         <IconBtn
-          tone="info"
-          disabled={!transportRunning || isMuted || isRx}
-          title={isRx ? "Per-channel monitor for RX is not wired yet" : (transportRunning ? (isMuted ? "Unmute first" : "Listen to this channel") : "Stream must be running")}
-          onClick={() => !isRx && startMonitor(i, effectiveSource)}>
+          tone={monitorSessions[i] ? "ok" : "info"}
+          disabled={!transportRunning || isMuted}
+          title={transportRunning ? (isMuted ? "Unmute first" : (monitorSessions[i] ? "Stop listening" : "Listen to this channel")) : "Stream must be running"}
+          onClick={() => startMonitor(i, effectiveSource)}>
           <ActIcon.listen />
         </IconBtn>
       </div>

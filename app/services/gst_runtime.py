@@ -118,6 +118,8 @@ class CtypesGst:
         self.gst.gst_structure_to_string.restype = ctypes.c_void_p
         self.gst.gst_object_get_name.argtypes = [ctypes.c_void_p]
         self.gst.gst_object_get_name.restype = ctypes.c_void_p
+        self.gst.gst_object_get_parent.argtypes = [ctypes.c_void_p]
+        self.gst.gst_object_get_parent.restype = ctypes.c_void_p
         self.gst.gst_mini_object_unref.argtypes = [ctypes.c_void_p]
         self.gst.gst_mini_object_unref.restype = None
         self.glib.g_free.argtypes = [ctypes.c_void_p]
@@ -316,6 +318,8 @@ class AttachedBranch:
     tee_element: int
     tee_src_pad: int
     branch_sink_pad: int
+    parent_bin: int = 0
+    parent_bin_owned: bool = False
     tee_links: list[tuple[str, int, int, int]] = field(default_factory=list)
     link_direction: str = "tee_to_branch"
     """List of (tap_name, tee_element, tee_src_pad, branch_sink_pad) for each
@@ -488,6 +492,9 @@ class CtypesManagedPipeline:
         if not tee:
             raise RuntimeError(f"tap '{tap_name}' not found in pipeline '{self.name}'")
 
+        parent_bin = gst.gst_object_get_parent(tee)
+        parent_bin_owned = bool(parent_bin)
+        parent_bin = parent_bin or self.pipeline
         bin_element = 0
         tee_src_pad = 0
         branch_sink_pad = 0
@@ -500,7 +507,7 @@ class CtypesManagedPipeline:
             if not bin_element:
                 raise RuntimeError(f"failed to parse branch description: {description!r}")
 
-            if not gst.gst_bin_add(self.pipeline, bin_element):
+            if not gst.gst_bin_add(parent_bin, bin_element):
                 raise RuntimeError("gst_bin_add rejected the branch bin")
             added_to_pipeline = True
 
@@ -512,7 +519,7 @@ class CtypesManagedPipeline:
             if not branch_sink_pad:
                 raise RuntimeError("branch bin has no ghost sink pad")
 
-            link_result = gst.gst_pad_link(tee_src_pad, branch_sink_pad)
+            link_result = gst.gst_pad_link_full(tee_src_pad, branch_sink_pad, 0)
             if link_result != 0:
                 raise RuntimeError(f"gst_pad_link failed (code {link_result})")
 
@@ -528,6 +535,8 @@ class CtypesManagedPipeline:
                 tee_element=tee,
                 tee_src_pad=tee_src_pad,
                 branch_sink_pad=branch_sink_pad,
+                parent_bin=parent_bin,
+                parent_bin_owned=parent_bin_owned,
                 tee_links=[(tap_name, tee, tee_src_pad, branch_sink_pad)],
             )
             with self._branch_lock:
@@ -540,9 +549,11 @@ class CtypesManagedPipeline:
                 gst.gst_element_release_request_pad(tee, tee_src_pad)
                 gobject.g_object_unref(tee_src_pad)
             if added_to_pipeline:
-                gst.gst_bin_remove(self.pipeline, bin_element)
+                gst.gst_bin_remove(parent_bin, bin_element)
             elif bin_element:
                 gobject.g_object_unref(bin_element)
+            if parent_bin_owned and parent_bin:
+                gobject.g_object_unref(parent_bin)
             gobject.g_object_unref(tee)
             raise
 
@@ -1135,9 +1146,10 @@ class CtypesManagedPipeline:
     def _teardown_branch_locked(self, branch: AttachedBranch) -> None:
         gst = self.runtime.gst
         gobject = self.runtime.gobject
+        parent_bin = branch.parent_bin or self.pipeline
         if branch.link_direction == "none":
             gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
-            gst.gst_bin_remove(self.pipeline, branch.bin_element)
+            gst.gst_bin_remove(parent_bin, branch.bin_element)
             self._drain_bus()
             return
         if branch.link_direction == "swap_silence":
@@ -1157,7 +1169,7 @@ class CtypesManagedPipeline:
                 gobject.g_object_unref(q_elem)
                 gobject.g_object_unref(v_elem)
             gst.gst_element_set_state(branch.bin_element, GST_STATE_NULL)
-            gst.gst_bin_remove(self.pipeline, branch.bin_element)
+            gst.gst_bin_remove(parent_bin, branch.bin_element)
             self._drain_bus()
             return
         # Use the link records when available so multi-tap branches release every
@@ -1195,7 +1207,7 @@ class CtypesManagedPipeline:
                     if tee_src and ghost_pad:
                         gst.gst_pad_unlink(tee_src, ghost_pad)
 
-            gst.gst_bin_remove(self.pipeline, branch.bin_element)
+            gst.gst_bin_remove(parent_bin, branch.bin_element)
             for _tap, tee, tee_src, _ghost in links:
                 if tee_src:
                     gst.gst_element_release_request_pad(tee, tee_src)
@@ -1208,6 +1220,8 @@ class CtypesManagedPipeline:
                 # before removing the bin.
                 if tee:
                     gobject.g_object_unref(tee)
+            if branch.parent_bin_owned and branch.parent_bin:
+                gobject.g_object_unref(branch.parent_bin)
 
     def _poll(self) -> None:
         while not self._stopped:

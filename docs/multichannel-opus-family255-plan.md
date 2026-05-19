@@ -164,6 +164,14 @@ The multichannel-opus refactor lands at the same time as the spine's per-channel
 
 Tests added during multichannel-opus work should assert: (a) the queue is named `rx_clkbuf_K` and is present per output channel, (b) `max-size-time` matches the resolved per-transport override at attach time, and (c) `/api/diagnostics/rx-clock-buffers` reports the expected depths for a fixture with mixed free-running and adaptive RX transports.
 
+**Telemetry surface added in this commit alongside the queue (drives operator-facing UI for both modes):**
+
+- Per output channel on `/api/status`: `buffer_fill_ms`, `buffer_max_ms`, `overrun_count`, `underrun_count`, `recent_slips[]`. Subscribe to the queue's `overrun` / `underrun` GstSignals at RX attach in `CtypesManagedPipeline` and increment counters; the ring of recent slip events lives in `telemetry.py` next to the existing meter observations.
+- Per RX leg: `estimated_drift_ppm` (rolling fill-slope integration in `telemetry.py`) and `opus_plc_count` (hooked off opusdec's PLC accounting).
+- System-wide: `asiosrc_measured_rate_hz` from samples-delivered / wall-elapsed.
+
+UI sparkline + color thresholds are detailed in [planv2.md](../planv2.md) under "Clock-related telemetry surface". The full adaptive-only fields (`lock_state`, `applied_ratio_ppm`) wait for the rate-slewing workstream; the field names are reserved so they can land without a snapshot-shape change.
+
 ## Out of scope (deferred)
 
 - Per-encode-group "discrete vs paired" toggle for bitrate efficiency on stereo-program use cases. Add later if bandwidth becomes a practical concern.
