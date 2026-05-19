@@ -1917,11 +1917,19 @@ function StreamDrawer({ ch, onClose }) {
   const [port, setPort] = useState(String(details.port || ((cfg.network && cfg.network.srt_port) || 9000)));
   const [latencyMs, setLatencyMs] = useState(String(details.latency_ms || (programSrt.srt_latency_ms || 240)));
 
-  // SRT extras (per-transport overrides; backend may not persist all of these yet).
-  const hasEncryptionOverride = details.encryption_enabled != null;
+  // SRT extras (per-transport overrides). All Optional on the schema: null = inherit program.
+  const hasEncryptionOverride = details.encryption_enabled != null || details.encryption_strength != null || details.passphrase != null;
   const [overrideEncryption, setOverrideEncryption] = useState(hasEncryptionOverride);
   const [encEnabled, setEncEnabled] = useState(details.encryption_enabled != null ? !!details.encryption_enabled : !!programSrt.encryption_enabled);
   const [encStrength, setEncStrength] = useState(details.encryption_strength || programSrt.encryption_strength || "aes-256");
+  // Passphrase is per-transport override. The API masks secrets as "********"
+  // (config GET) or "**********" (model_dump JSON), so any all-asterisk string
+  // means "secret is set, keep as-is" — don't echo it back into the form.
+  const isPassphraseMask = (v) => typeof v === "string" && /^\*+$/.test(v) && v.length >= 6;
+  const passphraseIsMasked = isPassphraseMask(details.passphrase);
+  const [encPassphrase, setEncPassphrase] = useState(passphraseIsMasked || !details.passphrase ? "" : details.passphrase);
+  const [revealPassphrase, setRevealPassphrase] = useState(false);
+  const [passphraseCopyState, setPassphraseCopyState] = useState("idle");
 
   const hasOverheadOverride = details.srt_overhead_bandwidth_percent != null;
   const [overrideOverhead, setOverrideOverhead] = useState(hasOverheadOverride);
@@ -1980,27 +1988,52 @@ function StreamDrawer({ ch, onClose }) {
       ...(host.trim() ? { host: host.trim() } : {}),
       encode_group_ids: details.encode_group_ids || [],
     };
+    // All override fields use explicit null = "inherit program". The API replaces
+    // the whole transport on PUT, so we must always send these keys (with null
+    // when the override toggle is off) to clear any prior override.
     if (overrideEncryption) {
       body.encryption_enabled = !!encEnabled;
       body.encryption_strength = encStrength;
+      const pp = (encPassphrase || "").trim();
+      // Skip if input is empty or still the masked sentinel — leaves existing value untouched.
+      if (pp && pp !== "********") {
+        body.passphrase = pp;
+      } else if (!passphraseIsMasked) {
+        body.passphrase = null;
+      }
+    } else {
+      body.encryption_enabled = null;
+      body.encryption_strength = null;
+      if (!passphraseIsMasked) body.passphrase = null;
     }
     if (overrideOverhead) {
       body.srt_overhead_bandwidth_percent = clampInt(overheadPct, 0, 100);
+    } else {
+      body.srt_overhead_bandwidth_percent = null;
     }
     if (overrideBandwidth) {
       body.srt_bandwidth_mode = bandwidthMode;
       const cap = String(bandwidthCap).trim();
       body.inbound_bandwidth_cap_kbps = bandwidthMode === "manual" && cap ? clampInt(cap, 64, 100000) : null;
+    } else {
+      body.srt_bandwidth_mode = null;
+      body.inbound_bandwidth_cap_kbps = null;
     }
-    if (!isTx && overrideClock) {
-      body.clock_recovery_mode = clockMode;
-      body.free_running_clock = { jitter_buffer_ms: clampInt(clockBufferMs, 20, 5000) };
+    if (!isTx) {
+      if (overrideClock) {
+        body.clock_recovery_mode = clockMode;
+        body.free_running_clock = { jitter_buffer_ms: clampInt(clockBufferMs, 20, 5000) };
+      } else {
+        body.clock_recovery_mode = null;
+        body.free_running_clock = null;
+      }
     }
     return body;
   };
 
-  const saveGroup = async () => {
-    if (!groupCfg) return;
+  // Shared between save and duplicate so pending Opus override edits aren't dropped.
+  const buildGroupBody = (idOverride, nameOverride) => {
+    if (!groupCfg) return null;
     const newCount = clampInt(channelCount, 1, 255);
     const existing = new Map((groupCfg.channels || []).map(c => [c.index, c]));
     const channels = [];
@@ -2012,9 +2045,9 @@ function StreamDrawer({ ch, onClose }) {
         gain_db: 0,
       });
     }
-    const body = {
-      id: groupCfg.id,
-      name: groupCfg.name,
+    return {
+      id: idOverride || groupCfg.id,
+      name: nameOverride || groupCfg.name,
       channel_count: newCount,
       channels,
       enabled: groupCfg.enabled !== false,
@@ -2027,6 +2060,11 @@ function StreamDrawer({ ch, onClose }) {
         expected_packet_loss_percent: clampInt(opus.expected_packet_loss_percent, 0, 30),
       } : { ...programDefaults },
     };
+  };
+
+  const saveGroup = async () => {
+    const body = buildGroupBody();
+    if (!body) return;
     const r = await fetch(`/api/encode-groups/${encodeURIComponent(groupCfg.id)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -2076,17 +2114,12 @@ function StreamDrawer({ ch, onClose }) {
       const newId = `${baseId}-copy`;
       const newName = `${name || ch.name} (copy)`;
       // Clone the encode group first (TX path), then the transport pointing at it.
+      // Use buildGroupBody so pending override edits (Opus, channel count) are
+      // preserved in the duplicate, matching how buildBody handles transport overrides.
       let newGroupIds = [];
       if (isSrt && isTx && groupCfg) {
         const newGroupId = `${groupCfg.id}-copy`;
-        const groupBody = {
-          id: newGroupId,
-          name: `${groupCfg.name} (copy)`,
-          channel_count: groupCfg.channel_count,
-          channels: groupCfg.channels,
-          opus: groupCfg.opus,
-          enabled: groupCfg.enabled !== false,
-        };
+        const groupBody = buildGroupBody(newGroupId, `${groupCfg.name} (copy)`);
         const gr = await fetch(`/api/encode-groups`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify(groupBody),
@@ -2108,6 +2141,29 @@ function StreamDrawer({ ch, onClose }) {
       console.error("[stream-drawer] duplicate failed", e);
       setSaveError(String(e.message || e));
       setSaveState("error");
+    }
+  };
+
+  const copyTransportPassphrase = async () => {
+    setPassphraseCopyState("copying");
+    try {
+      const r = await fetch("/api/config/export?include_secrets=true");
+      if (!r.ok) throw new Error(await r.text());
+      const full = await r.json();
+      const transportId = details.id || ch.runtime_id;
+      const t = ((full && full.srt_transports) || []).find(x => x.id === transportId);
+      // Per-transport passphrase wins; otherwise fall back to program (what the pipeline does).
+      const value = (t && t.passphrase && !isPassphraseMask(t.passphrase))
+        ? t.passphrase
+        : (full && full.program && full.program.srt_passphrase);
+      if (!value || isPassphraseMask(value)) throw new Error("passphrase is not available");
+      await writeClipboardText(value);
+      setPassphraseCopyState("copied");
+      window.setTimeout(() => setPassphraseCopyState("idle"), 1400);
+    } catch (e) {
+      console.error("[stream-drawer] passphrase copy failed", e);
+      setPassphraseCopyState("error");
+      window.setTimeout(() => setPassphraseCopyState("idle"), 1800);
     }
   };
 
@@ -2161,12 +2217,45 @@ function StreamDrawer({ ch, onClose }) {
           onToggle={setOverrideEncryption}>
           <FieldRow>
             <Field label="Encryption" w={120}><ToggleButton value={encEnabled} onChange={setEncEnabled} /></Field>
-            <Field label="Strength" grow>
+            <Field label="Strength" w={160}>
               <select value={encStrength} onChange={e => setEncStrength(e.target.value)} disabled={!encEnabled} className="ab-mono" style={{ ...cfgInputStyle, height: 22, opacity: encEnabled ? 1 : 0.5 }}>
                 <option value="aes-128">aes-128</option>
                 <option value="aes-192">aes-192</option>
                 <option value="aes-256">aes-256</option>
               </select>
+            </Field>
+            <Field label="Passphrase" grow>
+              <div style={{ display: "flex", gap: 4 }}>
+                <input
+                  type={revealPassphrase ? "text" : "password"}
+                  value={encPassphrase}
+                  onChange={e => setEncPassphrase(e.target.value)}
+                  disabled={!encEnabled}
+                  placeholder={passphraseIsMasked ? "set (leave blank to keep)" : "inherit from program"}
+                  className="ab-mono"
+                  style={{ ...cfgInputStyle, height: 22, opacity: encEnabled ? 1 : 0.5, flex: 1 }}
+                />
+                <button
+                  type="button"
+                  className="ab-btn"
+                  data-variant="ghost"
+                  disabled={!encEnabled}
+                  onClick={() => setRevealPassphrase(v => !v)}
+                  title={revealPassphrase ? "Hide passphrase" : "Show passphrase"}
+                  style={{ height: 22, fontSize: 10.5, padding: "0 6px" }}>
+                  {revealPassphrase ? "hide" : "show"}
+                </button>
+                <button
+                  type="button"
+                  className="ab-btn"
+                  data-variant="ghost"
+                  disabled={!encEnabled || passphraseCopyState === "copying"}
+                  onClick={copyTransportPassphrase}
+                  title="Copy the active passphrase (this transport's override, or the inherited program passphrase) to the clipboard."
+                  style={{ height: 22, fontSize: 10.5, padding: "0 6px" }}>
+                  {passphraseCopyState === "copied" ? "copied" : passphraseCopyState === "error" ? "error" : passphraseCopyState === "copying" ? "..." : "copy"}
+                </button>
+              </div>
             </Field>
           </FieldRow>
         </OverrideSection>

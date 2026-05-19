@@ -6,12 +6,22 @@ from typing import Any
 from app.core.config import (
     AudioConfig,
     EncodeGroupConfig,
+    EncryptionStrength,
     EndpointConfig,
+    OpusStreamConfig,
     SourceConfig,
     SourceKind,
     SrtTransportConfig,
     SrtTransportDirection,
 )
+
+
+_OPUS_BITRATE_TYPE = {"cbr": 0, "vbr": 1, "cvbr": 2}
+_SRT_PBKEYLEN = {
+    EncryptionStrength.aes128: 16,
+    EncryptionStrength.aes192: 24,
+    EncryptionStrength.aes256: 32,
+}
 
 
 class MediaGraphValidationError(ValueError):
@@ -58,7 +68,7 @@ class MediaGraphBuilder:
         selected_groups = [group_by_id[group_id] for group_id in transport.encode_group_ids]
         port = transport.port or config.network.srt_port
         latency_ms = transport.latency_ms or config.program.srt_latency_ms
-        uri = self._build_srt_uri(transport.host, port, transport.mode.value, latency_ms)
+        uri = self._build_srt_uri(config, transport, port, latency_ms)
         srt_element_name = self._srt_element_name(transport.id, transport.direction.value)
 
         if transport.direction == SrtTransportDirection.rx:
@@ -285,8 +295,7 @@ class MediaGraphBuilder:
             "!",
             "audioconvert",
             "!",
-            "opusenc",
-            f"bitrate={group.opus.bitrate_kbps * 1000}",
+            *self._opusenc_args(group.opus),
             "!",
             "mpegtsmux",
             "alignment=7",
@@ -529,7 +538,7 @@ class MediaGraphBuilder:
                 continue
             port = transport.port or config.network.srt_port
             latency_ms = transport.latency_ms or config.program.srt_latency_ms
-            uri = self._build_srt_uri(transport.host, port, transport.mode.value, latency_ms)
+            uri = self._build_srt_uri(config, transport, port, latency_ms)
             srt_name = self._srt_element_name(transport.id, transport.direction.value)
 
             # Only one encode group per TX is wired today (mirrors _build_tx_argv).
@@ -545,8 +554,7 @@ class MediaGraphBuilder:
                 "!",
                 "audioconvert",
                 "!",
-                "opusenc",
-                f"bitrate={group.opus.bitrate_kbps * 1000}",
+                *self._opusenc_args(group.opus),
                 "!",
                 "mpegtsmux",
                 "alignment=7",
@@ -704,7 +712,7 @@ class MediaGraphBuilder:
 
         port = transport.port or config.network.srt_port
         latency_ms = transport.latency_ms or config.program.srt_latency_ms
-        uri = self._build_srt_uri(transport.host, port, transport.mode.value, latency_ms)
+        uri = self._build_srt_uri(config, transport, port, latency_ms)
         srt_name = self._srt_element_name(transport.id, transport.direction.value)
         interleave_name = self._tx_leg_interleave_name(transport.id, group.id)
 
@@ -808,7 +816,7 @@ class MediaGraphBuilder:
             f"interleave name={interleave_name} "
             f"! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask)0x0 "
             f"! audioconvert "
-            f"! opusenc bitrate={group.opus.bitrate_kbps * 1000} "
+            f"! {' '.join(self._opusenc_args(group.opus))} "
             f"! mpegtsmux alignment=7 pat-interval=900 pmt-interval=900 "
             f"! srtsink name={srt_name} uri={uri} wait-for-connection=false async=false"
         )
@@ -861,7 +869,7 @@ class MediaGraphBuilder:
         sorted_channels = sorted(group.channels, key=lambda item: item.index)
         port = transport.port or config.network.srt_port
         latency_ms = transport.latency_ms or config.program.srt_latency_ms
-        uri = self._build_srt_uri(transport.host, port, transport.mode.value, latency_ms)
+        uri = self._build_srt_uri(config, transport, port, latency_ms)
         srt_name = self._srt_element_name(transport.id, transport.direction.value)
         split_name = f"rx_split_{''.join(char if char.isalnum() else '_' for char in transport.id)}"
         tap_name = self._rx_monitor_tap_name(transport.id)
@@ -1132,7 +1140,10 @@ class MediaGraphBuilder:
             argv.extend([
                 "audiomixer",
                 f"name={mixer_name}",
-                "latency=20000000",
+                # Mixer latency tracks the program Opus frame size so the mixer
+                # emits one output buffer per decoded packet. Decoupling these
+                # causes added latency (mixer > frame) or underruns (mixer < frame).
+                f"latency={config.program.opus.frame_ms * 1_000_000}",
                 "!",
                 "audioconvert",
                 "!",
@@ -1160,9 +1171,10 @@ class MediaGraphBuilder:
                 "!",
                 "queue",
                 f"name={self.spine_rx_clock_buffer_name(channel)}",
-                # Default 60ms post-bridge clock-recovery buffer; per-RX-transport
-                # overrides update max-size-time at attach time via g_object_set.
-                "max-size-time=60000000",
+                # Program-level free-running jitter buffer is the spine default;
+                # per-RX-transport overrides update max-size-time at attach time
+                # via g_object_set.
+                f"max-size-time={config.program.free_running_clock.jitter_buffer_ms * 1_000_000}",
                 "max-size-buffers=0",
                 "max-size-bytes=0",
                 "!",
@@ -1499,9 +1511,56 @@ class MediaGraphBuilder:
             "channels": [channel.model_dump(mode="json", exclude_none=True) for channel in sorted(group.channels, key=lambda item: item.index)],
         }
 
-    def _build_srt_uri(self, host: str | None, port: int, srt_mode: str, latency_ms: int) -> str:
-        authority = f"{host}:{port}" if host else f":{port}"
-        return f"srt://{authority}?mode={srt_mode}&latency={latency_ms}"
+    def _build_srt_uri(
+        self,
+        config: EndpointConfig,
+        transport: SrtTransportConfig,
+        port: int,
+        latency_ms: int,
+    ) -> str:
+        authority = f"{transport.host}:{port}" if transport.host else f":{port}"
+        params: list[str] = [
+            f"mode={transport.mode.value}",
+            f"latency={latency_ms}",
+        ]
+
+        program = config.program
+
+        # Override resolution: per-transport value (if not None) wins over program.
+        enc_enabled = transport.encryption_enabled if transport.encryption_enabled is not None else program.encryption_enabled
+        enc_strength = transport.encryption_strength or program.encryption_strength
+        if enc_enabled:
+            passphrase = transport.passphrase or program.srt_passphrase
+            if passphrase is not None:
+                secret = passphrase.get_secret_value() if hasattr(passphrase, "get_secret_value") else str(passphrase)
+                if secret:
+                    params.append(f"passphrase={secret}")
+                    params.append(f"pbkeylen={_SRT_PBKEYLEN[enc_strength]}")
+
+        bw_mode = transport.srt_bandwidth_mode or program.srt_bandwidth_mode
+        bw_cap = transport.inbound_bandwidth_cap_kbps if transport.inbound_bandwidth_cap_kbps is not None else program.inbound_bandwidth_cap_kbps
+        overhead = transport.srt_overhead_bandwidth_percent if transport.srt_overhead_bandwidth_percent is not None else program.srt_overhead_bandwidth_percent
+
+        # maxbw=0 lets SRT compute from input rate + oheadbw; manual mode pins the ceiling in B/s.
+        if bw_mode == "manual" and bw_cap:
+            maxbw_bytes_per_sec = bw_cap * 1000 // 8
+            params.append(f"maxbw={maxbw_bytes_per_sec}")
+        else:
+            params.append("maxbw=0")
+        params.append(f"oheadbw={overhead}")
+
+        return f"srt://{authority}?{'&'.join(params)}"
+
+    def _opusenc_args(self, opus: OpusStreamConfig) -> list[str]:
+        return [
+            "opusenc",
+            f"bitrate={opus.bitrate_kbps * 1000}",
+            f"bitrate-type={_OPUS_BITRATE_TYPE[opus.bitrate_mode]}",
+            f"frame-size={opus.frame_ms}",
+            f"complexity={opus.complexity}",
+            f"inband-fec={'true' if opus.inband_fec else 'false'}",
+            f"packet-loss-percentage={opus.expected_packet_loss_percent}",
+        ]
 
     def _argv_to_graph(self, argv: list[str]) -> str:
         graph_start = 1

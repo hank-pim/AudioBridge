@@ -151,12 +151,16 @@ class SrtTransportConfig(BaseModel):
     host: str | None = None
     port: int | None = Field(default=None, ge=1, le=65535)
     latency_ms: int | None = Field(default=None, ge=20, le=8000)
-    encryption_enabled: bool = True
-    encryption_strength: EncryptionStrength = EncryptionStrength.aes256
+    # All override fields use None = inherit from ProgramConfig. Non-None is an
+    # explicit per-transport override.
+    encryption_enabled: bool | None = None
+    encryption_strength: EncryptionStrength | None = None
     passphrase: SecretStr | None = None
+    srt_bandwidth_mode: Literal["auto", "manual"] | None = None
+    srt_overhead_bandwidth_percent: int | None = Field(default=None, ge=0, le=100)
+    inbound_bandwidth_cap_kbps: int | None = Field(default=None, ge=64, le=100000)
     encode_group_ids: list[str] = Field(default_factory=list)
     enabled: bool = True
-    # Per-transport overrides for clock recovery. None inherits from program.
     clock_recovery_mode: ClockRecoveryMode | None = None
     free_running_clock: FreeRunningClockConfig | None = None
 
@@ -206,6 +210,9 @@ class AudioConfig(BaseModel):
 
 
 class AdaptiveClockConfig(BaseModel):
+    # Reserved for the future adaptive clock-recovery control loop. These fields
+    # are not consumed by the pipeline today; they exist so the wire schema is
+    # stable when the loop lands. Do not surface in UI until consumers exist.
     convergence_window_seconds: int = Field(default=10, ge=5, le=60)
     steady_window_seconds: int = Field(default=300, ge=60, le=900)
     lock_ppm_threshold: float = Field(default=1.0, ge=0.1, le=10)
