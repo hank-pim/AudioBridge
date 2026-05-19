@@ -1,8 +1,8 @@
 # Dante Bridge
 
-Prototype endpoint app for a point-to-point Dante WAN bridge. The current build is a runnable control-plane and operator UI skeleton based on `planv2.md`; the GStreamer/Dante media plane is represented by explicit controller boundaries, subprocess diagnostics, and truthful null telemetry for observations that are not wired yet.
+Prototype endpoint app for a point-to-point Dante WAN bridge. The current build is a runnable control-plane and operator UI skeleton based on `planv2.md`; the media plane is built around GStreamer pipelines and a single full-duplex DVS spine that owns Dante Virtual Soundcard directly.
 
-The current media architecture pivot is documented in `docs/jack-audio-engine-plan.md`: JACK owns Dante Virtual Soundcard's ASIO driver once, while the app manages dynamic stream workers and Dante-facing routes.
+JACK is not part of the current runtime. The earlier JACK plan is kept in `docs/` as archived investigation material only.
 
 ## What Exists
 
@@ -27,6 +27,23 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8443
 Open `http://127.0.0.1:8443`.
 
 The app writes its endpoint config to `config/endpoint.toml` the first time settings are saved.
+
+## Runtime Requirements
+
+- Python 3.11 or newer.
+- GStreamer 1.22+ installed locally, with `gst-launch-1.0` and `gst-inspect-1.0` available on `PATH` or in the default Windows install path.
+- GStreamer plugins for SRT, Opus, MPEG-TS, audio conversion/resampling, audio test sources, and the host audio backend you plan to use.
+- Windows Dante I/O testing: Dante Virtual Soundcard installed/licensed in ASIO mode only, Dante Controller installed for routing/verification, and a GStreamer build with ASIO support (`asiosrc`/`asiosink`).
+- macOS Dante I/O testing is not currently packaged for this tester build.
+- Network access between endpoints for SRT transport ports.
+
+## Build a Distribution
+
+```powershell
+.\scripts\dist.ps1
+```
+
+Use `-SkipTests` to build without running the test suite first. The script cleans old build artifacts, ensures the `build` package is installed, builds a wheel, and writes `dist/dantebridge-tester.zip` for early Windows/macOS testing. The tester zip includes launcher scripts and creates a local virtual environment on first run; it expects the runtime requirements above to already be installed.
 
 ## API Shape
 

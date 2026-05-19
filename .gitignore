@@ -47,4 +47,3 @@ htmlcov/
 # Distribution
 *.whl
 .claude/
-app/services/media_graph.py
