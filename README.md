@@ -2,8 +2,6 @@
 
 Prototype endpoint app for a point-to-point Dante WAN bridge. The current build is a runnable control-plane and operator UI skeleton based on `planv2.md`; the media plane is built around GStreamer pipelines and a single full-duplex DVS spine that owns Dante Virtual Soundcard directly.
 
-JACK is not part of the current runtime. The earlier JACK plan is kept in `docs/` as archived investigation material only.
-
 ## What Exists
 
 - FastAPI service with REST and WebSocket APIs.
