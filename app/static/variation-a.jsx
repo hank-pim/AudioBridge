@@ -1086,39 +1086,12 @@ function RowActions({ ch, expanded, onToggle }) {
   const caps = runtime.capabilities || {};
   const supportsLifecycle = ch.entity_kind === "srt_transport"
     || (ch.entity_kind === "webrtc_stream" && !!caps.webrtc_media);
-  const diagnostics = (window.AB.status && window.AB.status.diagnostics) || {};
   const endpointBase = ch.entity_kind === "srt_transport"
     ? `/api/srt-transports/${encodeURIComponent(ch.runtime_id)}`
     : ch.entity_kind === "webrtc_stream"
       ? `/api/webrtc-streams/${encodeURIComponent(ch.runtime_id)}`
       : null;
-  const supportsListen = ch.entity_kind === "srt_transport" && ch.direction === "in";
-  const [monitorSession, setMonitorSession] = useState(null);
-  const monitorActiveForRow = !!monitorSession;
   const [actionState, setActionState] = useState({ tone: "idle", message: "" });
-
-  useEffect(() => {
-    return () => {
-      if (!monitorSession) return;
-      try { fetch(`/api/monitor-sessions/${monitorSession.sessionId}`, { method: "DELETE" }).catch(() => {}); } catch {}
-      try { monitorSession.pc.close(); } catch {}
-      if (monitorSession.audio && monitorSession.audio.parentNode) {
-        monitorSession.audio.parentNode.removeChild(monitorSession.audio);
-      }
-    };
-  }, [monitorSession]);
-
-  // If the transport stops while we're listening, drop the dead session.
-  useEffect(() => {
-    if (monitorSession && ch.state === "idle") {
-      try { fetch(`/api/monitor-sessions/${monitorSession.sessionId}`, { method: "DELETE" }).catch(() => {}); } catch {}
-      try { monitorSession.pc.close(); } catch {}
-      if (monitorSession.audio && monitorSession.audio.parentNode) {
-        monitorSession.audio.parentNode.removeChild(monitorSession.audio);
-      }
-      setMonitorSession(null);
-    }
-  }, [ch.state]);
 
   const refreshProgramView = async () => {
     await (window.AB.refreshAll ? window.AB.refreshAll() : Promise.resolve());
@@ -1259,7 +1232,6 @@ function RowActions({ ch, expanded, onToggle }) {
       {running
         ? <IconBtn tone="err" title={supportsLifecycle ? "Stop stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStop}><ActIcon.stop /></IconBtn>
         : <IconBtn tone="acc" title={supportsLifecycle ? "Start stream" : "Runtime start/stop is not available for this stream type"} disabled={!supportsLifecycle} onClick={handleProgramStart}><ActIcon.play /></IconBtn>}
-      <IconBtn tone={monitorActiveForRow ? "ok" : "info"} title={supportsListen ? (monitorActiveForRow ? "Stop monitor" : "Listen in browser") : "Listen is only available for RX SRT transports"} disabled={!supportsListen} onClick={handleListenToggle}><ActIcon.listen /></IconBtn>
       <IconBtn tone="info" title="Push to talk is not wired yet" disabled={true}><ActIcon.mic /></IconBtn>
       <IconBtn tone={expanded ? "acc" : "ghost"} title={expanded ? "Hide settings" : "Stream settings"} onClick={onToggle}><ActIcon.more /></IconBtn>
       <span
@@ -1575,16 +1547,7 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
       ? `monitor_tap_rx_${safeId(streamId)}_${idx}`
       : `monitor_tap_tx_${safeId(streamId)}_${safeId(group.id)}_${idx}`;
     try {
-      if (isRx) {
-        await startBrowserMonitor(idx, tapId);
-        return;
-      }
-      const res = await fetch(`/api/srt-transports/${encodeURIComponent(streamId)}/monitor-branches`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tap_id: tapId, audible: true }),
-      });
-      if (!res.ok) throw new Error(await res.text());
+      await startBrowserMonitor(idx, tapId);
     } catch (e) {
       console.error("[monitor] failed", e);
     }
@@ -1600,7 +1563,9 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
   }, [metersByTransport]);
   // RX: post-decode level for this transport (last readable point before Dante out).
   const rxMeterByCh = useMemo(() => meterRowsByChannel(streamId, "inputs"), [meterRowsByChannel, streamId]);
-  // TX: pre-encode spine capture meter, keyed by Dante input channel.
+  // TX: pre-encode per-transport branch meter, keyed by encode-group channel.
+  // The spine input meter is kept as a fallback for legacy Dante-only paths.
+  const txMeterByCh = useMemo(() => meterRowsByChannel(streamId, "outputs"), [meterRowsByChannel, streamId]);
   const spineMeterByCh = useMemo(() => meterRowsByChannel("spine", "inputs"), [meterRowsByChannel]);
   const channelCount = group.channel_count || 0;
   const start = page * perPage;
@@ -1612,11 +1577,13 @@ function ChannelStrip({ streamId, transportRunning, group, sources, metersByTran
     const effectiveSource = (pending[i] && pending[i].source_id) || ch.source_id;
     const isMuted = !isRx && effectiveSource === SILENCE_DEFAULT_SOURCE_ID;
     const meterCh = sourceMeterChannel(effectiveSource);
-    // TX: pre-encode spine capture meter for the routed Dante input channel.
+    // TX: pre-encode branch meter for this encoded channel. Fall back to the
+    // spine capture meter for Dante sources if a branch-level observation has
+    // not arrived yet.
     // RX: post-decode per-transport meter for this group channel index.
     const meter = isRx
       ? (rxMeterByCh.get(i) || {})
-      : (meterCh ? (spineMeterByCh.get(meterCh) || {}) : {});
+      : (txMeterByCh.get(i) || (meterCh ? (spineMeterByCh.get(meterCh) || {}) : {}));
     rows.push(
       <div key={`${streamId}-ch-${i}`}
            style={{ display: "grid", gridTemplateColumns: "38px 110px 140px 1fr 44px 22px 22px",

@@ -158,6 +158,9 @@ These work on a single endpoint with no peer connected, and remain available whi
 - **Link diagnostics**: continuous display of SRT RTT, RTT variance, packets lost, packets retransmitted, send/receive bitrate, buffer occupancy; WebRTC RTT, jitter, packet loss, current bitrate, ICE state.
 - **Clock-recovery telemetry** (Adaptive mode): frequency-lock ratio (ppm), phase-trim contribution (ppm), buffer occupancy (ms), occupancy bias from target (ms), slip event counter, time since last slip, lock state.
 - **Clock-recovery telemetry** (Free-running mode): glitch event counter, glitch interval (rolling average and last), accumulated offset since stream start, buffer occupancy.
+- connection time counter
+- connection and pipeline logging
+
 
 ## Pairing and setup
 
@@ -219,8 +222,8 @@ These work on a single endpoint with no peer connected, and remain available whi
 
 ## Platform support
 
-- Primary: Windows.
-- Secondary: macOS.
+- Primary: Windows.(ASIO)
+- Secondary: macOS.(WASPi)
 - Tertiary: Linux (PCIe-only, no DVS).
 - Single signed installer per platform; service auto-starts on boot; UI accessible immediately.
 

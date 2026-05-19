@@ -702,10 +702,10 @@ class MediaController:
         return {"running": True, "queues": queues}
 
     def _tx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
-        """Spine TX is used when every source for the leg is a dante_input AND
-        the audio interface driver is one the spine can open (i.e. real
-        capture). Non-dante sources (tones, silence) and unconfigured audio
-        interfaces stay on the legacy bundle path.
+        """Spine TX is used when the leg can attach to at least one dante_input
+        tap and every other source is self-contained inside the branch (tone or
+        silence). Pure tone/silence legs and unconfigured audio interfaces stay
+        on the legacy bundle path.
         """
         from app.core.config import SourceKind
 
@@ -713,6 +713,7 @@ class MediaController:
             return False
         if not config.audio.interface_name:
             return False
+        has_dante_input = False
         source_by_id = {s.id: s for s in config.sources if s.enabled}
         group_by_id = {g.id: g for g in config.encode_groups if g.enabled}
         for group_id in transport.encode_group_ids:
@@ -721,9 +722,13 @@ class MediaController:
                 return False
             for channel in group.channels:
                 source = source_by_id.get(channel.source_id or "")
-                if source is None or source.kind != SourceKind.dante_input:
+                if source is None:
                     return False
-        return True
+                if source.kind == SourceKind.dante_input:
+                    has_dante_input = True
+                elif source.kind not in {SourceKind.tone, SourceKind.silence}:
+                    return False
+        return has_dante_input
 
     def _rx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
         """RX spine legs require a configured playback device and an encode

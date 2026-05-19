@@ -13,6 +13,7 @@ from app.core.config import DEFAULT_CONFIG_PATH, EndpointConfig, SourceConfig, S
 
 
 SILENCE_DEFAULT_SOURCE_ID = "silence-default"
+TONE_DEFAULT_SOURCE_ID = "tone-default"
 
 
 def _slugify(value: str) -> str:
@@ -317,17 +318,28 @@ class ConfigStore:
         return True
 
     def _ensure_seed_sources(self) -> bool:
-        """Idempotently seed the global silence-default source.
+        """Idempotently seed global generator sources.
         Returns True if config was mutated."""
-        if any(s.id == SILENCE_DEFAULT_SOURCE_ID for s in self._config.sources):
+        existing = {s.id for s in self._config.sources}
+        seeded: list[SourceConfig] = []
+        if SILENCE_DEFAULT_SOURCE_ID not in existing:
+            seeded.append(SourceConfig(
+                id=SILENCE_DEFAULT_SOURCE_ID,
+                name="Silence",
+                kind=SourceKind.silence,
+            ))
+        if TONE_DEFAULT_SOURCE_ID not in existing:
+            seeded.append(SourceConfig(
+                id=TONE_DEFAULT_SOURCE_ID,
+                name="Tone 1 kHz",
+                kind=SourceKind.tone,
+                tone_frequency_hz=1000.0,
+                tone_level_dbfs=-20.0,
+            ))
+        if not seeded:
             return False
-        seeded = SourceConfig(
-            id=SILENCE_DEFAULT_SOURCE_ID,
-            name="Silence",
-            kind=SourceKind.silence,
-        )
         data = self._config.model_dump(mode="python")
-        data.setdefault("sources", []).insert(0, seeded.model_dump(mode="python"))
+        data.setdefault("sources", [])[0:0] = [s.model_dump(mode="python") for s in seeded]
         self._config = EndpointConfig.model_validate(data)
         return True
 

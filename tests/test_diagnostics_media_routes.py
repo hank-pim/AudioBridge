@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -42,6 +45,17 @@ class FakeProcess:
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
+
+
+def test_config_seeds_default_generator_sources() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/api/config")
+        assert response.status_code == 200
+        sources = {source["id"]: source for source in response.json()["sources"]}
+        assert sources["silence-default"]["kind"] == "silence"
+        assert sources["tone-default"]["kind"] == "tone"
+        assert sources["tone-default"]["tone_frequency_hz"] == 1000.0
+        assert sources["tone-default"]["tone_level_dbfs"] == -20.0
 
 
 def test_monitor_then_tone_lifecycle(monkeypatch) -> None:
@@ -537,6 +551,31 @@ def test_webrtc_streams_remain_stopped_without_runtime() -> None:
         assert stop_response.status_code == 200
 
 
+def test_monitor_audio_track_accumulates_fragmented_pcm() -> None:
+    from app.services.webrtc_monitor import _AppsinkAudioTrack, _SAMPLES_PER_FRAME
+
+    async def exercise() -> None:
+        track = _AppsinkAudioTrack()
+        loop = asyncio.get_running_loop()
+        first_half = np.arange(_SAMPLES_PER_FRAME // 2, dtype=np.int16)
+        second_half = np.arange(_SAMPLES_PER_FRAME // 2, _SAMPLES_PER_FRAME, dtype=np.int16)
+
+        track.push_pcm(first_half.tobytes(), loop)
+        await asyncio.sleep(0)
+        assert track._queue.empty()
+
+        track.push_pcm(second_half.tobytes(), loop)
+        await asyncio.sleep(0)
+        frame = await asyncio.wait_for(track.recv(), timeout=0.1)
+
+        assert frame.samples == _SAMPLES_PER_FRAME
+        assert frame.pts == 0
+        assert track._queue.empty()
+        assert track._pending_samples.size == 0
+
+    asyncio.run(exercise())
+
+
 def test_encode_group_crud_persists_channel_map() -> None:
     with TestClient(create_app()) as client:
         source = {
@@ -662,8 +701,8 @@ def test_media_graph_plan_exposes_tx_graph_from_configured_tone_sources() -> Non
             {
                 "id": "monitor_tap_tx_srt_main_enc_main_1",
                 "direction": "tx",
-                "stage": "post-encode-pre-mux",
-                "codec": "opus",
+                "stage": "post-level-pre-encode",
+                "codec": "raw",
                 "group_id": "enc-main",
                 "channel_index": 1,
                 "channel_count": 1,
@@ -1795,9 +1834,9 @@ def test_plan_tx_leg_branch_emits_per_channel_taps_and_one_srtsink() -> None:
     }
 
 
-def test_plan_tx_leg_branch_rejects_non_dante_sources() -> None:
-    """tone/silence sources cannot be pulled from a spine tee. The planner must
-    reject them rather than emitting a branch that can never link."""
+def test_plan_tx_leg_branch_allows_tone_sources_inside_spine_tx() -> None:
+    """Mixed Dante + tone TX legs keep Dante channels on spine taps while the
+    tone is generated inside the attached branch."""
     from app.core.config import (
         AudioConfig,
         EncodeGroupChannelConfig,
@@ -1820,12 +1859,16 @@ def test_plan_tx_leg_branch_rejects_non_dante_sources() -> None:
             channel_count=2,
         ),
         sources=[
+            SourceConfig(id="d1", name="D1", kind=SourceKind.dante_input, dante_channel=1),
             SourceConfig(id="tone-1", name="T", kind=SourceKind.tone, tone_frequency_hz=440.0),
         ],
         encode_groups=[
             EncodeGroupConfig(
-                id="enc", name="E", channel_count=1,
-                channels=[EncodeGroupChannelConfig(index=1, source_id="tone-1")],
+                id="enc", name="E", channel_count=2,
+                channels=[
+                    EncodeGroupChannelConfig(index=1, source_id="d1"),
+                    EncodeGroupChannelConfig(index=2, source_id="tone-1"),
+                ],
                 opus=OpusStreamConfig(bitrate_kbps=96),
             ),
         ],
@@ -1839,9 +1882,13 @@ def test_plan_tx_leg_branch_rejects_non_dante_sources() -> None:
     )
 
     plan = MediaGraphBuilder().plan_tx_leg_branch(cfg, "tx-t")
-    assert plan["valid"] is False
-    assert plan["branch_description"] is None
-    assert any(e["code"] == "non_dante_source_in_spine_tx" for e in plan["errors"])
+    assert plan["valid"] is True
+    assert plan["tap_names"] == ["spine_in_tee_1"]
+    assert plan["entry_element_names"] == ["in_1"]
+    assert "queue name=in_1" in plan["branch_description"]
+    assert "audiotestsrc is-live=true wave=sine freq=440.0" in plan["branch_description"]
+    assert "il_tx_t_enc.sink_0" in plan["branch_description"]
+    assert "il_tx_t_enc.sink_1" in plan["branch_description"]
 
 
 def test_plan_rx_leg_branch_emits_mixer_outputs_and_no_fakesink() -> None:
@@ -2004,10 +2051,14 @@ def test_spine_tx_path_attaches_branch_without_restarting_spine(monkeypatch) -> 
                 "sources": [
                     {"id": "d1", "name": "D1", "kind": "dante_input", "dante_channel": 1},
                     {"id": "d2", "name": "D2", "kind": "dante_input", "dante_channel": 2},
+                    {"id": "tone", "name": "Tone", "kind": "tone", "tone_frequency_hz": 1000},
                 ],
                 "encode_groups": [
                     {"id": "g-a", "name": "A", "channel_count": 1, "channels": [{"index": 1, "source_id": "d1"}]},
-                    {"id": "g-b", "name": "B", "channel_count": 1, "channels": [{"index": 1, "source_id": "d2"}]},
+                    {"id": "g-b", "name": "B", "channel_count": 2, "channels": [
+                        {"index": 1, "source_id": "d2"},
+                        {"index": 2, "source_id": "tone"},
+                    ]},
                 ],
                 "srt_transports": [
                     {"id": "tx-a", "name": "TX A", "direction": "tx", "mode": "listener", "port": 9301, "encode_group_ids": ["g-a"]},
@@ -2027,6 +2078,8 @@ def test_spine_tx_path_attaches_branch_without_restarting_spine(monkeypatch) -> 
         assert attach_calls[0]["entry_element_names"] == ["in_1"]
         assert "srtsink name=srtstats_tx_tx_a" in attach_calls[0]["description"]
         assert attach_calls[1]["tap_names"] == ["spine_in_tee_2"]
+        assert attach_calls[1]["entry_element_names"] == ["in_1"]
+        assert "audiotestsrc is-live=true wave=sine freq=1000.0" in attach_calls[1]["description"]
         assert "srtsink name=srtstats_tx_tx_b" in attach_calls[1]["description"]
         # Legacy bundle was never touched.
         assert bundle_calls == []

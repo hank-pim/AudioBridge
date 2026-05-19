@@ -29,6 +29,7 @@ class _AppsinkAudioTrack(MediaStreamTrack):
         super().__init__()
         self._queue: asyncio.Queue[av.AudioFrame] = asyncio.Queue(maxsize=50)
         self._pts: int = 0
+        self._pending_samples = np.empty(0, dtype=np.int16)
         self._closed = False
 
     async def recv(self) -> av.AudioFrame:
@@ -42,24 +43,36 @@ class _AppsinkAudioTrack(MediaStreamTrack):
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
         if samples.size == 0:
             return
-        offset = 0
-        while offset < samples.size:
-            chunk = samples[offset : offset + _SAMPLES_PER_FRAME]
-            offset += _SAMPLES_PER_FRAME
-            if chunk.size < _SAMPLES_PER_FRAME:
-                # Pad the trailing fragment so aiortc gets a full 20 ms frame.
-                padded = np.zeros(_SAMPLES_PER_FRAME, dtype=np.int16)
-                padded[: chunk.size] = chunk
-                chunk = padded
+        if self._pending_samples.size:
+            samples = np.concatenate((self._pending_samples, samples))
+        frame_count = samples.size // _SAMPLES_PER_FRAME
+        if frame_count == 0:
+            self._pending_samples = samples.copy()
+            return
+
+        complete_count = frame_count * _SAMPLES_PER_FRAME
+        complete_samples = samples[:complete_count]
+        self._pending_samples = samples[complete_count:].copy()
+
+        for offset in range(0, complete_samples.size, _SAMPLES_PER_FRAME):
+            chunk = np.ascontiguousarray(complete_samples[offset : offset + _SAMPLES_PER_FRAME])
             frame = av.AudioFrame.from_ndarray(chunk.reshape(1, -1), format="s16", layout="mono")
             frame.sample_rate = 48000
             frame.time_base = fractions.Fraction(1, 48000)
             frame.pts = self._pts
             self._pts += _SAMPLES_PER_FRAME
             try:
-                loop.call_soon_threadsafe(self._queue.put_nowait, frame)
+                loop.call_soon_threadsafe(self._enqueue_frame, frame)
             except RuntimeError:
                 return
+
+    def _enqueue_frame(self, frame: av.AudioFrame) -> None:
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            pass
 
     def close_track(self) -> None:
         self._closed = True

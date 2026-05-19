@@ -287,7 +287,6 @@ class MediaGraphBuilder:
             "!",
             "opusenc",
             f"bitrate={group.opus.bitrate_kbps * 1000}",
-            *self._tx_encoded_monitor_tee_argv(transport, group),
             "!",
             "mpegtsmux",
             "alignment=7",
@@ -354,6 +353,19 @@ class MediaGraphBuilder:
                     "message=true",
                     "interval=100000000",
                     "!",
+                    "audioconvert",
+                    "!",
+                    "audioresample",
+                    "!",
+                    "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+                    "!",
+                    "tee",
+                    f"name={self._tx_monitor_tap_name(transport.id, group.id, channel.index)}",
+                    "allow-not-linked=true",
+                    f"{self._tx_monitor_tap_name(transport.id, group.id, channel.index)}.",
+                    "!",
+                    "queue",
+                    "!",
                     sink_pad,
                 ])
             else:
@@ -372,6 +384,19 @@ class MediaGraphBuilder:
                     f"name={self._meter_element_name(group.id, channel.index)}",
                     "message=true",
                     "interval=100000000",
+                    "!",
+                    "audioconvert",
+                    "!",
+                    "audioresample",
+                    "!",
+                    "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+                    "!",
+                    "tee",
+                    f"name={self._tx_monitor_tap_name(transport.id, group.id, channel.index)}",
+                    "allow-not-linked=true",
+                    f"{self._tx_monitor_tap_name(transport.id, group.id, channel.index)}.",
+                    "!",
+                    "queue",
                     "!",
                     sink_pad,
                 ])
@@ -522,7 +547,6 @@ class MediaGraphBuilder:
                 "!",
                 "opusenc",
                 f"bitrate={group.opus.bitrate_kbps * 1000}",
-                *self._tx_encoded_monitor_tee_argv(transport, group),
                 "!",
                 "mpegtsmux",
                 "alignment=7",
@@ -558,6 +582,19 @@ class MediaGraphBuilder:
                         "message=true",
                         "interval=100000000",
                         "!",
+                        "audioconvert",
+                        "!",
+                        "audioresample",
+                        "!",
+                        "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+                        "!",
+                        "tee",
+                        f"name={self._tx_monitor_tap_name(transport.id, group.id, channel.index)}",
+                        "allow-not-linked=true",
+                        f"{self._tx_monitor_tap_name(transport.id, group.id, channel.index)}.",
+                        "!",
+                        "queue",
+                        "!",
                         sink_pad,
                     ])
                 else:
@@ -576,6 +613,19 @@ class MediaGraphBuilder:
                         f"name={meter_name}",
                         "message=true",
                         "interval=100000000",
+                        "!",
+                        "audioconvert",
+                        "!",
+                        "audioresample",
+                        "!",
+                        "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved",
+                        "!",
+                        "tee",
+                        f"name={self._tx_monitor_tap_name(transport.id, group.id, channel.index)}",
+                        "allow-not-linked=true",
+                        f"{self._tx_monitor_tap_name(transport.id, group.id, channel.index)}.",
+                        "!",
+                        "queue",
                         "!",
                         sink_pad,
                     ])
@@ -658,11 +708,13 @@ class MediaGraphBuilder:
         srt_name = self._srt_element_name(transport.id, transport.direction.value)
         interleave_name = self._tx_leg_interleave_name(transport.id, group.id)
 
-        # Per-channel feeder branches. Each ``queue name=in_K`` becomes the
-        # ghost sink pad sink_{K-1} on the bin. The level element name follows
-        # the existing dbmeter_out_<transport>_<group>_<channel> convention so
-        # the telemetry parser can still attribute per-channel meters to the
-        # right transport.
+        # Per-channel feeder branches. Dante inputs start with ``queue
+        # name=in_K`` so the runtime can ghost the queue sink and link it to
+        # the matching spine capture tee. Tone/silence inputs are self-contained
+        # audiotestsrc legs inside this branch, so they do not need a spine tap.
+        # The level element name follows the existing
+        # dbmeter_out_<transport>_<group>_<channel> convention so the telemetry
+        # parser can still attribute per-channel meters to the right transport.
         source_by_id = {source.id: source for source in config.sources if source.enabled}
         tap_names: list[str] = []
         entry_element_names: list[str] = []
@@ -675,18 +727,16 @@ class MediaGraphBuilder:
             meter_name = self._bundle_meter_name(transport.id, group.id, channel.index)
             if source.kind == SourceKind.dante_input:
                 tap_names.append(self.spine_capture_tee_name(source.dante_channel or 1))
-            else:
-                # tone/silence sources cannot pull from a spine tee — they would
-                # need their own audiotestsrc inside the bin. v1 spine TX legs
-                # require dante_input sources only; non-dante sources stay on
-                # the old per-leg subprocess path until commit 5 (or are
-                # rejected by the validator).
+            elif source.kind not in {SourceKind.tone, SourceKind.silence}:
+                # Validation should keep unsupported TX source kinds out of
+                # this planner. Keep a defensive error here so a bad runtime
+                # branch is never emitted.
                 if raise_on_error:
                     raise MediaGraphValidationError([
                         self._error(
                             transport.id, group.id,
-                            "non_dante_source_in_spine_tx",
-                            f"spine TX legs require dante_input sources; source '{source.id}' is {source.kind.value}",
+                            "unsupported_source_kind",
+                            f"source '{source.id}' kind '{source.kind.value}' is not supported by spine TX",
                             channel.index, source_id=source.id,
                         ),
                     ])
@@ -694,8 +744,8 @@ class MediaGraphBuilder:
                     "valid": False,
                     "errors": [self._error(
                         transport.id, group.id,
-                        "non_dante_source_in_spine_tx",
-                        f"spine TX legs require dante_input sources; source '{source.id}' is {source.kind.value}",
+                        "unsupported_source_kind",
+                        f"source '{source.id}' kind '{source.kind.value}' is not supported by spine TX",
                         channel.index, source_id=source.id,
                     )],
                     "transport_id": transport_id,
@@ -703,6 +753,29 @@ class MediaGraphBuilder:
                     "tap_names": [], "entry_element_names": [],
                     "srt_element_name": None, "meter_endpoints": [],
                 }
+
+            if source.kind in {SourceKind.tone, SourceKind.silence}:
+                meter_endpoints.append({
+                    "transport_id": transport.id,
+                    "channel": channel.index,
+                    "direction": "out",
+                    "element_name": meter_name,
+                })
+                parts.append(
+                    f"{self._source_element(source)} is-live=true "
+                    f"{' '.join(self._source_properties(source))} "
+                    f"! audioconvert "
+                    f"! audioresample "
+                    f"! audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0 "
+                    f"! level name={meter_name} message=true interval=100000000 "
+                    f"! audioconvert "
+                    f"! audioresample "
+                    f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
+                    f"! tee name={self._tx_monitor_tap_name(transport.id, group.id, channel.index)} allow-not-linked=true "
+                    f"{self._tx_monitor_tap_name(transport.id, group.id, channel.index)}. ! queue "
+                    f"! {interleave_name}.sink_{channel.index - 1}"
+                )
+                continue
 
             entry_element_names.append(entry_name)
             meter_endpoints.append({
@@ -717,6 +790,11 @@ class MediaGraphBuilder:
                 f"! audioconvert "
                 f"! audio/x-raw,format=S16LE,rate=48000,channels=1,channel-mask=(bitmask)0x0 "
                 f"! level name={meter_name} message=true interval=100000000 "
+                f"! audioconvert "
+                f"! audioresample "
+                f"! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
+                f"! tee name={self._tx_monitor_tap_name(transport.id, group.id, channel.index)} allow-not-linked=true "
+                f"{self._tx_monitor_tap_name(transport.id, group.id, channel.index)}. ! queue "
                 f"! {interleave_name}.sink_{channel.index - 1}"
             )
 
@@ -731,7 +809,6 @@ class MediaGraphBuilder:
             f"! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels={n},channel-mask=(bitmask)0x0 "
             f"! audioconvert "
             f"! opusenc bitrate={group.opus.bitrate_kbps * 1000} "
-            f"{self._tx_encoded_monitor_tee_graph(transport, group)} "
             f"! mpegtsmux alignment=7 pat-interval=900 pmt-interval=900 "
             f"! srtsink name={srt_name} uri={uri} wait-for-connection=false async=false"
         )
@@ -752,32 +829,6 @@ class MediaGraphBuilder:
         # Reuse the same naming as the legacy bundle so telemetry/meter parsing
         # stays consistent.
         return self._bundle_interleave_name(transport_id, group_id)
-
-    def _tx_encoded_monitor_tee_argv(
-        self,
-        transport: SrtTransportConfig,
-        group: EncodeGroupConfig,
-    ) -> list[str]:
-        argv: list[str] = []
-        for channel in sorted(group.channels, key=lambda item: item.index):
-            tap_name = self._tx_monitor_tap_name(transport.id, group.id, channel.index)
-            argv.extend([
-                "!",
-                "tee",
-                f"name={tap_name}",
-                "allow-not-linked=true",
-                f"{tap_name}.",
-                "!",
-                "queue",
-            ])
-        return argv
-
-    def _tx_encoded_monitor_tee_graph(
-        self,
-        transport: SrtTransportConfig,
-        group: EncodeGroupConfig,
-    ) -> str:
-        return " ".join(self._tx_encoded_monitor_tee_argv(transport, group))
 
     def plan_rx_leg_branch(
         self,
@@ -1367,11 +1418,11 @@ class MediaGraphBuilder:
                 taps.append({
                     "id": self._tx_monitor_tap_name(transport.id, group.id, channel.index),
                     "direction": transport.direction.value,
-                    "stage": "post-encode-pre-mux",
-                    "codec": "opus",
+                    "stage": "post-level-pre-encode",
+                    "codec": "raw",
                     "group_id": group.id,
                     "channel_index": channel.index,
-                    "channel_count": group.channel_count,
+                    "channel_count": 1,
                     "source_id": channel.source_id,
                 })
         return taps
