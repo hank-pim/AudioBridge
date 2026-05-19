@@ -47,3 +47,4 @@ htmlcov/
 # Distribution
 *.whl
 .claude/
+_design/
