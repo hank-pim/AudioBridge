@@ -71,26 +71,36 @@ The receiver's Dante audio clock and the sender's Dante audio clock are independ
 - Free-running for workflows with explicit glitch-tolerant re-sync points.
 - Sample-accurate sync across the bridge is **not possible** on open-internet point-to-point; that requires a shared timing reference (PTP grandmaster, GPS-disciplined references, or equivalent), which by definition means both sites are on a single logical network and should route Dante natively over a layer-2 transport rather than encode/decode through this bridge.
 
-**Implementation status (as of multichannel-opus pre-commit):**
+**Implementation status:**
 
 - Spine playback chain instantiates one `queue name=rx_clkbuf_K` per output channel between `interaudiosrc` and `audiomixer.sink_K`. This is the post-bridge clock-recovery reservoir; its `max-size-time` is the configured jitter-buffer depth, and `current-level-time` is the observable for the adaptive loop. Default depth at spine build time: 60 ms.
 - Diagnostic surface: `GET /api/diagnostics/rx-clock-buffers` reports `max-size-time / current-level-time / current-level-buffers` per channel. Used to verify per-transport overrides land.
 - Free-running mode is wired end-to-end: `SrtTransportConfig.clock_recovery_mode = free_running` + `free_running_clock.jitter_buffer_ms` → resolved at RX attach in `media.py` → pushed onto the spine queue via `CtypesManagedPipeline.set_queue_max_size_time`. Per-transport override falls back to `program.clock_recovery_mode` / `program.free_running_clock` when unset.
-- Adaptive mode currently does **nothing** in the pipeline. `AdaptiveClockConfig` (convergence window, lock PPM threshold, lock hold, ratio clamp) is declared in `config.py` but not yet wired. RX legs in adaptive mode currently fall through to the default 60 ms queue depth — i.e. equivalent to a 60 ms free-run today.
+- Adaptive mode has explicit starting-depth wiring: `SrtTransportConfig.adaptive_clock: AdaptiveClockConfig | None` mirrors `free_running_clock`, and `AdaptiveClockConfig.initial_buffer_ms` (default 120 ms) is applied to `rx_clkbuf_K.max-size-time` at RX attach the same way `jitter_buffer_ms` is for free-running. No rate-slewing element and no control loop yet — adaptive mode currently behaves as a fixed `initial_buffer_ms` free-run.
+- The RX-leg branch names its decoder `opusdec_rx_<transport_id>` so future probe work can hook it without restructuring the branch.
 
 **Remaining work to honor the documented adaptive design:**
 
-1. **Per-transport adaptive surface.** Add `adaptive_clock: AdaptiveClockConfig | None` override to `SrtTransportConfig` (mirrors the existing per-transport `free_running_clock` field). Add an `initial_buffer_ms` field to `AdaptiveClockConfig` so adaptive mode has an explicit starting depth applied to `rx_clkbuf_K.max-size-time` at attach time, the same way free-running's `jitter_buffer_ms` is.
-2. **Rate-slewing element insertion.** Insert one `audioresample` per channel between `interaudiosrc` and the `rx_clkbuf_K` queue (or move the whole chain through a single multichannel resampler post-interleave, per the "Resampler structure" section above — TBD by the spine-shape work). The resample ratio is the control-loop output.
-3. **Adaptive control loop.** Periodic task (sub-second tick) per active RX leg:
+1. **Rate-slewing element insertion.** Insert one `audioresample` per channel between `interaudiosrc` and the `rx_clkbuf_K` queue (or move the whole chain through a single multichannel resampler post-interleave, per the "Resampler structure" section above — TBD by the spine-shape work). The resample ratio is the control-loop output. See "Dead-branch lessons" below for what already failed.
+2. **Adaptive control loop.** Periodic task (sub-second tick) per active RX leg:
    - Read `rx_clkbuf_K.current-level-time` and tail of underrun events.
    - Frequency-lock estimator: integrate fill drift over the configured `convergence_window_seconds` to derive ppm offset.
    - Phase-trim PI: low-gain correction toward a target depth (typ. half `initial_buffer_ms`).
    - Output ratio clamped to `±ratio_clamp_ppm`; written to the per-channel `audioresample` via `g_object_set` on a runtime-settable property (likely needs the `audioresample` ratio surfaced as a custom property or driven via `gst_segment` math — confirm during impl).
    - Lock state emitted to telemetry (`telemetry.observe_clock(lock_state=...)`); UI's existing "locking → locked" indicator already consumes it.
-4. **Telemetry.** Expose per-RX-channel `buffer_fill_ms`, `estimated_ppm_offset`, and `slip_count` on the existing status snapshot. The diagnostic endpoint added in step 1 (`/api/diagnostics/rx-clock-buffers`) becomes the per-channel-fill source; the ppm/slip data is loop-side bookkeeping.
+3. **Telemetry.** Expose per-RX-channel `buffer_fill_ms`, `estimated_ppm_offset`, and `slip_count` on the existing status snapshot. The diagnostic endpoint (`/api/diagnostics/rx-clock-buffers`) becomes the per-channel-fill source; the ppm/slip data is loop-side bookkeeping.
 
-**Test plan (low-vs-high-latency sweep):** today, switch the transport to `free_running` and sweep `jitter_buffer_ms`. End-to-end wiring is validated. Once step 1 lands, the same sweep works under `adaptive` mode via `initial_buffer_ms`.
+**Dead-branch lessons (`dead/clock-recovery-attempt`, abandoned):**
+
+A first pass at items 1-3 was made and abandoned. The branch is preserved as a reference. Specific things that turned out to be wrong:
+
+- **Don't subscribe to `queue` `overrun`/`underrun` GstSignals as a slip source.** Those signals fire on queue-full / queue-empty transitions, not on audio drops. A small (~60 ms) queue between `interaudiosrc` and a demand-driven `audiomixer` sits near-empty in normal operation and emits `underrun` constantly — the counts climbed continuously while audio played fine. A real audio underrun shows up as silence insertion at the audiomixer (no GstSignal exists for that today); a real overrun only happens if the queue is `leaky` (ours isn't). A real dropout detector is a separate project; until it exists, slip counters should stay at 0 rather than be wired to GstSignals that lie.
+- **Don't sandwich a rate-slew between two fixed-rate capsfilters inside the RX-leg branch.** It can't negotiate. If a rate-slew lands, it goes inside the spine, between `rx_clkbuf_K` and the audiomixer, with a single mutable `capsfilter` declaring the slewed rate on the resample's output. The mixer accepts the slewed rate on its sink pad and internally aggregates to the spine's 48 kHz output — that aggregation is the actual clock-recovery action. Even this placement was only verified to build, not audibly validated end-to-end.
+- **Integer caps `rate` gives ~20.8 ppm (1 Hz / 48000) step granularity.** A PI loop clamped to ±50 ppm will dither across bucket boundaries; the loop's time constant has to absorb it. Sub-Hz would require a custom resampler.
+- **The queue-fill slope is not a usable drift observable in this spine shape.** Because the audiomixer is demand-driven by the local clock and the queue stays near-empty regardless of sender rate, slope is structurally near-zero. A separate sender-rate measurement (e.g. bytes / wall-time on the opusdec output, or a sender PTS-vs-wall comparison) is required. The dead-branch pad-probe code reached into the GstBuffer struct at hand-computed offsets — version-fragile and not worth carrying forward.
+- **SRT's RX-side prefill dumps ~240 ms of audio into opusdec faster than realtime at startup.** Any rate measurement that integrates over the first ~2 s will be contaminated. The control loop needs an explicit settling delay before lock-state can leave `initializing`.
+
+**Test plan (low-vs-high-latency sweep):** switch the transport to either `free_running` or `adaptive` and sweep the matching depth field (`jitter_buffer_ms` or `initial_buffer_ms`). Until the rate-slewing element and control loop land, adaptive mode behaves identically to a fixed-depth free-run at `initial_buffer_ms`.
 
 **Clock-related telemetry surface (lands with queue-fill work, regardless of mode):**
 

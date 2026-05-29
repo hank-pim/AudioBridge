@@ -143,6 +143,19 @@ class FreeRunningClockConfig(BaseModel):
     underrun_policy: Literal["silence", "repeat_last_sample"] = "silence"
 
 
+class AdaptiveClockConfig(BaseModel):
+    # Starting depth applied to rx_clkbuf_K.max-size-time at RX attach for
+    # adaptive mode (mirrors free_running_clock.jitter_buffer_ms). The future
+    # control loop will tune toward roughly half this value in steady state.
+    # Other fields are reserved for that loop and not consumed today.
+    initial_buffer_ms: int = Field(default=120, ge=20, le=5000)
+    convergence_window_seconds: int = Field(default=10, ge=5, le=60)
+    steady_window_seconds: int = Field(default=300, ge=60, le=900)
+    lock_ppm_threshold: float = Field(default=1.0, ge=0.1, le=10)
+    lock_hold_seconds: int = Field(default=30, ge=5, le=120)
+    ratio_clamp_ppm: float = Field(default=50.0, ge=1, le=200)
+
+
 class SrtTransportConfig(BaseModel):
     id: str
     name: str
@@ -163,6 +176,7 @@ class SrtTransportConfig(BaseModel):
     enabled: bool = True
     clock_recovery_mode: ClockRecoveryMode | None = None
     free_running_clock: FreeRunningClockConfig | None = None
+    adaptive_clock: AdaptiveClockConfig | None = None
 
 
 class StreamConfig(BaseModel):
@@ -207,17 +221,6 @@ class AudioConfig(BaseModel):
         if len(value) > 128:
             raise ValueError("streams cannot exceed 128 entries (TX + RX combined)")
         return value
-
-
-class AdaptiveClockConfig(BaseModel):
-    # Reserved for the future adaptive clock-recovery control loop. These fields
-    # are not consumed by the pipeline today; they exist so the wire schema is
-    # stable when the loop lands. Do not surface in UI until consumers exist.
-    convergence_window_seconds: int = Field(default=10, ge=5, le=60)
-    steady_window_seconds: int = Field(default=300, ge=60, le=900)
-    lock_ppm_threshold: float = Field(default=1.0, ge=0.1, le=10)
-    lock_hold_seconds: int = Field(default=30, ge=5, le=120)
-    ratio_clamp_ppm: float = Field(default=50.0, ge=1, le=200)
 
 
 class ProgramConfig(BaseModel):

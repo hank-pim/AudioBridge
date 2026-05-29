@@ -333,17 +333,22 @@ class MediaController:
                 )
             # Apply effective clock-recovery buffer depth to the per-channel
             # spine queues this RX leg writes into. Per-transport override
-            # falls back to program-level config when unset. Free-running mode
-            # pins max-size-time to the configured jitter_buffer_ms; adaptive
-            # mode leaves the default in place (control loop will tune it).
+            # falls back to program-level config when unset. Both modes pin an
+            # explicit starting depth — free-running's jitter_buffer_ms or
+            # adaptive's initial_buffer_ms — so adaptive mode no longer falls
+            # through to the default 60 ms. The future adaptive control loop
+            # will tune from this starting depth once it lands.
             effective_mode = transport.clock_recovery_mode or config.program.clock_recovery_mode
             effective_free = transport.free_running_clock or config.program.free_running_clock
+            effective_adaptive = transport.adaptive_clock or config.program.adaptive_clock
             if effective_mode == ClockRecoveryMode.free_running:
                 depth_ns = effective_free.jitter_buffer_ms * 1_000_000
-                for ch_name in leg_plan.get("interaudio_channels", []):
-                    if ch_name.startswith("spine_out_"):
-                        k = ch_name.removeprefix("spine_out_")
-                        spine.set_queue_max_size_time(f"rx_clkbuf_{k}", depth_ns)
+            else:
+                depth_ns = effective_adaptive.initial_buffer_ms * 1_000_000
+            for ch_name in leg_plan.get("interaudio_channels", []):
+                if ch_name.startswith("spine_out_"):
+                    k = ch_name.removeprefix("spine_out_")
+                    spine.set_queue_max_size_time(f"rx_clkbuf_{k}", depth_ns)
             pipeline = spine
             self._srt_transport_pipelines[transport_id] = pipeline
             runtime_note = (

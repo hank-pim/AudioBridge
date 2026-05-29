@@ -873,12 +873,13 @@ class MediaGraphBuilder:
         srt_name = self._srt_element_name(transport.id, transport.direction.value)
         split_name = f"rx_split_{''.join(char if char.isalnum() else '_' for char in transport.id)}"
         tap_name = self._rx_monitor_tap_name(transport.id)
+        opusdec_name = self._rx_opusdec_name(transport.id)
 
         parts: list[str] = [
             f"srtsrc name={srt_name} uri={uri}",
             "! tsdemux",
             f"! tee name={tap_name} allow-not-linked=true",
-            f"{tap_name}. ! queue ! opusdec ! audioconvert ! audioresample",
+            f"{tap_name}. ! queue ! opusdec name={opusdec_name} ! audioconvert ! audioresample",
             f"! audio/x-raw,format=S16LE,rate=48000,channels={n},layout=interleaved",
             f"! deinterleave name={split_name}",
         ]
@@ -943,6 +944,7 @@ class MediaGraphBuilder:
             "meter_endpoints": meter_endpoints,
             "monitor_taps": self._rx_monitor_taps(transport.id, n),
             "interaudio_channels": interaudio_channels,
+            "opusdec_element_name": opusdec_name,
         }
 
     # --- spine planner (commit 1 of dynamic-pipeline refactor) ---
@@ -1443,6 +1445,10 @@ class MediaGraphBuilder:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
         suffix = "" if channel_index is None else f"_{channel_index}"
         return f"monitor_tap_rx_{safe_transport}{suffix}"
+
+    def _rx_opusdec_name(self, transport_id: str) -> str:
+        safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
+        return f"opusdec_rx_{safe_transport}"
 
     def _tx_monitor_tap_name(self, transport_id: str, group_id: str, channel_index: int) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
