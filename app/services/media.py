@@ -333,17 +333,45 @@ class MediaController:
                 )
             # Apply effective clock-recovery buffer depth to the per-channel
             # spine queues this RX leg writes into. Per-transport override
-            # falls back to program-level config when unset. Free-running mode
-            # pins max-size-time to the configured jitter_buffer_ms; adaptive
-            # mode leaves the default in place (control loop will tune it).
+            # falls back to program-level config when unset. Both modes pin an
+            # explicit starting depth; the adaptive control loop tunes from
+            # there once it lands.
             effective_mode = transport.clock_recovery_mode or config.program.clock_recovery_mode
             effective_free = transport.free_running_clock or config.program.free_running_clock
+            effective_adaptive = transport.adaptive_clock or config.program.adaptive_clock
+            leg_channel_indices: list[int] = []
+            for ch_name in leg_plan.get("interaudio_channels", []):
+                if ch_name.startswith("spine_out_"):
+                    k_text = ch_name.removeprefix("spine_out_")
+                    if k_text.isdigit():
+                        leg_channel_indices.append(int(k_text))
             if effective_mode == ClockRecoveryMode.free_running:
                 depth_ns = effective_free.jitter_buffer_ms * 1_000_000
-                for ch_name in leg_plan.get("interaudio_channels", []):
-                    if ch_name.startswith("spine_out_"):
-                        k = ch_name.removeprefix("spine_out_")
-                        spine.set_queue_max_size_time(f"rx_clkbuf_{k}", depth_ns)
+            else:
+                depth_ns = effective_adaptive.initial_buffer_ms * 1_000_000
+            for k in leg_channel_indices:
+                spine.set_queue_max_size_time(f"rx_clkbuf_{k}", depth_ns)
+            # Tell telemetry which output channels this RX leg owns so per-leg
+            # drift / overrun / underrun rollups know which per-channel samples
+            # to aggregate. Cleared in mark_srt_transport(running=False).
+            self.telemetry.register_clock_leg_channels(transport_id, leg_channel_indices)
+            self.telemetry.observe_clock_leg(transport_id, lock_state="initializing")
+            # Initialize each spine-side rate-slew capsfilter this leg occupies
+            # to 0 ppm. Free-running mode leaves it at zero forever; adaptive
+            # mode's control loop drives it once it lands.
+            for k in leg_channel_indices:
+                cf_name = builder.spine_rateslew_capsfilter_name(k)
+                spine.set_spine_channel_rate_slew(cf_name, 0.0)
+            self.telemetry.observe_clock_leg(transport_id, applied_ratio_ppm=0.0)
+            # Pad-probe-based PLC counter on this leg's opusdec.
+            opusdec_name = leg_plan.get("opusdec_element_name")
+            if opusdec_name:
+                # opusdec outputs S16LE × group.channel_count at 48 kHz; the
+                # probe uses this to convert bytes → samples → measured rate.
+                group_by_id = {g.id: g for g in config.encode_groups if g.enabled}
+                rx_group = group_by_id.get(transport.encode_group_ids[0]) if transport.encode_group_ids else None
+                rx_channels = rx_group.channel_count if rx_group else 1
+                spine.install_rx_leg_probes(transport_id, opusdec_name, rx_channels)
             pipeline = spine
             self._srt_transport_pipelines[transport_id] = pipeline
             runtime_note = (
@@ -404,12 +432,20 @@ class MediaController:
         if transport_id in self._spine_rx_branches:
             handle = self._spine_rx_branches.pop(transport_id)
             spine = self._spine_pipeline
+            # Snapshot the leg's channels before mark_srt_transport drops them,
+            # so we can reset the spine rate-slew back to 0 ppm. Otherwise a
+            # future RX leg attached to the same channels would inherit the
+            # stopped leg's last slew value until the loop re-tuned it.
+            leg_channels = list(self.telemetry.clock_leg_channels.get(transport_id, ()))
             if spine is not None:
                 try:
                     spine.detach_branch(handle)
                 except Exception:
                     pass
                 self._unregister_spine_srt_endpoint(transport_id)
+                builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
+                for k in leg_channels:
+                    spine.set_spine_channel_rate_slew(builder.spine_rateslew_capsfilter_name(k), 0.0)
             self._srt_transport_pipelines.pop(transport_id, None)
             self.telemetry.mark_srt_transport(transport_id, False)
             return
@@ -659,6 +695,11 @@ class MediaController:
                 channel_count=plan["channel_count"],
             )
             self._spine_pipeline = pipeline
+            # Wall-clock sample-rate measurement on the local ASIO capture.
+            pipeline.install_asiosrc_probe(
+                plan["gstreamer"]["asiosrc_element_name"],
+                plan["channel_count"],
+            )
             return {
                 "running": True,
                 "already_running": False,
@@ -698,8 +739,49 @@ class MediaController:
             levels = spine.get_queue_levels(name)
             if levels is None:
                 continue
-            queues.append({"channel": channel, "queue": name, **levels})
+            row: dict[str, Any] = {"channel": channel, "queue": name, **levels}
+            telemetry_obs = self.telemetry.clock_channels.get(channel)
+            if telemetry_obs is not None:
+                row["overrun_count"] = telemetry_obs.overrun_count
+                row["underrun_count"] = telemetry_obs.underrun_count
+                row["estimated_drift_ppm"] = telemetry_obs.estimated_drift_ppm()
+                row["recent_slips"] = [
+                    {"timestamp": t, "kind": k} for (t, k) in list(telemetry_obs.recent_slips)
+                ]
+            queues.append(row)
         return {"running": True, "queues": queues}
+
+    def set_rx_leg_slew_ppm(self, transport_id: str, ppm: float) -> dict[str, Any]:
+        """Diagnostic: drive every spine rate-slew capsfilter occupied by this
+        RX leg to the given ppm. Per-leg, not per-channel: one ratio per
+        sender clock. Lets an operator poke values via curl and listen for
+        renegotiation artifacts before the adaptive control loop lands.
+        """
+        spine = self._spine_pipeline
+        if spine is None:
+            return {"ok": False, "error": "spine_not_running"}
+        channels = self.telemetry.clock_leg_channels.get(transport_id)
+        if not channels:
+            return {"ok": False, "error": "transport_not_running_or_not_rx"}
+        builder = MediaGraphBuilder(gst_launch_executable=self.gst_launch_executable)
+        applied_channels: list[int] = []
+        failed_channels: list[int] = []
+        for k in channels:
+            cf_name = builder.spine_rateslew_capsfilter_name(k)
+            if spine.set_spine_channel_rate_slew(cf_name, ppm):
+                applied_channels.append(k)
+            else:
+                failed_channels.append(k)
+        if applied_channels:
+            self.telemetry.observe_clock_leg(transport_id, applied_ratio_ppm=float(ppm))
+        return {
+            "ok": not failed_channels,
+            "transport_id": transport_id,
+            "applied_channels": applied_channels,
+            "failed_channels": failed_channels,
+            "ppm": float(ppm),
+            "quantized_rate_hz": 48000 + int(round(48000 * ppm / 1_000_000)),
+        }
 
     def _tx_leg_eligible_for_spine(self, config: EndpointConfig, transport: SrtTransportConfig) -> bool:
         """Spine TX is used when the leg can attach to at least one dante_input
@@ -799,7 +881,7 @@ class MediaController:
             f"dbmeter_in_spine_{ch}": ("spine", "in", ch)
             for ch in range(1, channel_count + 1)
         }
-        return CtypesManagedPipeline.start_bundle(
+        pipeline = CtypesManagedPipeline.start_bundle(
             name=name,
             graph=graph,
             srt_endpoints=[],
@@ -807,6 +889,11 @@ class MediaController:
             runtime=self._gst_runtime,
             meter_lookup=meter_lookup,
         )
+        # Enable per-channel rx_clkbuf_K sampling. Only the full-duplex spine
+        # has these queues; the TX-only capture spine has no rx_clkbuf elements
+        # so sampling there is a harmless no-op (probe finds nothing).
+        pipeline.mark_spine_clock_channels(channel_count)
+        return pipeline
 
     def start_tx_capture_spine(self, config: EndpointConfig) -> dict[str, Any]:
         """Start the capture-only spine used for dynamic TX leg attachment."""

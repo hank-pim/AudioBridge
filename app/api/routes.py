@@ -715,6 +715,22 @@ def create_api_router(
         """
         return media.describe_rx_clock_buffers()
 
+    @router.post("/diagnostics/rx-leg-slew/{transport_id}")
+    def rx_leg_slew(transport_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Drive the per-RX-leg rate-slew capsfilter to a specified ppm.
+
+        Diagnostic-only; the adaptive control loop will own this in production.
+        Used to validate that audioresample renegotiates cleanly when the
+        downstream capsfilter caps change at runtime.
+        """
+        try:
+            ppm = float(body.get("ppm", 0.0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="ppm must be a number")
+        result = media.set_rx_leg_slew_ppm(transport_id, ppm)
+        events.append("info", "diagnostics", "rx-leg slew set", transport_id=transport_id, ppm=ppm, ok=result.get("ok"))
+        return result
+
     @router.post("/diagnostics/tone")
     def tone_start(body: dict[str, Any]) -> dict[str, Any]:
         freq = float(body.get("frequency_hz", 1000))

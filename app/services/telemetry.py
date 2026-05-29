@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Deque
 
 from app.core.config import EndpointConfig
+
+
+# Per-channel rolling window of (timestamp, fill_ms) used to compute
+# estimated_drift_ppm. 60 s at ~4 Hz sampling = 240 entries; keep a little
+# headroom.
+_FILL_HISTORY_MAX = 300
+_FILL_HISTORY_WINDOW_S = 60.0
+_SLIP_RING_MAX = 50
 
 
 @dataclass
@@ -81,6 +90,68 @@ class ClockObservation:
 
 
 @dataclass
+class ClockChannelObservation:
+    """Per-output-channel snapshot of the spine clock-recovery queue.
+
+    Both adaptive and free-running modes write here; UI sparkline / overrun
+    badges read from here. ``recent_slips`` holds the last ``_SLIP_RING_MAX``
+    (timestamp, kind) pairs."""
+
+    channel: int
+    buffer_fill_ms: float | None = None
+    buffer_max_ms: float | None = None
+    overrun_count: int = 0
+    underrun_count: int = 0
+    recent_slips: Deque[tuple[float, str]] = field(default_factory=lambda: deque(maxlen=_SLIP_RING_MAX))
+    # Rolling (t, fill_ms) ring used to estimate drift. Per-channel because
+    # the spine queues are per-channel; per-leg drift is averaged in snapshot.
+    fill_history: Deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=_FILL_HISTORY_MAX))
+    observed_at: float = field(default_factory=time.time)
+
+    def estimated_drift_ppm(self) -> float | None:
+        """Slope of fill_ms over the last _FILL_HISTORY_WINDOW_S seconds, in
+        ppm. Positive = sender faster than receiver (fill rising).
+
+        ``d ms`` of fill accumulated per second of wall time means the sender
+        produced ``1 + d/1000`` seconds of audio per receiver-second →
+        ``d * 1000`` ppm.
+        """
+        if len(self.fill_history) < 2:
+            return None
+        now = self.fill_history[-1][0]
+        cutoff = now - _FILL_HISTORY_WINDOW_S
+        recent = [(t, v) for (t, v) in self.fill_history if t >= cutoff]
+        if len(recent) < 2:
+            return None
+        t0, v0 = recent[0]
+        t1, v1 = recent[-1]
+        dt = t1 - t0
+        if dt <= 0:
+            return None
+        slope_ms_per_s = (v1 - v0) / dt
+        return round(slope_ms_per_s * 1000.0, 3)
+
+
+@dataclass
+class ClockLegObservation:
+    """Per-RX-transport derived metrics. Channel-level data lives in
+    ``ClockChannelObservation``; this is the leg's roll-up plus loop-side
+    bookkeeping that doesn't decompose to a channel (PLC count, applied
+    ratio, lock state from the control loop, measured sender drift)."""
+
+    transport_id: str
+    opus_plc_count: int = 0
+    lock_state: str | None = None
+    applied_ratio_ppm: float | None = None
+    # Sender-vs-local clock measurement. Driven by the opusdec pad probe in
+    # gst_runtime: bytes-out / wall-elapsed → effective sender rate → ppm
+    # offset vs nominal 48 kHz. Positive = sender faster than local.
+    sender_rate_hz: float | None = None
+    drift_ppm: float | None = None
+    observed_at: float = field(default_factory=time.time)
+
+
+@dataclass
 class TelemetryService:
     started_at: float = field(default_factory=time.time)
     program_running: bool = False
@@ -102,6 +173,17 @@ class TelemetryService:
     input_meters_by_transport: dict[str, dict[int, AudioMeterObservation]] = field(default_factory=dict)
     output_meters_by_transport: dict[str, dict[int, AudioMeterObservation]] = field(default_factory=dict)
     clock_observation: ClockObservation | None = None
+    # New per-channel / per-leg clock-recovery telemetry. Populated by the
+    # spine queue sampler in gst_runtime and (later) the adaptive control loop.
+    clock_channels: dict[int, ClockChannelObservation] = field(default_factory=dict)
+    clock_legs: dict[str, ClockLegObservation] = field(default_factory=dict)
+    # Maps RX leg transport_id -> list of output channel indices owned by that
+    # leg. Registered on RX attach, cleared on detach. Used to roll per-channel
+    # data up into per-leg snapshot rows.
+    clock_leg_channels: dict[str, list[int]] = field(default_factory=dict)
+    # System-wide measured local capture rate. Nominally 48000.000. Drift here
+    # flags local PTP / DVS clock health independent of any RX leg.
+    asiosrc_measured_rate_hz: float | None = None
     observation_ttl_seconds: float = 3.0
 
     def mark_srt_transport(self, transport_id: str, running: bool) -> None:
@@ -112,6 +194,10 @@ class TelemetryService:
             self.srt_observations.pop(transport_id, None)
             self.input_meters_by_transport.pop(transport_id, None)
             self.output_meters_by_transport.pop(transport_id, None)
+            # Drop per-leg clock telemetry; per-channel data is owned by the
+            # spine and may still be valid (another RX leg might share channels).
+            self.clock_legs.pop(transport_id, None)
+            self.clock_leg_channels.pop(transport_id, None)
         self.program_running = any(item.state == "running" for item in self.srt_transports.values())
 
     def mark_webrtc_stream(self, stream_id: str, running: bool) -> None:
@@ -165,6 +251,64 @@ class TelemetryService:
     def observe_clock(self, **values: Any) -> None:
         current = self.clock_observation or ClockObservation()
         self.clock_observation = self._replace_observation(current, values)
+
+    def observe_clock_channel(
+        self,
+        channel: int,
+        *,
+        buffer_fill_ms: float,
+        buffer_max_ms: float,
+    ) -> None:
+        """Push a fresh queue-level sample for one RX output channel. Slip
+        counters (``overrun_count`` / ``underrun_count`` / ``recent_slips``)
+        are NOT updated here — the spine connects GstSignal handlers on each
+        ``rx_clkbuf_K`` queue and increments those counters from the streaming
+        thread. This method only updates the fill snapshot and drift history."""
+
+        now = time.time()
+        observation = self.clock_channels.get(channel)
+        if observation is None:
+            observation = ClockChannelObservation(channel=channel)
+            self.clock_channels[channel] = observation
+
+        observation.buffer_fill_ms = buffer_fill_ms
+        observation.buffer_max_ms = buffer_max_ms
+        observation.observed_at = now
+        observation.fill_history.append((now, buffer_fill_ms))
+
+    def observe_clock_leg(
+        self,
+        transport_id: str,
+        *,
+        opus_plc_count: int | None = None,
+        lock_state: str | None = None,
+        applied_ratio_ppm: float | None = None,
+        sender_rate_hz: float | None = None,
+        drift_ppm: float | None = None,
+    ) -> None:
+        leg = self.clock_legs.get(transport_id) or ClockLegObservation(transport_id=transport_id)
+        if opus_plc_count is not None:
+            leg.opus_plc_count = opus_plc_count
+        if lock_state is not None:
+            leg.lock_state = lock_state
+        if applied_ratio_ppm is not None:
+            leg.applied_ratio_ppm = applied_ratio_ppm
+        if sender_rate_hz is not None:
+            leg.sender_rate_hz = sender_rate_hz
+        if drift_ppm is not None:
+            leg.drift_ppm = drift_ppm
+        leg.observed_at = time.time()
+        self.clock_legs[transport_id] = leg
+
+    def register_clock_leg_channels(self, transport_id: str, channels: list[int]) -> None:
+        self.clock_leg_channels[transport_id] = sorted(set(channels))
+
+    def unregister_clock_leg(self, transport_id: str) -> None:
+        self.clock_leg_channels.pop(transport_id, None)
+        self.clock_legs.pop(transport_id, None)
+
+    def observe_asiosrc_rate(self, measured_hz: float) -> None:
+        self.asiosrc_measured_rate_hz = round(measured_hz, 3)
 
     def has_recent_media_observations(self) -> bool:
         now = time.time()
@@ -275,6 +419,7 @@ class TelemetryService:
                 "dante_tx_kbps": None,
                 "wan_rx_kbps": None,
                 "wan_tx_kbps": None,
+                "asiosrc_measured_rate_hz": self.asiosrc_measured_rate_hz,
             },
             "meters": self._meter_snapshot(channel_count),
             "meters_by_transport": self._meter_snapshot_by_transport(),
@@ -297,35 +442,82 @@ class TelemetryService:
 
     def _clock_snapshot(self, config: EndpointConfig) -> dict[str, Any]:
         observation = self._recent_or_none(self.clock_observation)
-        if observation is not None:
-            return {
-                "mode": config.program.clock_recovery_mode.value,
-                "lock_state": observation.lock_state,
-                "frequency_ratio_ppm": observation.frequency_ratio_ppm,
-                "phase_trim_ppm": observation.phase_trim_ppm,
-                "buffer_occupancy_ms": observation.buffer_occupancy_ms,
-                "slip_events": observation.slip_events,
-                "time_since_last_slip_s": observation.time_since_last_slip_s,
-            }
-        if self.program_running:
-            return {
-                "mode": config.program.clock_recovery_mode.value,
-                "lock_state": None,
-                "frequency_ratio_ppm": None,
-                "phase_trim_ppm": None,
-                "buffer_occupancy_ms": None,
-                "slip_events": None,
-                "time_since_last_slip_s": None,
-            }
-        return {
+        base = {
             "mode": config.program.clock_recovery_mode.value,
-            "lock_state": "idle",
-            "frequency_ratio_ppm": None,
-            "phase_trim_ppm": None,
-            "buffer_occupancy_ms": None,
-            "slip_events": None,
-            "time_since_last_slip_s": None,
+            "lock_state": (observation.lock_state if observation else ("idle" if not self.program_running else None)),
+            "frequency_ratio_ppm": observation.frequency_ratio_ppm if observation else None,
+            "phase_trim_ppm": observation.phase_trim_ppm if observation else None,
+            "buffer_occupancy_ms": observation.buffer_occupancy_ms if observation else None,
+            "slip_events": observation.slip_events if observation else None,
+            "time_since_last_slip_s": observation.time_since_last_slip_s if observation else None,
+            "per_channel": self._clock_per_channel_rows(),
+            "per_leg": self._clock_per_leg_rows(config),
         }
+        return base
+
+    def _clock_per_channel_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for channel, obs in sorted(self.clock_channels.items()):
+            if not self._is_recent(obs):
+                continue
+            last_slip = obs.recent_slips[-1] if obs.recent_slips else None
+            rows.append({
+                "channel": channel,
+                "buffer_fill_ms": round(obs.buffer_fill_ms, 3) if obs.buffer_fill_ms is not None else None,
+                "buffer_max_ms": round(obs.buffer_max_ms, 3) if obs.buffer_max_ms is not None else None,
+                "overrun_count": obs.overrun_count,
+                "underrun_count": obs.underrun_count,
+                "estimated_drift_ppm": obs.estimated_drift_ppm(),
+                "last_slip": (
+                    {"timestamp": last_slip[0], "kind": last_slip[1]} if last_slip else None
+                ),
+                "recent_slips": [
+                    {"timestamp": t, "kind": k} for (t, k) in list(obs.recent_slips)
+                ],
+            })
+        return rows
+
+    def _clock_per_leg_rows(self, config: EndpointConfig) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for transport_id, channels in self.clock_leg_channels.items():
+            channel_obs = [
+                self.clock_channels[c] for c in channels
+                if c in self.clock_channels and self._is_recent(self.clock_channels[c])
+            ]
+            leg = self.clock_legs.get(transport_id)
+            # Prefer the opusdec-probe drift (sender bytes vs wall time) — the
+            # channel-fill slope is structurally zero in this spine shape
+            # (demand-driven audiomixer keeps queues near empty).
+            if leg is not None and leg.drift_ppm is not None:
+                drift = round(leg.drift_ppm, 3)
+            else:
+                drift_values = [
+                    obs.estimated_drift_ppm() for obs in channel_obs
+                    if obs.estimated_drift_ppm() is not None
+                ]
+                drift = round(sum(drift_values) / len(drift_values), 3) if drift_values else None
+            overrun = sum(obs.overrun_count for obs in channel_obs)
+            underrun = sum(obs.underrun_count for obs in channel_obs)
+            effective_mode = self._effective_clock_mode(config, transport_id)
+            result[transport_id] = {
+                "mode": effective_mode,
+                "channels": channels,
+                "estimated_drift_ppm": drift,
+                "sender_rate_hz": leg.sender_rate_hz if leg else None,
+                "overrun_count": overrun,
+                "underrun_count": underrun,
+                "opus_plc_count": leg.opus_plc_count if leg else 0,
+                "lock_state": leg.lock_state if leg else None,
+                "applied_ratio_ppm": leg.applied_ratio_ppm if leg else None,
+            }
+        return result
+
+    def _effective_clock_mode(self, config: EndpointConfig, transport_id: str) -> str:
+        for transport in config.srt_transports:
+            if transport.id == transport_id:
+                mode = transport.clock_recovery_mode or config.program.clock_recovery_mode
+                return mode.value
+        return config.program.clock_recovery_mode.value
 
     def _clock_snapshot_free_running(self) -> dict[str, Any]:
         return {

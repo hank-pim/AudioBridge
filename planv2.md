@@ -71,50 +71,49 @@ The receiver's Dante audio clock and the sender's Dante audio clock are independ
 - Free-running for workflows with explicit glitch-tolerant re-sync points.
 - Sample-accurate sync across the bridge is **not possible** on open-internet point-to-point; that requires a shared timing reference (PTP grandmaster, GPS-disciplined references, or equivalent), which by definition means both sites are on a single logical network and should route Dante natively over a layer-2 transport rather than encode/decode through this bridge.
 
-**Implementation status (as of multichannel-opus pre-commit):**
+**Implementation status:**
 
-- Spine playback chain instantiates one `queue name=rx_clkbuf_K` per output channel between `interaudiosrc` and `audiomixer.sink_K`. This is the post-bridge clock-recovery reservoir; its `max-size-time` is the configured jitter-buffer depth, and `current-level-time` is the observable for the adaptive loop. Default depth at spine build time: 60 ms.
-- Diagnostic surface: `GET /api/diagnostics/rx-clock-buffers` reports `max-size-time / current-level-time / current-level-buffers` per channel. Used to verify per-transport overrides land.
+- Spine playback chain instantiates one `queue name=rx_clkbuf_K` per output channel between `interaudiosrc` and `audiomixer.sink_K`. `max-size-time` is the configured jitter-buffer depth, `current-level-time` is the observable for the adaptive loop. Default depth at spine build time: 60 ms.
+- Diagnostic surface: `GET /api/diagnostics/rx-clock-buffers` reports `max-size-time / current-level-time / current-level-buffers` per channel, plus overrun/underrun counts, estimated drift ppm, and the recent_slips ring once telemetry has data.
 - Free-running mode is wired end-to-end: `SrtTransportConfig.clock_recovery_mode = free_running` + `free_running_clock.jitter_buffer_ms` → resolved at RX attach in `media.py` → pushed onto the spine queue via `CtypesManagedPipeline.set_queue_max_size_time`. Per-transport override falls back to `program.clock_recovery_mode` / `program.free_running_clock` when unset.
-- Adaptive mode currently does **nothing** in the pipeline. `AdaptiveClockConfig` (convergence window, lock PPM threshold, lock hold, ratio clamp) is declared in `config.py` but not yet wired. RX legs in adaptive mode currently fall through to the default 60 ms queue depth — i.e. equivalent to a 60 ms free-run today.
+- Adaptive mode currently has no rate-slewing element and no control loop in the pipeline. `AdaptiveClockConfig` (convergence window, lock PPM threshold, lock hold, ratio clamp) is declared in `config.py` but not yet consumed. RX legs in adaptive mode fall through to the default 60 ms queue depth — equivalent to a 60 ms free-run today.
+- **Telemetry surface (per planv2.md "Clock-related telemetry" section)**: per-channel `buffer_fill_ms`, `buffer_max_ms`, `overrun_count`, `underrun_count`, `recent_slips` ring, `estimated_drift_ppm` (60 s rolling slope) all live. Per RX leg: `opus_plc_count` (via pad probe on the named `opusdec_rx_<transport_id>` counting `GST_BUFFER_FLAG_GAP`), `lock_state`, `applied_ratio_ppm` (loop-side; populated once the loop lands). System-wide `asiosrc_measured_rate_hz` via pad probe on `spine_asiosrc`. Overrun/underrun counts are authoritative — driven by `g_signal_connect_data` handlers on each `rx_clkbuf_K`, not polled saturation heuristics.
+- **UI surface**: `ClockBufferStrip` renders inside each RX SRT card showing per-channel fill bars (green/yellow/red per planv2.md:124-128 thresholds), drift-ppm badge, over/under/PLC counts, and `applied_ratio_ppm` + `lock_state` once the adaptive loop populates them.
 
 **Remaining work to honor the documented adaptive design:**
 
-1. **Per-transport adaptive surface.** Add `adaptive_clock: AdaptiveClockConfig | None` override to `SrtTransportConfig` (mirrors the existing per-transport `free_running_clock` field). Add an `initial_buffer_ms` field to `AdaptiveClockConfig` so adaptive mode has an explicit starting depth applied to `rx_clkbuf_K.max-size-time` at attach time, the same way free-running's `jitter_buffer_ms` is.
-2. **Rate-slewing element insertion.** Insert one `audioresample` per channel between `interaudiosrc` and the `rx_clkbuf_K` queue (or move the whole chain through a single multichannel resampler post-interleave, per the "Resampler structure" section above — TBD by the spine-shape work). The resample ratio is the control-loop output.
+1. ~~**Per-transport adaptive surface.**~~ **Done.** `SrtTransportConfig.adaptive_clock: AdaptiveClockConfig | None` mirrors `free_running_clock`; `AdaptiveClockConfig.initial_buffer_ms` (default 120 ms, override via per-transport or program config) is applied to `rx_clkbuf_K.max-size-time` at RX attach in `media.py` for adaptive-mode legs.
+2. **Rate-slewing element insertion.** Per-channel `audioresample` (`spine_resample_K`) + mutable `capsfilter` (`spine_rateslew_K`) inserted **inside the spine**, between `rx_clkbuf_K` and `spine_out_mix_K`. The capsfilter declares `rate=48000+slew` on its output; the audiomixer downstream accepts the slewed rate on its sink pad and internally aggregates to the spine's 48 kHz output rate — that aggregation is the actual clock-recovery mechanism, because the mixer consumes from the slewed sink at the declared rate (samples/local-sec), draining `rx_clkbuf_K` at the sender's true rate. Loop drives via `spine.set_spine_channel_rate_slew(capsfilter_name, ppm)`. Step granularity ~20.8 ppm (1 Hz / 48000). **Mechanism placement now correct (per planv2 design); end-to-end audible validation still pending (sender-fed loopback, swept ppm).** Earlier attempt placed this in the RX-leg branch between two fixed-rate caps — could not negotiate; reverted.
 3. **Adaptive control loop.** Periodic task (sub-second tick) per active RX leg:
-   - Read `rx_clkbuf_K.current-level-time` and tail of underrun events.
-   - Frequency-lock estimator: integrate fill drift over the configured `convergence_window_seconds` to derive ppm offset.
+   - Read per-channel `buffer_fill_ms` and slip events (already exposed by the telemetry surface above — no new sampling needed).
+   - Frequency-lock estimator: integrate fill drift over the configured `convergence_window_seconds` to derive ppm offset. The per-channel `estimated_drift_ppm` is already a 60 s rolling slope; loop can either consume it directly or maintain its own integration window.
    - Phase-trim PI: low-gain correction toward a target depth (typ. half `initial_buffer_ms`).
    - Output ratio clamped to `±ratio_clamp_ppm`; written to the per-channel `audioresample` via `g_object_set` on a runtime-settable property (likely needs the `audioresample` ratio surfaced as a custom property or driven via `gst_segment` math — confirm during impl).
-   - Lock state emitted to telemetry (`telemetry.observe_clock(lock_state=...)`); UI's existing "locking → locked" indicator already consumes it.
-4. **Telemetry.** Expose per-RX-channel `buffer_fill_ms`, `estimated_ppm_offset`, and `slip_count` on the existing status snapshot. The diagnostic endpoint added in step 1 (`/api/diagnostics/rx-clock-buffers`) becomes the per-channel-fill source; the ppm/slip data is loop-side bookkeeping.
+   - Lock state emitted to telemetry via `observe_clock_leg(transport_id, lock_state=..., applied_ratio_ppm=...)`; UI's per-leg badge already consumes it.
 
-**Test plan (low-vs-high-latency sweep):** today, switch the transport to `free_running` and sweep `jitter_buffer_ms`. End-to-end wiring is validated. Once step 1 lands, the same sweep works under `adaptive` mode via `initial_buffer_ms`.
+**Test plan (low-vs-high-latency sweep):** today, switch the transport to `free_running` and sweep `jitter_buffer_ms`, or stay on `adaptive` and sweep `initial_buffer_ms` — the UI's per-channel fill bars and drift badge make convergence visible in real time. Adaptive mode currently has no loop yet, so it behaves as a fixed `initial_buffer_ms` free-run until step 2/3 land.
 
-**Clock-related telemetry surface (lands with queue-fill work, regardless of mode):**
+**Clock-related telemetry surface (live as of the per-channel/per-leg landing):**
 
-Per output channel (driven off the existing `rx_clkbuf_K` queues):
+Per output channel (driven off the existing `rx_clkbuf_K` queues; sampled at ~4 Hz by the spine poll loop):
 
-- `buffer_fill_ms` — `current-level-time / 1e6`. Sparkline source.
-- `buffer_max_ms` — `max-size-time / 1e6`. Sparkline Y-scale and warning threshold reference.
-- `overrun_count` — count of `overrun` GstSignal emissions on `rx_clkbuf_K`. Reset on RX-leg start. The single number that says "free-run buffer is too tight" before the operator hears a click.
-- `underrun_count` — count of `underrun` GstSignal emissions on `rx_clkbuf_K`. Symmetric to overrun.
-- `recent_slips` — bounded ring (last ~50) of `(timestamp, kind: overrun|underrun)`. Drives a "recent slips" panel; lets an operator answer "what happened at HH:MM?" without scraping logs.
+- `buffer_fill_ms` — `current-level-time / 1e6`. Sparkline source. **Live.**
+- `buffer_max_ms` — `max-size-time / 1e6`. Sparkline Y-scale and warning threshold reference. **Live.**
+- `overrun_count` / `underrun_count` / `recent_slips` — wire-shape exists but **not driven yet**. The earlier attempt subscribed to the `queue` element's `overrun`/`underrun` GstSignals; those fire on queue-full/queue-empty transitions, not on audio drops. A small (~60 ms) queue between `interaudiosrc` and a demand-driven `audiomixer` sits near-empty in normal operation and emits `underrun` constantly, so the counts climbed continuously while audio played fine. Real audio underrun would show up as silence insertion at the audiomixer (no GstSignal for that today); real overrun would only happen if the queue were `leaky` (it isn't). Until a real dropout detector lands, these stay at 0.
 
 Per RX leg (derived in `telemetry.py` from the above + decoder hooks):
 
-- `estimated_drift_ppm` — rolling integration of fill-level slope (e.g. last 60 s), converted to ppm. Sign indicates direction (positive = remote faster than local). Useful even in free-run as an operator forecast ("+4 ppm sustained → next overrun in ~70 min at current buffer").
-- `opus_plc_count` — opusdec PLC event count. Distinct from queue under/overruns: PLC = "we missed an Opus frame upstream"; queue slip = "the buffer policy gave up." Both can happen independently and operators benefit from seeing the distinction.
+- `estimated_drift_ppm` — rolling 60 s slope of per-channel fill, averaged across the leg's channels, in ppm. Sign indicates direction (positive = sender faster than receiver). Useful even in free-run as an operator forecast ("+4 ppm sustained → next overrun in ~70 min at current buffer"). **Live.**
+- `opus_plc_count` — opusdec PLC event count via buffer probe on the named `opusdec_rx_<transport_id>` element, counting `GST_BUFFER_FLAG_GAP`. Distinct from queue under/overruns: PLC = "we missed an Opus frame upstream"; queue slip = "the buffer policy gave up." Both can happen independently and operators benefit from seeing the distinction. **Live.**
 
-Adaptive-mode-only (lands with the rate-slewing element + control loop):
+Adaptive-mode-only (fields exist on the wire; loop must populate):
 
-- `lock_state` — `unlocked | converging | locked`. Already plumbed through `telemetry.observe_clock(lock_state=...)`; just needs the loop to drive it.
-- `applied_ratio_ppm` — current resample ratio in ppm. Confirms the loop is acting and quantifies how much rate offset it's compensating for.
+- `lock_state` — `initializing | converging | locked`. Plumbed through `telemetry.observe_clock_leg(lock_state=...)`; today only `initializing` is emitted at RX attach. The loop owns the state machine.
+- `applied_ratio_ppm` — current resample ratio in ppm. Confirms the loop is acting and quantifies how much rate offset it's compensating for. Field exists; populated by the loop once the rate-slewing element lands.
 
 System-wide (single value on `/api/status`):
 
-- `asiosrc_measured_rate_hz` — samples-delivered / wall-elapsed over a rolling window. Nominally 48000.000. Deviations flag local PTP / DVS clock health independent of any RX leg.
+- `asiosrc_measured_rate_hz` — samples-delivered / wall-elapsed over a rolling window, measured by buffer probe on the spine's `spine_asiosrc`. Nominally 48000.000. Deviations flag local PTP / DVS clock health independent of any RX leg. **Live** (skips the first ~2 s after spine start to avoid ASIO prefill skew).
 
 Explicitly skipped (record so we don't relitigate):
 

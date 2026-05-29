@@ -45,6 +45,7 @@ function VariationA() {
   }, [tab, query, CHANNELS]);
 
   const metersByTransport = status.meters_by_transport || {};
+  const clockTelemetry = status.clock || {};
   const sources = cfg.sources || [];
 
   return (
@@ -78,6 +79,7 @@ function VariationA() {
                 onCloseDrawer={() => closeDrawer(c.id)}
                 sources={sources}
                 metersByTransport={metersByTransport}
+                clockTelemetry={clockTelemetry}
               />
             ))}
           </div>
@@ -176,7 +178,7 @@ function EventsRail({ open, onToggle }) {
 
 
 // ── Stream card (the grid tile) ────────────────────────────────────────────
-function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, metersByTransport }) {
+function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, metersByTransport, clockTelemetry }) {
   const cfgRoot = window.AB.config || {};
   const isSrt = ch.entity_kind === "srt_transport";
   const transportCfg = isSrt ? (cfgRoot.srt_transports || []).find(t => t.id === ch.runtime_id) : null;
@@ -206,6 +208,9 @@ function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, me
       ) : (
         <div style={{ padding: 12, fontSize: 11, color: "var(--ab-fg-4)" }}>no channel group — assign one in settings</div>
       )}
+      {isSrt && ch.direction === "in" && (
+        <ClockBufferStrip transportId={ch.runtime_id} clockTelemetry={clockTelemetry} />
+      )}
       {pageCount > 1 && (
         <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
                       padding: "4px 10px", borderTop: "1px solid var(--ab-border-soft)" }}>
@@ -223,6 +228,72 @@ function StreamCard({ ch, drawerOpen, onToggleDrawer, onCloseDrawer, sources, me
           <StreamDrawer ch={ch} onClose={onCloseDrawer} />
         </div>
       )}
+    </div>
+  );
+}
+
+// Per-RX-leg clock-recovery telemetry strip. Renders fill bars per channel,
+// a drift-ppm badge, and overrun/underrun counts plus opus PLC count.
+// Color thresholds per planv2.md:124-128:
+//   green  — fill near 0, no recent slips
+//   yellow — sustained fill > 50% of max, or |drift_ppm| > 10
+//   red    — fill > 90% of max, or any slip in the last sample window
+function ClockBufferStrip({ transportId, clockTelemetry }) {
+  const leg = (clockTelemetry.per_leg || {})[transportId];
+  if (!leg) return null;
+  const allChannels = clockTelemetry.per_channel || [];
+  const ours = leg.channels || [];
+  const channelRows = allChannels.filter(row => ours.includes(row.channel));
+  const drift = leg.estimated_drift_ppm;
+  const driftColor =
+    drift == null ? "var(--ab-fg-4)"
+    : Math.abs(drift) > 10 ? "var(--ab-warn, #d4a017)"
+    : "var(--ab-fg-3)";
+  const labelStyle = { fontSize: 9.5, letterSpacing: 0.06, textTransform: "uppercase", color: "var(--ab-fg-4)" };
+  const valStyle = { fontSize: 11, color: "var(--ab-fg)" };
+  return (
+    <div style={{
+      borderTop: "1px solid var(--ab-border-soft)",
+      padding: "6px 10px",
+      display: "flex", flexDirection: "column", gap: 4,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <span className="ab-mono" style={labelStyle}>Clock · {leg.mode || "—"}</span>
+        <span className="ab-mono" title="Measured sender effective rate (opusdec bytes-out vs wall time)" style={valStyle}>
+          rate {leg.sender_rate_hz == null ? "—" : `${leg.sender_rate_hz.toFixed(3)} Hz`}
+        </span>
+        <span className="ab-mono" title="Sender vs local clock drift (positive = sender faster)" style={{ ...valStyle, color: driftColor }}>
+          drift {drift == null ? "—" : `${drift > 0 ? "+" : ""}${drift.toFixed(2)} ppm`}
+        </span>
+        <span className="ab-mono" title="Opus PLC events from the decoder (missed/concealed frames)" style={valStyle}>
+          plc {leg.opus_plc_count ?? 0}
+        </span>
+        {leg.applied_ratio_ppm != null && (
+          <span className="ab-mono" title="Adaptive control loop's current resample correction" style={valStyle}>
+            applied {leg.applied_ratio_ppm.toFixed(1)} ppm
+          </span>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 2, alignItems: "stretch", height: 10 }}>
+        {channelRows.length === 0 ? (
+          <span className="ab-mono" style={{ ...labelStyle, alignSelf: "center" }}>no buffer samples yet</span>
+        ) : channelRows.map(row => {
+          const fill = row.buffer_fill_ms;
+          const max = row.buffer_max_ms;
+          const ratio = max > 0 ? Math.min(1, fill / max) : 0;
+          const color =
+            ratio > 0.9 ? "var(--ab-err, #c14444)"
+            : ratio > 0.5 ? "var(--ab-warn, #d4a017)"
+            : "var(--ab-ok, #4caf50)";
+          return (
+            <div key={row.channel}
+                 title={`ch ${row.channel}: ${fill?.toFixed(1) ?? "—"} / ${max?.toFixed(0) ?? "—"} ms`}
+                 style={{ flex: 1, background: "var(--ab-surface-2)", position: "relative", overflow: "hidden" }}>
+              <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: `${ratio * 100}%`, background: color }} />
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

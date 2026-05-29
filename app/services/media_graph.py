@@ -873,12 +873,20 @@ class MediaGraphBuilder:
         srt_name = self._srt_element_name(transport.id, transport.direction.value)
         split_name = f"rx_split_{''.join(char if char.isalnum() else '_' for char in transport.id)}"
         tap_name = self._rx_monitor_tap_name(transport.id)
+        opusdec_name = self._rx_opusdec_name(transport.id)
 
+        # Clock recovery is NOT done in the RX leg — see plan_spine_full_duplex_shape
+        # where per-channel rate-slew (audioresample + capsfilter) sits between
+        # rx_clkbuf_K and the audiomixer. The RX leg just decodes Opus, resamples
+        # to the canonical 48 kHz/N-channel format for the bridge, deinterleaves
+        # per output channel, and hands each off to interaudiosink. The downstream
+        # interaudiosrc → rx_clkbuf_K → spine_resample_K → spine_rateslew_K → mixer
+        # chain is where the sender-clock slew is actually applied.
         parts: list[str] = [
             f"srtsrc name={srt_name} uri={uri}",
             "! tsdemux",
             f"! tee name={tap_name} allow-not-linked=true",
-            f"{tap_name}. ! queue ! opusdec ! audioconvert ! audioresample",
+            f"{tap_name}. ! queue ! opusdec name={opusdec_name} ! audioconvert ! audioresample",
             f"! audio/x-raw,format=S16LE,rate=48000,channels={n},layout=interleaved",
             f"! deinterleave name={split_name}",
         ]
@@ -943,6 +951,7 @@ class MediaGraphBuilder:
             "meter_endpoints": meter_endpoints,
             "monitor_taps": self._rx_monitor_taps(transport.id, n),
             "interaudio_channels": interaudio_channels,
+            "opusdec_element_name": opusdec_name,
         }
 
     # --- spine planner (commit 1 of dynamic-pipeline refactor) ---
@@ -1015,6 +1024,22 @@ class MediaGraphBuilder:
         is the observable for adaptive control loops.
         """
         return f"rx_clkbuf_{channel_index}"
+
+    def spine_rateslew_resample_name(self, channel_index: int) -> str:
+        """Per-channel audioresample inside the spine that absorbs the
+        sender-vs-local clock offset for the RX leg occupying this channel.
+        Driven by the adaptive control loop via the downstream capsfilter.
+        """
+        return f"spine_resample_{channel_index}"
+
+    def spine_rateslew_capsfilter_name(self, channel_index: int) -> str:
+        """Per-channel capsfilter whose ``caps`` rate is mutated at runtime to
+        drive the matching ``spine_resample_K``. The audiomixer downstream
+        accepts the slewed rate on its sink pad and internally aggregates to
+        the spine's 48 kHz output rate — that aggregation is the actual
+        clock-recovery mechanism.
+        """
+        return f"spine_rateslew_{channel_index}"
 
     def spine_silence_queue_name(self, channel_index: int) -> str:
         return f"spine_silence_q_{channel_index}"
@@ -1177,6 +1202,20 @@ class MediaGraphBuilder:
                 f"max-size-time={config.program.free_running_clock.jitter_buffer_ms * 1_000_000}",
                 "max-size-buffers=0",
                 "max-size-bytes=0",
+                "!",
+                # Rate-slew pair: the audiomixer downstream is locked to the
+                # local 48 kHz output clock. To match the sender's clock we
+                # consume from rx_clkbuf_K at the sender's actual rate. The
+                # capsfilter declares that rate on the resample's output; the
+                # mixer's sink pad accepts the slewed rate and its internal
+                # aggregator does the conversion to the spine's 48 kHz output.
+                # Adaptive loop mutates capsfilter.caps via g_object_set.
+                "audioresample",
+                f"name={self.spine_rateslew_resample_name(channel)}",
+                "!",
+                "capsfilter",
+                f"name={self.spine_rateslew_capsfilter_name(channel)}",
+                "caps=audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved,channel-mask=(bitmask)0x0",
                 "!",
                 f"{mixer_name}.",
             ])
@@ -1443,6 +1482,10 @@ class MediaGraphBuilder:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
         suffix = "" if channel_index is None else f"_{channel_index}"
         return f"monitor_tap_rx_{safe_transport}{suffix}"
+
+    def _rx_opusdec_name(self, transport_id: str) -> str:
+        safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)
+        return f"opusdec_rx_{safe_transport}"
 
     def _tx_monitor_tap_name(self, transport_id: str, group_id: str, channel_index: int) -> str:
         safe_transport = "".join(char if char.isalnum() else "_" for char in transport_id)

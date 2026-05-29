@@ -198,6 +198,49 @@ class CtypesGst:
             self.gst.gst_element_request_pad_simple.restype = ctypes.c_void_p
         self.gst.gst_element_get_request_pad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         self.gst.gst_element_get_request_pad.restype = ctypes.c_void_p
+        # GObject signal connection — used by the spine to subscribe to
+        # rx_clkbuf_K "overrun"/"underrun" emissions for authoritative slip
+        # counts (the polling-derived heuristic can miss bursts inside one
+        # 250 ms sample period).
+        self.gobject.g_signal_connect_data.argtypes = [
+            ctypes.c_void_p,         # instance
+            ctypes.c_char_p,         # detailed_signal
+            ctypes.c_void_p,         # GCallback
+            ctypes.c_void_p,         # data
+            ctypes.c_void_p,         # destroy_data
+            ctypes.c_uint,           # GConnectFlags
+        ]
+        self.gobject.g_signal_connect_data.restype = ctypes.c_ulong
+        # Pad probes — used to count opusdec PLC GAP buffers per RX leg and to
+        # derive the spine's measured ASIO source rate.
+        self.gst.gst_pad_add_probe.argtypes = [
+            ctypes.c_void_p,         # pad
+            ctypes.c_uint,           # GstPadProbeType mask
+            ctypes.c_void_p,         # GstPadProbeCallback
+            ctypes.c_void_p,         # user_data
+            ctypes.c_void_p,         # GDestroyNotify
+        ]
+        self.gst.gst_pad_add_probe.restype = ctypes.c_ulong
+        # gst_buffer_has_flags — for detecting GST_BUFFER_FLAG_GAP on opusdec
+        # output (Opus PLC concealment marker).
+        if hasattr(self.gst, "gst_buffer_has_flags"):
+            self.gst.gst_buffer_has_flags.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            self.gst.gst_buffer_has_flags.restype = ctypes.c_int
+        if hasattr(self.gst, "gst_buffer_get_size"):
+            self.gst.gst_buffer_get_size.argtypes = [ctypes.c_void_p]
+            self.gst.gst_buffer_get_size.restype = ctypes.c_size_t
+        # gst_bin_iterate_recurse — walking the spine to find opusdec elements
+        # inside attached RX branches without each branch having to publish its
+        # element pointers up to media.py.
+        if hasattr(self.gst, "gst_bin_iterate_recurse"):
+            self.gst.gst_bin_iterate_recurse.argtypes = [ctypes.c_void_p]
+            self.gst.gst_bin_iterate_recurse.restype = ctypes.c_void_p
+        if hasattr(self.gst, "gst_iterator_next"):
+            self.gst.gst_iterator_next.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.gst.gst_iterator_next.restype = ctypes.c_uint
+        if hasattr(self.gst, "gst_iterator_free"):
+            self.gst.gst_iterator_free.argtypes = [ctypes.c_void_p]
+            self.gst.gst_iterator_free.restype = None
 
     def request_pad(self, element: int, template: bytes, caps_string: bytes | None = None) -> int | None:
         if caps_string:
@@ -235,6 +278,28 @@ class CtypesGst:
             ctypes.c_uint64(value),
             ctypes.c_void_p(0),
         )
+
+    def set_caps_property(self, element: int, prop_name: bytes, caps_string: bytes) -> bool:
+        """Set a GstCaps property (e.g. capsfilter "caps") via g_object_set.
+
+        Parses caps_string with gst_caps_from_string and hands the result to
+        g_object_set. capsfilter takes its own ref so we unref locally on the
+        way out. Returns False if caps parsing fails.
+        """
+        caps = self.gst.gst_caps_from_string(caps_string)
+        if not caps:
+            return False
+        try:
+            self.gobject.g_object_set(
+                ctypes.c_void_p(element),
+                ctypes.c_char_p(prop_name),
+                ctypes.c_void_p(caps),
+                ctypes.c_void_p(0),
+            )
+            return True
+        finally:
+            if hasattr(self.gst, "gst_caps_unref"):
+                self.gst.gst_caps_unref(caps)
 
     def request_interleave_sink_pad(self, mixer: int) -> int | None:
         return self.request_pad(mixer, b"sink_%u")
@@ -351,6 +416,39 @@ class CtypesManagedPipeline:
     _last_bytes: dict[str, int] = field(default_factory=dict)
     _last_stats_at: dict[str, float] = field(default_factory=dict)
     _last_stats_tail_at: float | None = None
+    # Channels to probe for rx_clkbuf_K queue levels. Set on spine pipelines
+    # via mark_spine_clock_channels(). Zero means "not a spine, skip clock
+    # buffer sampling entirely."
+    _clock_sample_channel_count: int = 0
+    _clock_sample_known_channels: set[int] = field(default_factory=set)
+    _last_clock_sample_at: float | None = None
+    # Callbacks passed to GLib/GStreamer must stay referenced for the lifetime
+    # of the connection, otherwise Python GC collects them and the C side
+    # calls into freed memory. Anything we hand to g_signal_connect_data or
+    # gst_pad_add_probe goes here.
+    _native_callbacks: list[Any] = field(default_factory=list)
+    # PLC counters per RX transport_id; the pad-probe callback bumps these and
+    # periodically flushes into telemetry.observe_clock_leg(). Decoupled from
+    # the telemetry write so the probe callback stays signal-safe-ish.
+    _plc_counts: dict[str, int] = field(default_factory=dict)
+    _plc_last_flushed: dict[str, int] = field(default_factory=dict)
+    # Per-RX-leg sender-rate measurement: bytes seen out of opusdec vs. wall
+    # time → effective sender sample rate → drift ppm vs nominal 48 kHz. This
+    # is the load-bearing drift observable; the queue-fill slope is useless
+    # in this spine shape because the downstream audiomixer is demand-driven
+    # by the local clock and keeps the queue near empty regardless of drift.
+    # Sliding 30 s window per RX leg. Each entry is (wall_time, sender_pts_ns).
+    # sender_pts comes from GstBuffer.pts on opusdec output — it's the sender's
+    # own timeline. Drift = ((wall_span - sender_span) / sender_span) × 1e6 ppm
+    # which avoids the buffer-count edge aliasing that ruined the
+    # samples-vs-wall-time approach.
+    _rx_rate_window: dict[str, Any] = field(default_factory=dict)
+    _rx_bytes_per_sample: dict[str, int] = field(default_factory=dict)
+    # ASIO src measurement: running sample count + start wall time.
+    # Sliding 30 s window for asiosrc rate, same shape as _rx_rate_window.
+    _asio_rate_window: Any = None
+    _asio_bytes_per_sample: int = 0
+    _last_asio_observe_at: float | None = None
     _thread: threading.Thread | None = None
     _branches: dict[str, AttachedBranch] = field(default_factory=dict)
     _branch_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -1115,6 +1213,48 @@ class CtypesManagedPipeline:
         finally:
             gobject.g_object_unref(element)
 
+    def set_spine_channel_rate_slew(
+        self, capsfilter_element_name: str, ppm: float
+    ) -> bool:
+        """Mutate the per-spine-channel rate-slew capsfilter to a new rate.
+
+        Topology: ``rx_clkbuf_K → audioresample(spine_resample_K) →
+        capsfilter(spine_rateslew_K) → audiomixer.sink``.
+
+        The capsfilter declares ``rate = 48000 + slew`` on its output. The
+        ``spine_resample_K`` upstream renegotiates filter coefficients to
+        match. The audiomixer downstream accepts the slewed rate on its sink
+        pad and internally converts to its own 48 kHz output rate — that
+        conversion is the actual clock-recovery action, because the mixer
+        consumes from the slewed sink at the declared rate (samples/local-sec)
+        rather than 48000/local-sec, so the rx_clkbuf_K queue drains at the
+        sender's true sample rate and stays at a stable fill.
+
+        GstCaps ``rate`` is integer, so step granularity is 1 Hz / 48000 ≈
+        20.8 ppm. At ±50 ppm clamp the PI loop dithers across bucket
+        boundaries; long time constant absorbs it. Sub-Hz would require a
+        custom resampler element — out of scope.
+
+        Returns False if the capsfilter isn't found or caps parsing fails.
+        """
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+        element = gst.gst_bin_get_by_name(
+            self.pipeline, capsfilter_element_name.encode("utf-8")
+        )
+        if not element:
+            return False
+        try:
+            slew_hz = int(round(48000 * ppm / 1_000_000))
+            rate = 48000 + slew_hz
+            caps_str = (
+                f"audio/x-raw,format=S16LE,rate={rate},channels=1,"
+                "layout=interleaved,channel-mask=(bitmask)0x0"
+            ).encode("utf-8")
+            return self.runtime.set_caps_property(element, b"caps", caps_str)
+        finally:
+            gobject.g_object_unref(element)
+
     def get_queue_levels(self, queue_name: str) -> dict[str, int] | None:
         """Read ``max-size-time``, ``current-level-time``, and ``current-level-buffers``
         from a named queue. Returns None if the queue isn't present.
@@ -1223,11 +1363,252 @@ class CtypesManagedPipeline:
             if branch.parent_bin_owned and branch.parent_bin:
                 gobject.g_object_unref(branch.parent_bin)
 
+    def mark_spine_clock_channels(self, channel_count: int) -> None:
+        """Enable per-channel rx_clkbuf_K sampling for this pipeline. Called
+        on the spine after construction; non-spine pipelines leave the count
+        at zero and the sampler is a no-op.
+
+        Note on slip counters: an earlier revision subscribed to the queues'
+        ``overrun``/``underrun`` GstSignals here. That was wrong. The signals
+        fire on queue-full/queue-empty transitions, NOT on audio drops. For a
+        small (~60 ms) queue between ``interaudiosrc`` and a demand-driven
+        ``audiomixer`` the queue sits near-empty in normal operation and emits
+        ``underrun`` constantly — meaningless as a dropout indicator. A real
+        audio underrun would show up as silence insertion at the audiomixer
+        (no GstSignal for that today); a real overrun would only happen if the
+        queue were ``leaky``, which ours isn't. Until we add a real dropout
+        detector, slip counters stay at 0 — that's honest."""
+        self._clock_sample_channel_count = int(channel_count)
+        self._clock_sample_known_channels = set()
+
+    def install_rx_leg_probes(self, transport_id: str, opusdec_element_name: str, channel_count: int) -> None:
+        """Add a buffer probe to the named opusdec's src pad. The single probe
+        does two jobs:
+        - counts PLC (GAP-flagged) buffers for this RX leg
+        - accumulates total decoded byte volume vs. wall time → effective
+          sender rate → drift ppm vs nominal 48 kHz (the actual frequency-lock
+          signal for the future adaptive loop)
+
+        Idempotent via a counter slot in ``self._plc_counts``."""
+        if transport_id in self._plc_counts:
+            return
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+        if not hasattr(gst, "gst_buffer_has_flags") or not hasattr(gst, "gst_buffer_get_size"):
+            return
+        element = gst.gst_bin_get_by_name(self.pipeline, opusdec_element_name.encode("utf-8"))
+        if not element:
+            return
+        try:
+            pad = gst.gst_element_get_static_pad(element, b"src")
+            if not pad:
+                return
+            self._plc_counts[transport_id] = 0
+            self._plc_last_flushed[transport_id] = 0
+            self._rx_rate_window[transport_id] = deque()
+            self._rx_bytes_per_sample[transport_id] = 2 * max(1, channel_count)
+            GAP_FLAG = 1 << 10  # GST_BUFFER_FLAG_GAP
+            probe_started_at = [0.0]  # closure-mutable; first buffer sets it
+            # GstBuffer.pts offset on 64-bit GStreamer 1.x:
+            #   GstMiniObject = 64 bytes (type8 + refcount4 + lockstate4 +
+            #     flags4 + pad4 + copy8 + dispose8 + free8 + n_qdata4 + pad4 +
+            #     qdata8) followed by pool* (8). pts is next.
+            PTS_OFFSET = 64 + 8
+
+            # Callback: GstPadProbeReturn (*)(GstPad*, GstPadProbeInfo*, gpointer)
+            PROBE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+            GST_CLOCK_TIME_NONE = (1 << 64) - 1
+
+            def _on_buffer(_pad, info_ptr, _user, tid=transport_id):
+                # GstPadProbeInfo layout: type(uint), id(ulong), data(void*), ...
+                buffer_ptr = ctypes.cast(
+                    info_ptr + ctypes.sizeof(ctypes.c_uint) + ctypes.sizeof(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_void_p),
+                ).contents.value
+                if buffer_ptr:
+                    if gst.gst_buffer_has_flags(buffer_ptr, GAP_FLAG):
+                        self._plc_counts[tid] = self._plc_counts.get(tid, 0) + 1
+                    window = self._rx_rate_window.get(tid)
+                    if window is not None:
+                        now = time.time()
+                        # SRT receive-buffer prefill dumps ~240 ms of audio
+                        # into opusdec faster than realtime at startup.
+                        # Skip the first 2 s of buffers so that burst never
+                        # contaminates the window.
+                        if probe_started_at[0] == 0.0:
+                            probe_started_at[0] = now
+                        elif now - probe_started_at[0] >= 2.0:
+                            pts_ns = ctypes.cast(
+                                buffer_ptr + PTS_OFFSET,
+                                ctypes.POINTER(ctypes.c_uint64),
+                            ).contents.value
+                            if pts_ns != GST_CLOCK_TIME_NONE:
+                                window.append((now, pts_ns))
+                return 1  # GST_PAD_PROBE_OK
+
+            cb = PROBE(_on_buffer)
+            self._native_callbacks.append(cb)
+            BUFFER_PROBE = 1 << 4  # GST_PAD_PROBE_TYPE_BUFFER
+            gst.gst_pad_add_probe(pad, BUFFER_PROBE, ctypes.cast(cb, ctypes.c_void_p), None, None)
+            gobject.g_object_unref(pad)
+        finally:
+            gobject.g_object_unref(element)
+
+    def install_asiosrc_probe(self, element_name: str, channel_count: int) -> None:
+        """Buffer probe on the spine's asiosrc src pad. Integrates byte volume
+        vs wall-clock time → measured sample rate.
+
+        bytes_per_sample is determined from the actual pad caps on first
+        buffer, not assumed — the ASIO driver may negotiate more channels or
+        a wider format than ``config.audio.channel_count`` implies, and a
+        wrong assumption gives a clean multiplicative bias in the result
+        (e.g. assuming S16LE × 16 ch when the driver delivers S16LE × 24 ch
+        yields a 1.5× rate)."""
+        gst = self.runtime.gst
+        gobject = self.runtime.gobject
+        if not hasattr(gst, "gst_buffer_get_size"):
+            return
+        element = gst.gst_bin_get_by_name(self.pipeline, element_name.encode("utf-8"))
+        if not element:
+            return
+        try:
+            pad = gst.gst_element_get_static_pad(element, b"src")
+            if not pad:
+                return
+            # Fallback in case caps query fails on first buffer.
+            self._asio_bytes_per_sample = 2 * max(1, channel_count)
+            self._asio_rate_window = deque()
+            PROBE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+            probe_pad = pad  # close over so we can query caps inside callback
+            bps_known = [False]
+
+            def _on_buffer(_pad, info_ptr, _user):
+                buffer_ptr = ctypes.cast(
+                    info_ptr + ctypes.sizeof(ctypes.c_uint) + ctypes.sizeof(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_void_p),
+                ).contents.value
+                if buffer_ptr:
+                    if not bps_known[0]:
+                        try:
+                            caps_str = self.runtime.pad_caps_string(probe_pad) or ""
+                        except Exception:
+                            caps_str = ""
+                        derived = _bytes_per_sample_from_caps(caps_str)
+                        if derived:
+                            self._asio_bytes_per_sample = derived
+                        bps_known[0] = True
+                    size = gst.gst_buffer_get_size(buffer_ptr)
+                    bps = self._asio_bytes_per_sample
+                    if size and bps and self._asio_rate_window is not None:
+                        self._asio_rate_window.append((time.time(), size // bps))
+                return 1  # GST_PAD_PROBE_OK (0 is GST_PAD_PROBE_DROP — would drop every capture buffer, killing TX + capture meters)
+
+            cb = PROBE(_on_buffer)
+            self._native_callbacks.append(cb)
+            BUFFER_PROBE = 1 << 4
+            gst.gst_pad_add_probe(pad, BUFFER_PROBE, ctypes.cast(cb, ctypes.c_void_p), None, None)
+            # Keep the pad ref alive for caps queries (we read it from inside
+            # the probe). Released when the spine is torn down.
+            self._native_callbacks.append(probe_pad)
+        finally:
+            gobject.g_object_unref(element)
+
+    def _flush_derived_clock_telemetry(self) -> None:
+        """Push counter snapshots from the probe-side bookkeeping into
+        telemetry. Called from the poll loop at ~4 Hz."""
+        for transport_id, count in self._plc_counts.items():
+            if count != self._plc_last_flushed.get(transport_id):
+                self.telemetry.observe_clock_leg(transport_id, opus_plc_count=count)
+                self._plc_last_flushed[transport_id] = count
+        # Per-leg drift from sender PTS vs wall time over a 30 s sliding window.
+        # Each window entry is (wall_time, sender_pts_ns). The drift is exactly
+        # (wall_span - sender_span) / sender_span × 1e6 ppm — no sample
+        # counting, no edge aliasing, no off-by-one bias.
+        now = time.time()
+        WINDOW_S = 30.0
+        MIN_SPAN_S = 5.0
+        for transport_id, window in self._rx_rate_window.items():
+            cutoff = now - WINDOW_S
+            while window and window[0][0] < cutoff:
+                window.popleft()
+            if len(window) < 2:
+                continue
+            wall_first, pts_first = window[0]
+            wall_last, pts_last = window[-1]
+            wall_span = wall_last - wall_first
+            if wall_span < MIN_SPAN_S:
+                continue
+            sender_span_s = (pts_last - pts_first) / 1_000_000_000.0
+            if sender_span_s <= 0:
+                continue
+            # If sender is faster than local, sender_span accumulates faster
+            # than wall_span — i.e. sender_span > wall_span over the same
+            # window. Drift in ppm of sender vs local.
+            drift_ppm = (sender_span_s - wall_span) / wall_span * 1_000_000.0
+            measured_rate = 48000.0 * (1.0 + drift_ppm / 1_000_000.0)
+            self.telemetry.observe_clock_leg(
+                transport_id,
+                sender_rate_hz=measured_rate,
+                drift_ppm=drift_ppm,
+                lock_state="running",
+            )
+        # asiosrc rate: we don't have a sender PTS here (it's a local capture),
+        # so we still use sample-count math but reframe it as
+        # "audio_seconds / wall_seconds" using the buffer count, which lands
+        # within ±100 ppm at steady state. Off-by-one aliasing applies but
+        # asiosrc emits at very regular hardware intervals so it's stable.
+        if self._asio_rate_window is not None:
+            cutoff = now - WINDOW_S
+            while self._asio_rate_window and self._asio_rate_window[0][0] < cutoff:
+                self._asio_rate_window.popleft()
+            if len(self._asio_rate_window) >= 2:
+                span = self._asio_rate_window[-1][0] - self._asio_rate_window[0][0]
+                if span >= MIN_SPAN_S:
+                    samples = sum(s for _, s in list(self._asio_rate_window)[1:])
+                    self.telemetry.observe_asiosrc_rate(samples / span)
+
     def _poll(self) -> None:
         while not self._stopped:
             self._drain_bus()
             self._poll_srt_stats()
+            self._sample_clock_buffers()
             time.sleep(0.1)
+
+    def _sample_clock_buffers(self) -> None:
+        if self._clock_sample_channel_count <= 0:
+            return
+        now = time.time()
+        # Throttle to ~4 Hz. Cheap on its own, but every sample probes N queues;
+        # 4 Hz × 8 channels = 32 ctypes calls/sec is fine, 4 Hz × 64 channels =
+        # 256 is still trivial. Higher rate doesn't help drift estimation.
+        if self._last_clock_sample_at is not None and (now - self._last_clock_sample_at) < 0.25:
+            return
+        self._last_clock_sample_at = now
+
+        # First sample: probe all channels in range and remember which exist.
+        # The set is stable for the spine's lifetime (queues don't come and go;
+        # RX legs swap silence in and out, but the queue elements stay put).
+        if not self._clock_sample_known_channels:
+            for channel in range(1, self._clock_sample_channel_count + 1):
+                if self.get_queue_levels(f"rx_clkbuf_{channel}") is not None:
+                    self._clock_sample_known_channels.add(channel)
+            if not self._clock_sample_known_channels:
+                # Pipeline isn't a spine after all (or queues aren't built yet).
+                # Try again on the next tick.
+                return
+
+        for channel in sorted(self._clock_sample_known_channels):
+            levels = self.get_queue_levels(f"rx_clkbuf_{channel}")
+            if levels is None:
+                continue
+            fill_ns = levels.get("current-level-time", 0)
+            max_ns = levels.get("max-size-time", 0)
+            self.telemetry.observe_clock_channel(
+                channel,
+                buffer_fill_ms=fill_ns / 1_000_000.0,
+                buffer_max_ms=max_ns / 1_000_000.0,
+            )
+        self._flush_derived_clock_telemetry()
 
     def _drain_bus(self, *, max_messages: int = 100) -> None:
         for _ in range(max_messages):
@@ -1372,6 +1753,34 @@ class CtypesManagedPipeline:
             return
         if source_name and source_name.startswith(("dbmeter_out_", "dbmeter_in_")):
             self.telemetry.observe_clock(lock_state="running")
+
+
+_GST_FORMAT_WIDTH = {
+    "S8": 1, "U8": 1,
+    "S16LE": 2, "S16BE": 2, "U16LE": 2, "U16BE": 2,
+    "S24LE": 3, "S24BE": 3, "U24LE": 3, "U24BE": 3,
+    "S24_32LE": 4, "S24_32BE": 4, "U24_32LE": 4, "U24_32BE": 4,
+    "S32LE": 4, "S32BE": 4, "U32LE": 4, "U32BE": 4,
+    "F32LE": 4, "F32BE": 4,
+    "F64LE": 8, "F64BE": 8,
+}
+
+
+def _bytes_per_sample_from_caps(caps_str: str) -> int | None:
+    """Parse ``audio/x-raw,format=...,channels=N,...`` caps string into a
+    bytes-per-interleaved-sample value. Returns None if either field is
+    missing or unrecognized. Used by the asiosrc probe to size sample
+    accumulation correctly when the driver negotiates more channels or a
+    wider format than the config implies."""
+    import re
+    format_match = re.search(r"format=\(string\)([A-Z0-9_]+)", caps_str) or re.search(r"format=([A-Z0-9_]+)", caps_str)
+    channels_match = re.search(r"channels=\(int\)(\d+)", caps_str) or re.search(r"channels=(\d+)", caps_str)
+    if not format_match or not channels_match:
+        return None
+    width = _GST_FORMAT_WIDTH.get(format_match.group(1))
+    if not width:
+        return None
+    return width * int(channels_match.group(1))
 
 
 def _parse_stats(text: str) -> dict[str, str]:
